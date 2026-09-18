@@ -1,0 +1,15 @@
+[workspace]
+name = "azo-plugin-swarm"
+version = "0.1.0"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64", "osx-64"]
+
+# Runtime dependencies are supplied by the integrated Agent Zoo host.
+[tool.agent-zoo.plugin]
+name = "azo-plugin-swarm"
+common = ["src/swarm.py"]
+default = []
+rlm = []
+
+[tasks]
+test = "bash scripts/test.sh"
