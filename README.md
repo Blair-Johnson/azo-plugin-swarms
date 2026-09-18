@@ -1,8 +1,8 @@
 # azo-plugin-swarm
 
-Pod-based swarms with durable message boards, raw slash commands and scoped agent tools. Requires the Agent Zoo integration stack with `CommandContext.defer` (agent-zoo `f4a1e6a` or later) and the integrated runtime launcher. No additional runtime dependencies.
+Pod-based swarms with durable message boards, explicit agent tools, and paused recovery. Requires the Agent Zoo integration stack with lifecycle-managed background submissions, `RuntimeLaunch.startup_mode`, and the `runtime.session_ready` feature event. No additional runtime dependencies.
 
-## Commands
+## User commands
 
 ```text
 /swarm -n 16 -p 4 --channels comms,breakthroughs --name exploration
@@ -15,33 +15,65 @@ Pod-based swarms with durable message boards, raw slash commands and scoped agen
 /swarm cancel sw0
 ```
 
-`-n` is the total number of agents. `-p` defaults to one; pods must be equal-sized. Initial bounds are 1–32 pods, 1–64 agents per pod and 1–32 distinct channels. Channels default to `general`. IDs are project-scoped `sw0`, `sw1`, etc., durably allocated and never reused. `--name` adds a unique alias; either the alias or ID addresses the resource. Omitted broadcast targets require exactly one owned, non-cancelled swarm.
+`-n` is the total number of agents. `-p` defaults to one; pods are equal-sized. Bounds are 1–32 pods, 1–64 agents per pod, and 1–32 distinct channels. Channels default to `general`. Project-scoped IDs (`sw0`, `sw1`, …) are never reused; `--name` adds a unique alias. Omitting a broadcast target requires exactly one owned, non-cancelled swarm.
 
-Pod selectors are zero-based comma-separated indices and inclusive ranges, such as `0-3,5`. Quoted broadcast messages may span lines and preserve their contents, including surrounding whitespace. Escape the matching quote or backslash with a backslash; other escape sequences remain literal. Broadcasts are ordinary user messages, not board posts or system instructions. The complete encoded websocket frame is limited to 1 MiB; oversized messages are rejected without truncation or splitting.
+Pod selectors are zero-based indices and inclusive ranges. Quoted messages may span lines and preserve whitespace. Escape the matching quote or backslash; other escape sequences remain literal. Broadcasts arrive as ordinary user messages, even when their contents begin with `/`. Encoded websocket frames are limited to 1 MiB; oversized messages are rejected, never truncated or split.
 
-Creation records all membership before launching idle, independent peer sessions with no initial user message. Their attach-menu types are stable labels such as `sw0p0a0`, `sw0p0a1`, and `sw0p1a0`. Use the normal attach menu to inspect a peer or message it directly. The parent receives a system notification describing the resource after creation completes. A partial launch retains its member identities, attempts and process handles; it is never automatically retried or rolled back.
+Peers have stable attach-menu labels such as `sw0p0a0`. Use the ordinary attach menu to inspect or message an individual peer. New peers start paused and idle; an explicit user message or continuation releases the startup gate. Board messages alone do not authorize work.
 
-Interrupt and continue forward the existing `/interrupt` and `/continue` commands. Cancel requests graceful shutdown with checkpoint saving; it does not mean interrupt, kill by PID, or prove that the peer has exited. Cancellation is terminal intent for the resource: later broadcast/continue is refused, but cancel may be explicitly requested again. Interrupt cannot preempt an arbitrary synchronous tool; continue does not create a new prompt or recover a provider error requiring `/retry`.
+Malformed slash commands report through the TUI status bar. Accepted operations run asynchronously and report their outcome. Cancel requests graceful save-and-shutdown and marks the resource terminal; it is not a force-kill or proof of exit. Interrupt cannot preempt an arbitrary synchronous tool. Continue does not invent a new prompt or bypass an independent provider-error gate.
 
-Malformed slash commands and operational feedback use the TUI status bar. Valid operations run asynchronously through the harness hook, with blocking storage/launch calls off the shared I/O loop. A parent's operations are serialized, with bounded member concurrency. Sends are reported as sent, not accepted or executed. Uncertain sends are not retried automatically.
+## Agent tools
 
-## Agent tools and views
+```python
+swarm_broadcast(swarm_id: str, message: str, pods: list[int] | None = None)
+swarm_interrupt(swarm_id: str)
+swarm_continue(swarm_id: str)
+swarm_cancel(swarm_id: str)
+swarm_post(swarm_id: str, pod: int, channel: str, message: str,
+           message_id: str | None = None)
+```
 
-The parent gets `swarm_control(command=...)`, which queues the same command tail, such as `bcast sw0 -p 0 "Investigate this"` or `interrupt sw0`, through the existing session input channel. It shares the slash parser, dispatcher and status feedback. Creation remains user-only through this tool interface. `swarm_post` appends to a named pod board and does not wake agents or dispatch work.
+Creation and takeover remain user-only. Tools accept named values, not command strings. Pod numbers are zero-based; omitted broadcast `pods` means all pods, while an empty list is invalid. A multiline message is a normal string, with no extra command quoting. Tools return a correlated receipt and automatically deliver compact completion feedback with outcome counts, affected peer labels, and actionable errors. No polling is required. A completed transport send is not an acknowledgement of peer acceptance or execution. Uncertain sends are never automatically replayed.
 
-The read-only `swarm:index` buffer lists bound resources, pod indices, member labels, board buffers and saved transcript buffers. Parents also see recent operation outcomes. Boards use `swarm:<id>:<pod>:board:<channel>` and transcripts use `swarm:<id>:<pod>:session:<session-id>`. Internal pod IDs remain `pod-1`, `pod-2`, etc.; command indices are zero-based. Transcript views show shared saved checkpoints, not live activity. Use attach for live inspection.
+`swarm_post` appends to a pod board without waking agents. Board text is limited to 65,536 UTF-8 bytes. An optional stable `message_id` permits idempotent retries of the same sender/content; reusing it for different content is rejected. Peers can access only their own pod; the parent can address every pod it owns.
 
-Peers bootstrap from `AZO_SWARM_ID` and `AZO_SWARM_POD_ID`. Their tools and buffers expose only their own pod; parents can see all pods they own. This is plugin-level scope enforcement, not filesystem, process or adversarial security isolation. Registration and reading buffers never launch agents or submit model work.
+## Views and durable state
 
-## Durability and recovery
+`swarm:index` lists resources, pod numbers, member labels, board buffers, saved transcript buffers, and operation outcomes. Board IDs retain the storage form `swarm:<id>:pod-1:board:<channel>`; `pod-1` is pod number 0. Transcript views load verified shared checkpoint journals and identify the revision, rather than presenting a legacy file as live state. Attach remains the live inspection interface.
 
-Authoritative records live under `<state-home>/projects/<project>/swarms/`, using the filesystem `RecordStore`. Pools have durable ownership and topology; launch attempts are reserved before spawning. Broadcast/control records retain the requested operation and outcomes. A pending record after interruption is ambiguous and is not replayed. Desired state records intent, not confirmed runtime state.
+Authoritative records live under `<state-home>/projects/<project>/swarms/`. Immutable message records and append-only references preserve board history. Host-local SQLite is a disposable projection; losing temporary files or caches does not erase acknowledged boards. Shared-storage failures are surfaced rather than hidden behind a stale cache. Ownership checks and mutations share a per-swarm lock; stale runtime grants cannot publish new board entries or overwrite successor outcomes.
 
-Board messages are immutable content-addressed records with an append-only reference list. SQLite under `<host-local-state>/swarm-cache/` is only a disposable projection. Losing temporary/local data cannot erase acknowledged board messages or durable control records. Shared-storage errors are surfaced rather than masked with stale cache data. A stable board `message_id` supports idempotent retries of identical content.
+## Recovery and replacement instances
 
-A restored parent can address its durable owned resource records even without a saved binding. Verified readiness snapshots are durable too: same-host/same-boot control may reconnect after temporary launch files are lost. Every send requires the recorded native process identity and an exact session/instance websocket hello; endpoints must be loopback. Missing identities, changed PIDs, foreign hosts/boots and unrelated session instances fail closed. The plugin never adopts an arbitrary latest session or signals a stored PID.
+Parent restoration holds saved work paused while it discovers owned resources, without requiring a model turn. Sessions with no resources are released automatically; a swarm-owning parent stays paused for review and explicit continuation. Recoverable children retain their session IDs, receive new runtime instance IDs, and resume exact shared checkpoints with the startup pause gate engaged. Successful children remain paused when another member fails. Missing checkpoints, divergent histories, unresolved tool outcomes, and uncertain launches remain explicit blocked states; recovery never substitutes a fresh session or replays an old broadcast. Initial readiness also requires plugin admission and a shared checkpoint, not merely an open websocket.
 
-Full cross-host recovery, stopped-peer relaunch and adoption of a peer's replacement `/reload` instance are not implemented. Restoring metadata does not launch, resume, pause, or replay peers. Independent peers may outlive their parent; explicitly interrupt or cancel them as appropriate. Portable storage requires the durable swarm directory and relevant member checkpoints, not merely the parent's checkpoint. Shared-filesystem guarantees remain those of RecordStore and the underlying filesystem.
+A verified same-host parent successor can preserve positively live child bindings and their grants instead of rotating the owner epoch and relaunching them. It requests interruption of those existing peers; this is not proof of tool quiescence. The old parent instance loses mutation authority. Mixed or uncertain execution sets take the conservative recovery path and may require explicit reconciliation.
+
+Reload/restart adoption follows verified harness successor lineage, including chains while the parent was offline. It checks the exact session, instance, native process identity, and websocket hello before changing the current binding. A newer unrelated process with the same session ID is not adopted. Original launch provenance is retained. An uncertain send is not redirected to the successor.
+
+Cross-host recovery requires the durable swarm records and verified parent/member checkpoints on the destination, plus valid destination configuration and working paths. A foreign or unreachable host is not proof that prior executions stopped. When automatic reconciliation cannot establish safety, a user can explicitly attest that the old parent, all children, uncertain launches, and external jobs are stopped or isolated:
+
+```text
+/swarm recover sw0 --takeover --expected-epoch 3 --confirmed-stopped
+```
+
+The expected epoch prevents taking over a changed resource; a positively identified live competing owner still blocks takeover. This is cooperative ownership fencing, not an ability to stop remote processes or undo external tool effects. Independent peers and detached jobs may outlive their parent. Shared-filesystem safety depends on working cross-host advisory locks and atomic durable publication; local tests do not qualify an arbitrary NFS deployment.
+
+## Disconnected transfer
+
+The standalone wrapper includes swarm records, board history, and exact parent/member revisions using the harness session archive format. Ordinary parent-session export alone is insufficient. Both export and import require source-stopped confirmation. Checksums, topology, session coverage, and collisions are validated before publication. IDs are preserved; remap, skip, and replace are not supported. Import does not launch agents or reuse source process identities as destination authority. Runtime recovery requires the matching import journal to be completed and uses its exact destination checkpoint revisions, even if newer revisions exist. Failed partial imports retain reconciliation evidence rather than deleting imported sessions; their unbound owners cannot obtain runtime authority.
+
+```sh
+python scripts/swarm_transfer.py export --project research --swarm sw0 \
+  --output /private/path/swarm.zip --home /shared/azo --store-root /shared/coord \
+  --confirmed-stopped --revision PARENT_ID=PARENT_COMMIT
+python scripts/swarm_transfer.py import /private/path/swarm.zip --project research \
+  --home /destination/azo --store-root /destination/coord \
+  --workdir /destination/work --confirmed-stopped --dry-run
+```
+
+Provide `--revision SESSION_ID=COMMIT` for every session without a recorded recoverable revision, including the parent. Inspect the dry-run before importing; omit `--dry-run` to publish. Use explicit `--path-map OLD=NEW` where required. Archives contain private transcripts and operational data; keep them private and retire the source before using the destination.
 
 ## Development
 
@@ -50,4 +82,4 @@ export AZO_HOST_MANIFEST=/absolute/path/to/agent-zoo-worktrees/swarm-integration
 pixi run test
 ```
 
-The manifest installs `src/swarm.py` in the common plugin scope so parents and peers load the same feature. Commands inherit the current model/environment, configuration provenance, project/store roots and working directory; peers use the default pipeline. Tests use isolated durable roots and mocked launches/transports, with real local websocket integration where noted. They do not install the plugin or launch model-backed agents.
+The plugin installs in the common scope. Tests use isolated durable roots, deterministic lifecycle fixtures, and local websocket checks; they do not install into or launch model work in user sessions.

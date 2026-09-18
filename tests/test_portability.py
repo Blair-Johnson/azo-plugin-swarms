@@ -15,7 +15,7 @@ def test_relocated_state_home_preserves_resource_without_old_absolute_paths(tmp_
                             _agent_zoo_context={"project_name": "research.v2",
                                                "project_dir": str(old / "obsolete")})
     first = swarm.store_for(state, "demo")
-    metadata = first.create("demo", pods=2, agents_per_pod=2)
+    metadata = first.create("demo", pods=2, agents_per_pod=2, owner_session_id="parent", owner_instance_id="source")
     first.post("pod-1", "general", "survive relocation", "parent", message_id="one")
     expected = first.messages("pod-1", "general")
     shutil.copytree(old, new)

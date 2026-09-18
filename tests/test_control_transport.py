@@ -43,22 +43,15 @@ def test_native_control_channels(tmp_path, monkeypatch, action):
         assert server.stop_background(timeout_s=5)
 
 
-def test_agent_control_tool_uses_the_same_command_ingress():
+def test_agent_tool_requires_background_service_not_slash_ingress():
     io = SessionIO(session_id="parent")
-    state = SimpleNamespace(_session_id="parent", swarm_access={"sw0": ""},
-                            _session_websocket_server=SimpleNamespace(session_io=io))
-    tool = swarm.SwarmControl()
-    assert tool.available(state)
-    command = 'bcast sw0 -p 0 "  first\nsecond  "'
-    assert swarm.control_swarm(command, state).startswith("Queued")
-    frame, = io.drain()
-    assert frame.channel == "slash_command"
-    assert frame.payload == {"raw": "/swarm " + command}
-    with pytest.raises(ValueError, match="user"):
-        swarm.control_swarm("-n 16 -p 4", state)
+    state = SimpleNamespace(_session_id="parent", _instance_id="parent-instance", swarm_access={"sw0": ""},
+                            _session_websocket_server=SimpleNamespace(session_io=io), session_cwd=str(__import__('pathlib').Path.cwd()))
+    controller = swarm.SwarmController({})
+    with pytest.raises(ValueError, match="Background execution unavailable"):
+        controller.broadcast("sw0", "exact payload", state=state)
     assert io.drain() == ()
     state.swarm_access = {"sw0": "pod-1"}
-    assert not tool.available(state)
     with pytest.raises(ValueError, match="peers"):
-        swarm.control_swarm("cancel sw0", state)
+        controller.cancel("sw0", state)
     assert io.drain() == ()

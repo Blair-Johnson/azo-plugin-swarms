@@ -14,7 +14,7 @@ from swarm import SwarmStore
 @pytest.fixture
 def store(tmp_path):
     result = SwarmStore(tmp_path / "shared", tmp_path / "host-a" / "messages.sqlite3")
-    result.create("demo", pods=2, agents_per_pod=2, boards=2)
+    result.create("demo", pods=2, agents_per_pod=2, boards=2, owner_session_id="sender", owner_instance_id="owner")
     return result
 
 
@@ -24,7 +24,7 @@ def test_create_topology_without_launch(tmp_path, monkeypatch):
 
     monkeypatch.setattr(subprocess, "Popen", forbidden)
     result = SwarmStore(tmp_path / "shared", tmp_path / "local" / "cache.sqlite3")
-    pool = result.create("demo", pods=4, agents_per_pod=4, boards=2)
+    pool = result.create("demo", pods=4, agents_per_pod=4, boards=2, owner_session_id="sender", owner_instance_id="owner")
     assert pool["id"] == "demo"
     assert pool["desired_state"] == "paused"
     assert pool["channels"] == ["general", "channel-2"]
@@ -36,7 +36,7 @@ def test_create_topology_without_launch(tmp_path, monkeypatch):
     assert result.pool() == pool
     assert result.attempts() == []
     with pytest.raises(ValueError, match="already exists"):
-        result.create("demo")
+        result.create("demo", owner_session_id="sender", owner_instance_id="owner")
     assert result.pool() == pool
 
 
@@ -64,7 +64,7 @@ def test_retry_is_idempotent_but_conflicting_id_fails(store):
     for _ in range(2):
         assert store.post("pod-1", "general", "first", "sender", message_id="stable") == "stable"
     for text, sender in [("changed", "sender"), ("first", "someone-else")]:
-        with pytest.raises(ValueError, match="different content"):
+        with pytest.raises(ValueError, match="different content|Sender"):
             store.post("pod-1", "general", text, sender, message_id="stable")
     assert store.messages("pod-1", "general") == before
 
@@ -84,20 +84,20 @@ def test_same_named_boards_and_ids_are_isolated_per_pod_and_channel(store):
     assert store.messages("pod-2", "channel-2") == []
 
 
-def _write_messages(durable, cache, worker, barrier):
+def _write_messages(durable, cache, worker, barrier, grant):
     """Spawn target only writes records; it never invokes the runtime launcher."""
-    child = SwarmStore(Path(durable), Path(cache))
+    child = SwarmStore(Path(durable), Path(cache), grant=grant)
     barrier.wait(timeout=30)
     for number in range(8):
         identity = f"worker-{worker}-{number}"
-        child.post("pod-1", "general", identity, f"writer-{worker}", message_id=identity)
+        child.post("pod-1", "general", identity, "sender", message_id=identity)
 
 
 def test_concurrent_process_writers_lose_no_messages(store, tmp_path):
     context = multiprocessing.get_context("spawn")
     barrier = context.Barrier(4)
     processes = [context.Process(target=_write_messages, args=(
-        str(store.durable), str(tmp_path / f"writer-{worker}" / "cache.sqlite3"), worker, barrier,
+        str(store.durable), str(tmp_path / f"writer-{worker}" / "cache.sqlite3"), worker, barrier, store.grant,
     )) for worker in range(4)]
     try:
         for process in processes:
@@ -127,11 +127,11 @@ def test_deleted_cache_and_second_host_rebuild_identical_data(store, tmp_path):
     assert reopened.pool() == metadata
     assert reopened.messages("pod-1", "general") == rows
     assert reopened.cache.exists()
-    other_host = SwarmStore(store.durable, tmp_path / "host-b" / "messages.sqlite3")
+    other_host = SwarmStore(store.durable, tmp_path / "host-b" / "messages.sqlite3", grant=store.grant)
     assert other_host.cache != reopened.cache
     assert other_host.pool() == metadata
     assert other_host.messages("pod-1", "general") == rows
-    other_host.post("pod-1", "general", "new", "other-host", message_id="new")
+    other_host.post("pod-1", "general", "new", "sender", message_id="new")
     assert reopened.messages("pod-1", "general") == other_host.messages("pod-1", "general")
     assert not list(store.durable.rglob("*.sqlite*"))
 
@@ -177,11 +177,10 @@ def test_precommit_publication_failure_is_not_acknowledged(store, monkeypatch, p
     monkeypatch.setattr(swarm, "store_for", lambda state, swarm_id: store)
     with monkeypatch.context() as fault:
         fault.setattr(swarm.RecordStore, "_publish_record", fail_publication)
-        with pytest.raises(RuntimeError, match="not acknowledged"):
-            swarm.post_message("demo", "pod-1", "general", "retry me", "stable", state)
+        with pytest.raises(OSError, match="publication failure"):
+            store.post("pod-1", "general", "retry me", "sender", message_id="stable")
     assert store.messages("pod-1", "general") == []
-    assert "Posted stable" in swarm.post_message(
-        "demo", "pod-1", "general", "retry me", "stable", state)
+    assert store.post("pod-1", "general", "retry me", "sender", message_id="stable", receipt=True) == ("stable", True)
     assert len(store.messages("pod-1", "general")) == 1
 
 
@@ -190,9 +189,9 @@ def test_persisted_resume_attempt_blocks_new_reservation(store, tmp_path, status
     member = store.pool()["pods"][0]["members"][0]["session_id"]
     attempt = dict(session_id=member, instance_id="attempt-1", state="reserved",
                    request={"source": {"kind": "resume", "session_id": member}})
-    store.reserve_attempt(member, attempt)
+    attempt = store.reserve_attempt(member, attempt)
     store.update_attempt(member, state=status)
-    reopened = SwarmStore(store.durable, tmp_path / "host-b" / "cache.sqlite3")
+    reopened = SwarmStore(store.durable, tmp_path / "host-b" / "cache.sqlite3", grant=store.grant)
     expected = dict(attempt, state=status)
     assert reopened.attempts() == [expected]
     with pytest.raises(ValueError, match="reconciliation"):
@@ -264,9 +263,8 @@ def test_ambiguous_committed_post_can_be_retried_without_duplication(store, monk
     monkeypatch.setattr(swarm, "store_for", lambda state, swarm_id: store)
     with monkeypatch.context() as fault:
         fault.setattr(swarm.RecordStore, "_publish_record", commit_then_fail)
-        with pytest.raises(RuntimeError, match="not acknowledged"):
-            swarm.post_message("demo", "pod-1", "general", "committed", "stable", state)
+        with pytest.raises(OSError, match="reply lost"):
+            store.post("pod-1", "general", "committed", "sender", message_id="stable")
     assert len(store.messages("pod-1", "general")) == 1
-    assert "Posted stable" in swarm.post_message(
-        "demo", "pod-1", "general", "committed", "stable", state)
+    assert store.post("pod-1", "general", "committed", "sender", message_id="stable", receipt=True) == ("stable", False)
     assert len(store.messages("pod-1", "general")) == 1
