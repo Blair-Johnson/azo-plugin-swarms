@@ -7,6 +7,7 @@ Pod-based swarms with durable message boards, explicit agent tools, and paused r
 ```text
 /swarm -n 16 -p 4 --channels comms,breakthroughs --name exploration
 /swarm -n 4
+/swarm -n 4 --profile gpt-5.6-luna-max
 /swarm bcast "A message to the only active swarm"
 /swarm bcast sw0 "A message to every pod"
 /swarm bcast exploration -p 0-2,3 "A message to selected pods"
@@ -16,6 +17,8 @@ Pod-based swarms with durable message boards, explicit agent tools, and paused r
 ```
 
 `-n` is the total number of agents. `-p` defaults to one; pods are equal-sized. Bounds are 1–32 pods, 1–64 agents per pod, and 1–32 distinct channels. Channels default to `general`. Project-scoped IDs (`sw0`, `sw1`, …) are never reused; `--name` adds a unique alias. Omitting a broadcast target requires exactly one owned, non-cancelled swarm.
+
+`--profile NAME` (or `--profile=NAME`) selects an enabled named entry in `llm.models` for every peer, without changing the parent model. New pools save the selected profile, including the current default when omitted. Recovery uses each pool's saved profile and blocks relaunch if it is missing or disabled on the destination; legacy pools without a saved profile use the current default. Profile validation does not prevent interrupting preserved live peers after a verified parent replacement.
 
 Pod selectors are zero-based indices and inclusive ranges. Quoted messages may span lines and preserve whitespace. Escape the matching quote or backslash; other escape sequences remain literal. Broadcasts arrive as ordinary user messages, even when their contents begin with `/`. Encoded websocket frames are limited to 1 MiB; oversized messages are rejected, never truncated or split.
 

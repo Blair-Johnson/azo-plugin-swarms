@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import closing, contextmanager
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from collections import Counter, defaultdict
 from types import SimpleNamespace
 import hashlib
@@ -17,6 +17,7 @@ import sqlite3
 import time
 import uuid
 
+from agents.llm import require_model_enabled
 from agent_utils import Feature, Tool
 from agent_utils.components import ToolDispatchStart, InterruptCheck, InterruptDelivery, HarnessEventHandler
 from agent_utils.session_repository import SessionRepository
@@ -99,7 +100,7 @@ def command_options(tokens, allowed):
                 raise ValueError(f"Missing value for {token}")
             value = tokens[index]
             index += 1
-        if not value:
+        if not value or (key == "profile" and value.startswith("-")):
             raise ValueError(f"Missing value for {key}")
         options[key] = value
     return options, positional
@@ -108,11 +109,12 @@ def command_options(tokens, allowed):
 def parse_command(raw_args: str) -> dict:
     source = raw_args.lstrip()
     if not source:
-        raise ValueError("Usage: /swarm -n AGENTS [-p PODS] [--channels NAMES] [--name NAME]; "
+        raise ValueError("Usage: /swarm -n AGENTS [-p PODS] [--channels NAMES] [--name NAME] [--profile PROFILE]; "
                          "or /swarm bcast|interrupt|continue|cancel ...")
     if source.startswith("-"):
         values, positional = command_options(source.split(), {
-            "-n": "agents", "-p": "pods", "--channels": "channels", "--name": "name"})
+            "-n": "agents", "-p": "pods", "--channels": "channels", "--name": "name",
+            "--profile": "profile"})
         if positional or "agents" not in values:
             raise ValueError("Creation requires -n AGENTS and accepts only named options")
         try:
@@ -124,8 +126,11 @@ def parse_command(raw_args: str) -> dict:
         channels = tuple(name(channel) for channel in values.get("channels", "general").split(","))
         if not 1 <= len(channels) <= 32 or len(set(channels)) != len(channels):
             raise ValueError("Expected 1–32 distinct channel names")
-        return dict(action="create", agents=agents, pods=pods, channels=channels,
-                    name=name(values["name"]) if "name" in values else None)
+        request = dict(action="create", agents=agents, pods=pods, channels=channels,
+                       name=name(values["name"]) if "name" in values else None)
+        if "profile" in values:
+            request["profile"] = values["profile"]
+        return request
     action, *tail = source.split(maxsplit=1)
     rest = tail[0] if tail else ""
     if action == "recover":
@@ -174,8 +179,11 @@ class SwarmStore:
         return RecordStore(self.durable, create=False)
 
     def create(self, swarm_id: str, *, pods=1, agents_per_pod=1, boards=1,
-               channels=None, display_name=None, owner_session_id="", owner_instance_id=""):
+               channels=None, display_name=None, owner_session_id="", owner_instance_id="",
+               model_profile=None):
         name(swarm_id)
+        if model_profile is not None and (not isinstance(model_profile, str) or not model_profile.strip()):
+            raise ValueError("Invalid swarm model profile")
         channels = channel_names(boards) if channels is None else list(channels)
         if not 1 <= len(channels) <= 32 or len(set(channels)) != len(channels):
             raise ValueError("Expected 1–32 distinct channel names")
@@ -202,6 +210,8 @@ class SwarmStore:
                         owner=dict(epoch=1, token=uuid.uuid4().hex, parent_instance_id=owner_instance_id,
                                    host=local_host_identity().to_dict(),
                                    process_identity=native_self()), recovery=None)
+            if model_profile is not None:
+                pool["model_profile"] = model_profile
         self.grant = parent_grant(self.pool(), owner_instance_id)
         return self.pool()
 
@@ -320,6 +330,8 @@ def validate_pool(pool):
     if not isinstance(pool, dict) or type(pool.get("version")) is not int or pool["version"] not in {1, 2}:
         raise ValueError("Missing or unsupported swarm metadata")
     name(pool["id"]); name(pool["name"])
+    if "model_profile" in pool and (not isinstance(pool["model_profile"], str) or not pool["model_profile"].strip()):
+        raise ValueError("Invalid swarm model profile")
     if not isinstance(pool.get("owner_session_id"), str):
         raise ValueError("Invalid owner session")
     channels, pods = pool.get("channels"), pool.get("pods")
@@ -1159,7 +1171,8 @@ def allocate_pool(state, request):
     pool = store.create(swarm_id, pods=request["pods"],
                         agents_per_pod=request["agents"] // request["pods"],
                         channels=request["channels"], display_name=alias,
-                        owner_session_id=state._session_id, owner_instance_id=state._instance_id)
+                        owner_session_id=state._session_id, owner_instance_id=state._instance_id,
+                        model_profile=request.get("profile"))
     state.grants[swarm_id] = deepcopy(store.grant)
     state.swarm_resource_uids = {**getattr(state, "swarm_resource_uids", {}), swarm_id: pool["resource_uid"]}
     repair_index(state, store, pool)
@@ -1471,10 +1484,26 @@ async def send_to_member(target, request, *, store=None, member=None):
             raise
 
 
-def launch_settings(state, config):
+def validate_model_profile(config, profile):
+    models = (config.get("llm", {}) or {}).get("models", {}) or {}
+    if not isinstance(profile, str) or not profile.strip() or profile not in models:
+        raise ValueError(f"Unknown swarm model profile: {profile!r}; configure it in llm.models")
+    require_model_enabled(config, profile)
+    return profile
+
+
+def pool_launch_settings(settings, config, pool):
+    # Legacy pools have no pinned selection. Never mutate the shared recovery snapshot.
+    if "model_profile" not in pool:
+        return settings
+    return replace(settings, model=validate_model_profile(config, pool["model_profile"]))
+
+
+def launch_settings(state, config, *, profile=None):
     context = dict(getattr(state, "_agent_zoo_context", {}) or {})
     provenance = config.get("_runtime_launch", {}) or {}
-    model = str((config.get("llm", {}) or {}).get("default") or "")
+    model = (validate_model_profile(config, profile) if profile is not None
+             else str((config.get("llm", {}) or {}).get("default") or ""))
     if not model or not context.get("project_name") or not context.get("project_store_root"):
         raise ValueError("Current model, project, and coordination store are required to launch a swarm")
     if getattr(state, "session_launcher", None) is None:
@@ -1564,7 +1593,7 @@ class SwarmController:
         return (id(state), getattr(state, "_session_id", ""), getattr(state, "_instance_id", ""),
                 id(getattr(self.session, "pipeline", None)))
 
-    def snapshot(self, state, *, settings=False):
+    def snapshot(self, state, *, settings=False, profile=None):
         if not getattr(state, "_session_id", "") or not getattr(state, "_instance_id", ""):
             raise ValueError("Final runtime session and instance identities are required")
         return SimpleNamespace(_session_id=state._session_id, _instance_id=state._instance_id,
@@ -1573,7 +1602,7 @@ class SwarmController:
             swarm_resource_uids=dict(getattr(state, "swarm_resource_uids", {})),
             session_launcher=getattr(state, "session_launcher", None), session_cwd=get_session_cwd(state),
             _persistence_local_root=getattr(state, "_persistence_local_root", ""),
-            settings=launch_settings(state, self.config) if settings else None)
+            settings=launch_settings(state, self.config, profile=profile) if settings else None)
 
     def command(self, ctx, *, raw_args):
         try:
@@ -1582,7 +1611,8 @@ class SwarmController:
             if request["action"] == "bcast":
                 validate_broadcast(request["message"])
             request["operation_id"] = uuid.uuid4().hex
-            snapshot = self.snapshot(ctx.state, settings=request["action"] in {"create", "recover"})
+            snapshot = self.snapshot(ctx.state, settings=request["action"] in {"create", "recover"},
+                                     profile=request.get("profile"))
         except (ValueError, OSError) as exc:
             # Malformed user slash input is status only: do not inject a model message.
             raise CommandError(str(exc)) from exc
@@ -1594,7 +1624,10 @@ class SwarmController:
         if request["action"] == "post":
             return (f"STARTED op={request['operation_id']} post {request['target']}/pod={request['pod']}/"
                     f"{request['channel']} id={request['message_id']}; commit pending. Completion arrives automatically; peers not woken.")
-        scope = "all pods" if request.get("pods") is None else "pods=" + ",".join(map(str, request["pods"]))
+        if request["action"] == "create":
+            scope = f"{request['pods']} pods"
+        else:
+            scope = "all pods" if request.get("pods") is None else "pods=" + ",".join(map(str, request["pods"]))
         return (f"STARTED op={request['operation_id']} {request['action']} {request.get('target', '')} {scope}; "
                 "target validation pending. Completion arrives automatically; no polling needed.")
 
@@ -1663,6 +1696,8 @@ class SwarmController:
                             access=state.swarm_access, grants=state.grants)
 
     async def create(self, state, request):
+        profile = validate_model_profile(self.config, request.get("profile", state.settings.model))
+        request = dict(request, profile=profile)
         store, pool = await blocking(allocate_pool, state, request)
         outcomes = await self.launch_members(state, store, pool, recovering=False)
         operation = dict(id=request["operation_id"], action="create", epoch=pool["owner"]["epoch"],
@@ -1676,14 +1711,15 @@ class SwarmController:
         return dict(pool=pool, summary=summary, level="warning" if audit_error or any(
             r.get("error") for r in outcomes) else "info")
 
-    async def launch_members(self, state, store, pool, *, recovering):
+    async def launch_members(self, state, store, pool, *, recovering, settings=None):
+        settings = pool_launch_settings(state.settings, self.config, pool) if settings is None else settings
         limit = asyncio.Semaphore(4)
         async def launch(member):
             async with limit:
                 try:
                     checkpoint = await blocking(pin_checkpoint, state, store, member) if recovering else None
                     handle = await blocking(launch_member, state, pool["id"], member["session_id"],
-                                            state.settings, handles=self.handles, checkpoint=checkpoint)
+                                            settings, handles=self.handles, checkpoint=checkpoint)
                     return await await_member_ready(state, store, member, handle)
                 except Exception as exc:
                     status = "missing_checkpoint" if isinstance(exc, FileNotFoundError) else "blocked"
@@ -1708,12 +1744,16 @@ class SwarmController:
             result = await self.control(state, ControlRequest("interrupt", rebound["id"]).as_dict())
             result["summary"] = "Verified parent replacement; live child bindings preserved, no peers relaunched. " + result["summary"]
             return result
+        # Validate before ownership claim, but preserve the live-successor interrupt
+        # path above: it does not launch peers and needs no destination profile.
+        saved_pool = await blocking(store.pool)
+        settings = pool_launch_settings(state.settings, self.config, saved_pool)
         pool = await blocking(claim_recovery, state, store,
                              expected_epoch=request.get("expected_epoch"),
                              confirmed_stopped=request.get("confirmed_stopped", False))
         await blocking(repair_index, state, store, pool)
         state.swarm_resource_uids = {**getattr(state, "swarm_resource_uids", {}), pool["id"]: pool["resource_uid"]}
-        outcomes = await self.launch_members(state, store, pool, recovering=True)
+        outcomes = await self.launch_members(state, store, pool, recovering=True, settings=settings)
         operation = dict(id=pool["recovery"]["operation_id"], action="recover", epoch=pool["owner"]["epoch"],
                          state="finished", outcomes=outcomes, created_ns=time.time_ns())
         phase = "paused" if all(r["state"] == "ready_paused" for r in outcomes) else "mixed"
@@ -1969,15 +2009,26 @@ class SwarmCompletionCheck(InterruptCheck):
         server = getattr(state, "_session_websocket_server", None)
         if server is not None:
             for event, fence in list(c.ready_events):
-                c.ready_events.remove((event, fence))
                 if fence != identity:
+                    c.ready_events.remove((event, fence))
+                    LOG.warning("Discarding stale swarm startup event for %s", fence[1:3])
                     continue
                 try:
                     snapshot = c.snapshot(state)
                     factory = lambda snapshot=snapshot, event=event: c.startup(snapshot, event)
-                    future = server.submit_background(factory)
+                    try:
+                        future = server.submit_background(factory)
+                    except RuntimeError as exc:
+                        if str(exc) == "session websocket background server is not running or is stopping":
+                            # The core binds this service before starting its IO thread.
+                            # Rejected submission did not invoke the factory; retain the event.
+                            continue
+                        raise
+                    c.ready_events.remove((event, fence))
                     c.pending.append((future, fence))
                 except Exception as exc:
+                    c.ready_events.remove((event, fence))
+                    LOG.exception("Swarm startup submission failed for %s", identity[1:3])
                     state.pending_interrupts.append(f"Swarm startup blocked: {exc}")
         for future, fence in list(c.pending):
             if not future.done():
@@ -1994,6 +2045,7 @@ class SwarmCompletionCheck(InterruptCheck):
                 if result.get("summary"):
                     state.pending_interrupts.append(result["summary"])
             except Exception as exc:
+                LOG.exception("Swarm background operation failed for %s", identity[1:3])
                 state.pending_interrupts.append(f"Swarm background operation failed: {type(exc).__name__}: {exc}; "
                                                 "inspect durable attempts/outcomes; no automatic retry")
         return state
@@ -2009,7 +2061,7 @@ def register_features(builder, *, session, config):
         SwarmTool(controller, "cancel", "swarm_cancel"),
         SwarmTool(controller, "post_message", "swarm_post", parent_only=False),
         Command("/swarm", "Create, control, or explicitly recover pod-based swarms", controller.command,
-                raw=True, usage='/swarm -n N [-p PODS] | bcast|interrupt|continue|cancel \u2026 | recover ID --takeover --expected-epoch N --confirmed-stopped',
+                raw=True, usage='/swarm -n N [-p PODS] [--profile PROFILE] | bcast|interrupt|continue|cancel \u2026 | recover ID --takeover --expected-epoch N --confirmed-stopped',
                 section="Swarm"),
     ], order=[RegisterSpecialBuffers, SwarmBuffers, SwarmRuntimeReady, Command,
               SwarmCompletionCheck, InterruptDelivery, ToolDispatchStart]))
