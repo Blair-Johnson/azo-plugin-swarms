@@ -128,7 +128,7 @@ def test_non_readiness_runtime_error_is_logged_not_retried(startup_runtime, monk
     r.factory.assert_not_called()
     r.apply.assert_not_called()
     assert not r.controller.ready_events and not r.controller.pending
-    assert r.state.pending_interrupts == [f"Swarm startup blocked: {message}"]
+    assert r.state.pending_interrupts == [f"Swarm startup failed: {message}"]
     records = [record for record in caplog.records if "Swarm startup submission failed" in record.message]
     assert len(records) == 1 and records[0].exc_info
 
@@ -145,7 +145,7 @@ def test_snapshot_failure_is_logged_not_retried(startup_runtime, monkeypatch, ca
     submit.assert_not_called()
     r.factory.assert_not_called()
     assert not r.controller.ready_events and not r.controller.pending
-    assert r.state.pending_interrupts == ["Swarm startup blocked: snapshot unavailable"]
+    assert r.state.pending_interrupts == ["Swarm startup failed: snapshot unavailable"]
     records = [record for record in caplog.records if "Swarm startup submission failed" in record.message]
     assert len(records) == 1 and records[0].exc_info
 
@@ -166,8 +166,7 @@ def test_real_background_future_failure_is_logged_not_retried(startup_runtime, c
     r.apply.assert_not_called()
     assert not r.controller.ready_events and not r.controller.pending
     assert r.state.pending_interrupts == [
-        "Swarm background operation failed: RuntimeError: startup future failed; "
-        "inspect durable attempts/outcomes; no automatic retry"]
+        "Swarm operation failed: startup future failed"]
     records = [record for record in caplog.records if "Swarm background operation failed" in record.message]
     assert len(records) == 1 and records[0].exc_info
 

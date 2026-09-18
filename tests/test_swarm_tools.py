@@ -40,14 +40,14 @@ def test_tool_nonblocking_payload_preserved_and_completion_once(tool_runtime):
     t = tool_runtime; c = t.controller; state = t.runtime.state
     text = '  quoted "\\\\\n\u96ea\t  '
     receipt = c.broadcast("sw0", text, [1, 0, 1], state)
-    assert receipt.startswith("STARTED op=") and "pending" in receipt and "no polling" in receipt
+    assert receipt == "Sending message to sw0 (pods 1, 0)..."
     assert len(t.futures) == 1 and not t.futures[0].done()
     execute = AsyncMock(return_value=dict(summary="OK sent=2/2", access={"sw0": ""}, grants={}))
     c.execute = execute
     result = asyncio.run(t.factories[0]())
     request = execute.call_args.args[1]
     assert request["message"] == text and request["pods"] == (1, 0)
-    assert request["operation_id"] in receipt
+    assert request["operation_id"] not in receipt
     t.futures[0].set_result(result)
     check = swarm.SwarmCompletionCheck(c)
     check(state); check(state)
@@ -144,13 +144,14 @@ def test_event_before_server_schedules_only_from_interrupt_check(tool_runtime):
     assert len(t.futures) == 1 and not t.controller.ready_events
 
 
-def test_partial_summary_keeps_counts_and_all_failure_groups():
+def test_partial_summary_keeps_counts_and_bounds_failure_detail():
     outcomes = [dict(label=f"p{i}", state="unavailable", error=f"distinct reason {i}") for i in range(9)]
     outcomes.extend([dict(label="sent-peer", state="sent"), dict(label="unknown-peer", state="unknown", error="send timeout")])
     summary = swarm.operation_summary({"id": "sw0"}, dict(id="op", action="bcast", outcomes=outcomes, pods=[0]))
-    assert "sent=1" in summary and "unavailable=9" in summary and "unknown=1" in summary
-    assert all(f"distinct reason {i}" in summary for i in range(9))
-    assert "acceptance" in summary and "duplicate" in summary
+    assert "sent to 1 of 11 agents" in summary and "9 unavailable" in summary and "1 delivery unknown" in summary
+    assert all(f"distinct reason {i}" in summary for i in range(3))
+    assert "distinct reason 3" not in summary and "swarm:index" in summary
+    assert "acceptance" not in summary and "duplicate" not in summary and len(summary) < 300
 
 
 @pytest.mark.parametrize("pipeline_name", ["build_default_pipeline", "build_readonly_rlm_pipeline"])

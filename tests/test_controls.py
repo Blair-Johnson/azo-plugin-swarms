@@ -73,7 +73,7 @@ def test_forged_saved_parent_binding_does_not_authorize_controls(runtime, actor)
     state._session_id = r.members[0]["session_id"] if actor == "peer" else actor
     state.swarm_access = {"sw0": ""}
     result = asyncio.run(swarm.SwarmController({}).execute(state, swarm.ControlRequest("interrupt", "sw0")))
-    assert result["summary"].startswith("ERROR")
+    assert result["summary"].startswith("sw0:") and result["level"] == "warning"
     assert r.store.records().list("operations") == []
 
 
@@ -96,14 +96,14 @@ def test_all_controls_report_partial_outcomes_and_durable_opid(lineage, monkeypa
     client, _ = client_for(monkeypatch, l.a)
     request = swarm.ControlRequest(action, "sw0", message="text")
     result = asyncio.run(swarm.SwarmController({}).execute(r.state, request))
-    assert "sent=1" in result["summary"] and "unavailable=1" in result["summary"]
+    assert "1 of 2 agents" in result["summary"] and "1 unavailable" in result["summary"]
     operation = r.store.records().get("operations", request.operation_id)
     assert operation["epoch"] == 1 and len(operation["outcomes"]) == 2
     if action == "bcast":
         client.send_user.assert_awaited_once()
     elif action == "cancel":
         client.control.assert_awaited_once()
-        assert r.store.pool()["desired_state"] == "cancelled" and "exits unconfirmed" in result["summary"]
+        assert r.store.pool()["desired_state"] == "cancelled" and "shutdown requested" in result["summary"]
     else:
         client.slash.assert_awaited_once_with("/"+action)
 

@@ -229,7 +229,7 @@ def test_partial_recovery_does_not_replay_or_continue(runtime, monkeypatch):
     controller = swarm.SwarmController({})
     result = asyncio.run(controller.recover(r.state, r.store, {}))
     assert launches == [(saved.session_id, swarm.CheckpointRef(saved.session_id, saved.commit_id))]
-    assert "missing_checkpoint=1" in result["summary"] and "ready_paused=1" in result["summary"]
+    assert "1 missing checkpoint" in result["summary"] and "1 of 2 agents restored (paused)" in result["summary"]
     assert r.store.pool()["phase"] == "mixed"
     assert all(op["action"] == "recover" for op in r.store.records().list("operations"))
 
@@ -314,7 +314,7 @@ def test_transport_ready_without_plugin_admission_is_not_recoverable(runtime, mo
                  startup_mode="paused", paused=True, revision_id=saved.commit_id)
     handle = SimpleNamespace(ref=SimpleNamespace(instance_id=attempt["instance_id"]), process=SimpleNamespace(pid=200),
                              poll=lambda: SimpleNamespace(status="ready", ready=ready))
-    with pytest.raises(TimeoutError, match="plugin/shared-checkpoint"):
+    with pytest.raises(TimeoutError, match="Agent startup timed out"):
         asyncio.run(swarm.await_member_ready(r.state, r.store, member, handle, timeout=0))
     assert r.store.records().get("members", member["session_id"])["recovery_status"] == "pending"
 

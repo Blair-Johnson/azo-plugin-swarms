@@ -687,7 +687,7 @@ async def await_member_ready(state, store, member, handle, *, timeout=30):
         if observed.status in {"exited", "unknown"}:
             raise RuntimeError(observed.error or f"Peer {observed.status}")
         if asyncio.get_running_loop().time() >= deadline:
-            raise TimeoutError("Paused plugin/shared-checkpoint readiness timed out; attempt retained, no retry")
+            raise TimeoutError("Agent startup timed out")
         await asyncio.sleep(0.1)
 
 
@@ -969,7 +969,7 @@ def claim_recovery(state, store, *, expected_epoch=None, confirmed_stopped=False
                                                 process_evidence=classifications[sid], epoch=epoch + 1)))
             row = records.get("members", sid, {})
             row.update(session_id=sid, recovery_status="pending" if safe else "ambiguous",
-                       error="" if safe else f"Prior child {classifications[sid]}; quiescence unconfirmed, no duplicate spawn")
+                       error="" if safe else f"Previous agent is {classifications[sid]}; stop it before recovery")
             records.put("members", sid, row)
         records.put("operations", operation_id, dict(id=operation_id, action="recover", epoch=epoch + 1,
                     state="pending", outcomes=[], created_ns=time.time_ns()))
@@ -1123,7 +1123,7 @@ async def bootstrap_member(state, event, resource=None):
                        recovery_status="ready_paused" if event.get("paused") is True else "ready")
             records.put("members", state._session_id, row)
     await blocking(commit)
-    return dict(summary=f"Swarm {swarm_id} member admitted at shared revision {revision}; paused={event.get('paused') is True}.",
+    return dict(summary=f"{swarm_id}: agent ready{' (paused)' if event.get('paused') is True else ''}.",
                 access=state.swarm_access, replace_access=True, grants=state.grants,
                 resource_uids={swarm_id: pool["resource_uid"]}, level="info")
 
@@ -1544,37 +1544,58 @@ def failure_summary(outcomes):
     groups = defaultdict(list)
     for row in outcomes:
         if row.get("error"):
-            groups[(row["state"], row["error"])].append(row.get("label", row.get("session_id", "?")))
+            groups[brief_error(row["error"])].append(row.get("label", "agent"))
     lines = []
-    for (status, error), labels in groups.items():
-        shown = ",".join(labels[:20])
-        if len(labels) > 20:
-            shown += f" (+{len(labels)-20} peers)"
-        lines.append(f"{status}: {shown}: {error[:500]}")
-    return "\n".join(lines)
+    for error, labels in list(groups.items())[:3]:
+        shown = ", ".join(labels[:4])
+        if len(labels) > 4:
+            shown += f" and {len(labels) - 4} others"
+        lines.append(f"{shown}: {error}")
+    if len(groups) > 3:
+        lines.append("More details in swarm:index.")
+    return " ".join(lines)
+
+
+def brief_error(error):
+    text = " ".join(str(error).split())
+    text = re.sub(r"\b(?:[0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\b", "[id]", text, flags=re.I)
+    return text if len(text) <= 160 else text[:157] + "..."
+
+
+def pool_label(pool):
+    alias = pool.get("name", pool["id"])
+    return pool["id"] if alias == pool["id"] else f"{alias} ({pool['id']})"
 
 
 def operation_summary(pool, operation, *, audit_error=""):
     counts = Counter(row["state"] for row in operation["outcomes"])
-    action = "broadcast" if operation["action"] == "bcast" else operation["action"]
-    scope = "all pods" if operation.get("pods") is None else "pods=" + ",".join(map(str, operation["pods"]))
-    success = counts.get("sent", 0) if action not in {"recover", "create"} else counts.get("ready_paused", 0)
+    action = operation["action"]
+    ready = action in {"recover", "create"}
+    success = counts.get("ready_paused" if ready else "sent", 0)
     total = len(operation["outcomes"])
-    status = "OK" if success == total and not audit_error else "PARTIAL"
-    counts_text = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-    text = f"{status} op={operation['id']} {action} {pool['id']} {scope}: {counts_text}; total={total}."
-    meanings = {"broadcast": "Transport writes completed, not peer acceptance/execution.",
-                "interrupt": "Pause requested; tool quiescence unconfirmed.",
-                "continue": "Continuation requested; no peers launched.",
-                "cancel": "Swarm terminal; shutdown requested, exits unconfirmed.",
-                "recover": "Successful members remain paused. Last shared revisions only; unmirrored state may be lost.",
-                "create": "Successful members have shared seed checkpoints and remain paused."}
-    text += " " + meanings[action]
-    failures = failure_summary(operation["outcomes"])
+    number = str(success) if success == total else f"{success} of {total}"
+    agents = f"{number} agent{'s' if total != 1 else ''}"
+    message = {
+        "bcast": f"message sent to {agents}",
+        "interrupt": f"pause requested for {agents}",
+        "continue": f"continue requested for {agents}",
+        "cancel": f"shutdown requested for {agents}",
+        "create": f"{agents} ready (paused)",
+        "recover": f"{agents} restored (paused)",
+    }[action]
+    text = f"{pool_label(pool)}: {message}"
+    if operation.get("pods") is not None:
+        text += " — pods " + ", ".join(map(str, operation["pods"]))
+    failures = {key: value for key, value in counts.items() if key != ("ready_paused" if ready else "sent")}
     if failures:
-        text += "\n" + failures + "\nNo automatic retry; resending work may duplicate sent/unknown deliveries."
+        names = {"unknown": "delivery unknown", "missing_checkpoint": "missing checkpoint"}
+        text += "; " + ", ".join(f"{value} {names.get(key, key.replace('_', ' '))}" for key, value in sorted(failures.items()))
+    text += "."
+    detail = failure_summary(operation["outcomes"])
+    if detail:
+        text += " " + detail
     if audit_error:
-        text += f"\nAudit persistence unacknowledged: {audit_error}. Outcomes above are transport observations, not durable acknowledgement."
+        text += " Could not save the operation record: " + brief_error(audit_error)
     return text
 
 
@@ -1621,15 +1642,18 @@ class SwarmController:
 
     @staticmethod
     def receipt(request):
-        if request["action"] == "post":
-            return (f"STARTED op={request['operation_id']} post {request['target']}/pod={request['pod']}/"
-                    f"{request['channel']} id={request['message_id']}; commit pending. Completion arrives automatically; peers not woken.")
-        if request["action"] == "create":
-            scope = f"{request['pods']} pods"
-        else:
-            scope = "all pods" if request.get("pods") is None else "pods=" + ",".join(map(str, request["pods"]))
-        return (f"STARTED op={request['operation_id']} {request['action']} {request.get('target', '')} {scope}; "
-                "target validation pending. Completion arrives automatically; no polling needed.")
+        action = request["action"]
+        if action == "post":
+            return (f"Posting to {request['target']}/pod {request['pod']}/{request['channel']} "
+                    f"(message_id={request['message_id']})...")
+        if action == "create":
+            return (f"Creating {request.get('name') or 'swarm'}: {request['agents']} agent{'s' if request['agents'] != 1 else ''} "
+                    f"in {request['pods']} pod{'s' if request['pods'] != 1 else ''}...")
+        verb = {"bcast": "Sending message to", "interrupt": "Requesting pause for",
+                "continue": "Requesting continue for", "cancel": "Requesting shutdown for",
+                "recover": "Restoring"}[action]
+        scope = "" if request.get("pods") is None else " (pods " + ", ".join(map(str, request["pods"])) + ")"
+        return f"{verb} {request.get('target') or 'swarm'}{scope}..."
 
     def apply(self, state, result):
         if result.get("access"):
@@ -1691,8 +1715,8 @@ class SwarmController:
                               resource_uids=getattr(state, "swarm_resource_uids", {}))
                 return result
             except Exception as exc:
-                return dict(summary=f"ERROR op={request['operation_id']} {request['action']} "
-                            f"{request.get('target', '')}: {type(exc).__name__}: {exc}", level="warning",
+                LOG.warning("Swarm operation %s failed", request["operation_id"], exc_info=True)
+                return dict(summary=f"{request.get('target') or 'Swarm'}: {brief_error(exc)}", level="warning",
                             access=state.swarm_access, grants=state.grants)
 
     async def create(self, state, request):
@@ -1705,9 +1729,9 @@ class SwarmController:
         audit_error = await self.finish_operation(store, operation, phase="paused" if all(
             r["state"] == "ready_paused" for r in outcomes) else "mixed")
         summary = operation_summary(pool, operation, audit_error=audit_error)
-        summary += (f"\nUser-created {pool['id']} ({pool['name']}): zero-based pods "
-                    f"0\u2013{len(pool['pods'])-1}; channels={','.join(pool['channels'])}. "
-                    "Use swarm_broadcast/interrupt/continue/cancel and swarm_post; swarm:index lists resources.")
+        summary += (f" {len(pool['pods'])} pod{'s' if len(pool['pods']) != 1 else ''}; "
+                    f"channels: {', '.join(pool['channels'])}; profile: {profile}. "
+                    "Swarm tools are available; see swarm:index.")
         return dict(pool=pool, summary=summary, level="warning" if audit_error or any(
             r.get("error") for r in outcomes) else "info")
 
@@ -1742,7 +1766,7 @@ class SwarmController:
         rebound = await blocking(rebind_live_parent_successor, state, store, request)
         if rebound is not None:
             result = await self.control(state, ControlRequest("interrupt", rebound["id"]).as_dict())
-            result["summary"] = "Verified parent replacement; live child bindings preserved, no peers relaunched. " + result["summary"]
+            result["summary"] = "Reconnected to existing swarm agents. " + result["summary"]
             return result
         # Validate before ownership claim, but preserve the live-successor interrupt
         # path above: it does not launch peers and needs no destination profile.
@@ -1782,7 +1806,7 @@ class SwarmController:
             stores = await blocking(owned_stores, state)
         for swarm_id, store, error in stores:
             if error:
-                summaries.append(f"{swarm_id}: blocked: {error}")
+                summaries.append(f"{swarm_id}: recovery blocked: {brief_error(error)}")
                 continue
             pool = await blocking(store.pool)
             state.swarm_access[swarm_id] = ""
@@ -1793,7 +1817,7 @@ class SwarmController:
                 result = await self.recover(state, store, {})
                 summaries.append(result["summary"])
             except Exception as exc:
-                summaries.append(f"{swarm_id}: recovery blocked: {type(exc).__name__}: {exc}")
+                summaries.append(f"{swarm_id}: recovery blocked: {brief_error(exc)}")
         return dict(summary="\n".join(summaries), access=state.swarm_access, grants=state.grants,
                     resource_uids=getattr(state, "swarm_resource_uids", {}), level="info")
 
@@ -1884,10 +1908,10 @@ class SwarmController:
             identity, appended = await blocking(store.post, pod_id, request["channel"], request["message"],
                                                state._session_id, message_id=request["message_id"], receipt=True)
         except (OSError, RuntimeError) as exc:
-            return dict(summary=f"UNKNOWN post {pool['id']}/pod={pod} id={request['message_id']}: {exc}. "
-                        "Retry identical content with this same message_id; do not generate a new ID.", level="warning")
-        return dict(summary=f"OK post {pool['id']}/pod={pod}/{request['channel']} id={identity}: "
-                    f"{'committed' if appended else 'already committed; no duplicate append'}. Peers not woken.", level="info")
+            return dict(summary=f"{pool_label(pool)}/pod {pod}/{request['channel']}: write outcome unknown. "
+                        f"{brief_error(exc)}. Retry the same content with message_id={request['message_id']}.", level="warning")
+        return dict(summary=f"{pool_label(pool)}/pod {pod}/{request['channel']}: "
+                    f"message {'committed' if appended else 'already committed'}.", level="info")
 
     def broadcast(self, swarm_id: str, message: str, pods: list[int] | None = None, state=None) -> str:
         """Broadcast exact user text to existing peers; never create/relaunch or automatically retry.
@@ -1900,7 +1924,7 @@ class SwarmController:
         return self.submit(state, ControlRequest("bcast", swarm_id, None if pods is None else tuple(pods), message).as_dict())
 
     def interrupt(self, swarm_id: str, state=None) -> str:
-        """Request interruption of all peers. A sent request does not prove tool quiescence.
+        """Request a pause for every agent in the swarm.
 
         Args:
             swarm_id: Canonical swarm resource ID.
@@ -1916,7 +1940,7 @@ class SwarmController:
         return self.submit(state, ControlRequest("continue", swarm_id).as_dict())
 
     def cancel(self, swarm_id: str, state=None) -> str:
-        """Make a swarm terminal and request save/shutdown. Peer exit remains unconfirmed.
+        """Cancel the swarm and request that its agents save and shut down.
 
         Args:
             swarm_id: Canonical swarm resource ID.
@@ -2029,7 +2053,7 @@ class SwarmCompletionCheck(InterruptCheck):
                 except Exception as exc:
                     c.ready_events.remove((event, fence))
                     LOG.exception("Swarm startup submission failed for %s", identity[1:3])
-                    state.pending_interrupts.append(f"Swarm startup blocked: {exc}")
+                    state.pending_interrupts.append(f"Swarm startup failed: {brief_error(exc)}")
         for future, fence in list(c.pending):
             if not future.done():
                 continue
@@ -2046,8 +2070,7 @@ class SwarmCompletionCheck(InterruptCheck):
                     state.pending_interrupts.append(result["summary"])
             except Exception as exc:
                 LOG.exception("Swarm background operation failed for %s", identity[1:3])
-                state.pending_interrupts.append(f"Swarm background operation failed: {type(exc).__name__}: {exc}; "
-                                                "inspect durable attempts/outcomes; no automatic retry")
+                state.pending_interrupts.append(f"Swarm operation failed: {brief_error(exc)}")
         return state
 
 
