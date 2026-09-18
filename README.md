@@ -1,4 +1,4 @@
-# azo-plugin-swarm
+# azo-plugin-swarms
 
 Pod-based swarms with durable message boards, explicit agent tools, and paused recovery. Requires the Agent Zoo integration stack with lifecycle-managed background submissions, `RuntimeLaunch.startup_mode`, and the `runtime.session_ready` feature event. No additional runtime dependencies.
 
