@@ -155,7 +155,12 @@ def test_partial_summary_keeps_counts_and_bounds_failure_detail():
 
 
 @pytest.mark.parametrize("pipeline_name", ["build_default_pipeline", "build_readonly_rlm_pipeline"])
-def test_new_plugin_builds_real_pipelines(tmp_path, monkeypatch, pipeline_name):
+@pytest.mark.parametrize("session_kind,is_member", [
+    ("default", False), ("rlm", False), ("fork", False),
+    ("sw0p0a0", True), ("sw12p31a63", True),
+    ("sw0p0a0-extra", False), ("review_sw0p0a0", False),
+])
+def test_new_plugin_builds_real_pipelines(tmp_path, monkeypatch, pipeline_name, session_kind, is_member):
     from pathlib import Path
     import agent_zoo.pipelines as pipelines
     import agent_zoo.plugins as plugins
@@ -164,13 +169,43 @@ def test_new_plugin_builds_real_pipelines(tmp_path, monkeypatch, pipeline_name):
     (root / "common" / "swarm.py").write_text(Path(swarm.__file__).read_text())
     monkeypatch.setattr(plugins, "_base_dir", lambda: root)
     monkeypatch.setattr(plugins.metadata, "entry_points", lambda **kwargs: [])
+    # A restored member needs no launch environment. Conversely, inherited
+    # environment, a matching title, or parent resource access is not membership.
+    if is_member:
+        monkeypatch.delenv("AZO_SWARM_ID", raising=False)
+        monkeypatch.delenv("AZO_SWARM_POD_ID", raising=False)
+    else:
+        monkeypatch.setenv("AZO_SWARM_ID", "sw0")
+        monkeypatch.setenv("AZO_SWARM_POD_ID", "pod-1")
     session = Session(system_prompt="offline", token_budget=120000)
+    session.state._session_kind = session_kind
+    session.state._session_name = "sw0p0a0"
+    session.state.swarm_access = {"sw0": "pod-1" if is_member else ""}
     pipeline = getattr(pipelines, pipeline_name)(session, config={}, skill_paths=[], max_idle=0,
         terminal_backend="headless", mode_defs=default_modes() if pipeline_name == "build_default_pipeline" else rlm_modes(),
         on_interrupt=lambda _: None)
-    tools = {c.name for c in pipeline if isinstance(c, Tool) and c.name.startswith("swarm_")}
-    assert tools == {"swarm_broadcast", "swarm_interrupt", "swarm_continue", "swarm_cancel", "swarm_post"}
+    tools = {c.name for c in pipeline if isinstance(c, Tool)}
+    assert {t for t in tools if t.startswith("swarm_")} == {
+        "swarm_broadcast", "swarm_interrupt", "swarm_continue", "swarm_cancel", "swarm_post"}
+    assert "view" in tools
     assert any(type(c).__name__ == "SwarmCompletionCheck" for c in pipeline)
+    has_rlm = pipeline_name == "build_default_pipeline" and not is_member
+    assert tools & {"submit_rlm", "rlm_status", "cancel_rlm"} == (
+        {"submit_rlm", "rlm_status", "cancel_rlm"} if has_rlm else set())
+    has_compaction = pipeline_name == "build_default_pipeline"
+    for component in ("RLMProcessCheck", "ContextCompactionTrigger", "ContextCompactionRenderer"):
+        assert any(type(c).__name__ == component for c in pipeline) == has_compaction
+    if has_compaction:
+        poller = next(c for c in pipeline if type(c).__name__ == "RLMProcessCheck")
+        trigger = next(c for c in pipeline if type(c).__name__ == "ContextCompactionTrigger")
+        assert poller.rlm_queue is trigger.rlm_queue
+        pump = Mock(return_value=session.state)
+        monkeypatch.setattr(poller.rlm_queue, "poll_due", lambda _: True)
+        monkeypatch.setattr(poller.rlm_queue, "pump_queue", pump)
+        assert poller(session.state) is session.state
+        pump.assert_called_once_with(session.state)
+    if pipeline_name == "build_readonly_rlm_pipeline":
+        assert "finish_rlm" in tools
 
 
 def test_old_completion_cannot_roll_back_new_owner_grant(tool_runtime):

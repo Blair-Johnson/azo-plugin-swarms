@@ -24,6 +24,8 @@ Pod selectors are zero-based indices and inclusive ranges. Quoted messages may s
 
 Peers have stable attach-menu labels such as `sw0p0a0`. Use the ordinary attach menu to inspect or message an individual peer. New peers start paused and idle; an explicit user message or continuation releases the startup gate. Board messages alone do not authorize work.
 
+Swarm-member pipelines exclude the agent-facing RLM tools (`submit_rlm`, `rlm_status`, and `cancel_rlm`) so peers cannot delegate additional RLM work. Automatic context compaction remains enabled, including its shared internal RLM queue and poller; occasional maintenance jobs are separate from agent-directed delegation. This restriction follows the member's durable session kind through reload and recovery; parent and ordinary sessions retain their RLM tools. It does not cancel descendants launched by older pipelines.
+
 Malformed slash commands report through the TUI status bar. Accepted operations run asynchronously and report their outcome. Cancel requests graceful save-and-shutdown and marks the resource terminal; it is not a force-kill or proof of exit. Interrupt cannot preempt an arbitrary synchronous tool. Continue does not invent a new prompt or bypass an independent provider-error gate.
 
 ## Agent tools

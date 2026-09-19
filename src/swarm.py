@@ -2075,6 +2075,16 @@ class SwarmCompletionCheck(InterruptCheck):
 
 
 def register_features(builder, *, session, config):
+    # launch_member assigns this durable kind; unlike environment or display
+    # names it also identifies members during reload/recovery without disk IO.
+    kind = str(getattr(getattr(session, "state", None), "_session_kind", "") or "")
+    if re.fullmatch(r"sw[0-9]+p[0-9]+a[0-9]+", kind) and builder.has("rlm"):
+        # Restrict agent-directed delegation, not internal maintenance. Preserve
+        # the existing shared queue/poller so automatic compaction still works.
+        feature = builder._features["rlm"]
+        builder.add(replace(feature, components=[
+            component for component in feature.components if not isinstance(component, Tool)
+        ]))
     controller = SwarmController(config, session)
     builder.add(Feature("swarm", components=[
         SwarmBuffers(), SwarmRuntimeReady(controller), SwarmCompletionCheck(controller),
