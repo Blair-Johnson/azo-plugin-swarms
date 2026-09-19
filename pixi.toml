@@ -13,3 +13,6 @@ rlm = []
 
 [tasks]
 test = "bash scripts/test.sh"
+
+[tool.agent-zoo.plugin.config]
+files = ["config/worker_prompt.md", "skills/swarm/SKILL.md"]

@@ -119,9 +119,12 @@ def test_import_and_registration_have_no_writes_or_spawns(monkeypatch):
         guard.setattr(RuntimeLauncher, "prepare", forbidden); guard.setattr(RuntimeLauncher, "start", forbidden)
         spec.loader.exec_module(module)
         module.register_features(SimpleNamespace(add=features.append), session=SimpleNamespace(), config={})
-    feature, = features
-    assert feature.name == "swarm"
+    assert {feature.name for feature in features} == {"swarm", "swarm_guidance"}
+    feature = next(feature for feature in features if feature.name == "swarm")
     commands = [c for c in feature.components if isinstance(c, Command)]
     assert len(commands) == 1 and commands[0].path == "/swarm"
+    assert commands[0].usage == (
+        "/swarm -n AGENTS [-p PODS] [--channels NAME,...] [--name NAME] [--profile PROFILE]"
+    )
     assert {c.name for c in feature.components if isinstance(c, Tool)} == {
         "swarm_broadcast", "swarm_interrupt", "swarm_continue", "swarm_cancel", "swarm_post"}

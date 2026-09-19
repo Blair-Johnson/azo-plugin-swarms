@@ -166,6 +166,9 @@ def test_new_plugin_builds_real_pipelines(tmp_path, monkeypatch, pipeline_name, 
     import agent_zoo.plugins as plugins
     from agent_zoo.modes import default_modes, rlm_modes
     root = tmp_path / "plugins"; (root / "common").mkdir(parents=True)
+    skill_path = Path(swarm.resolve_state_root()) / "plugin-configs/azo-plugin-swarms/skills/swarm/SKILL.md"
+    skill_path.parent.mkdir(parents=True)
+    skill_path.write_text((Path(swarm.__file__).resolve().parent.parent / "skills/swarm/SKILL.md").read_text())
     (root / "common" / "swarm.py").write_text(Path(swarm.__file__).read_text())
     monkeypatch.setattr(plugins, "_base_dir", lambda: root)
     monkeypatch.setattr(plugins.metadata, "entry_points", lambda **kwargs: [])
@@ -184,6 +187,15 @@ def test_new_plugin_builds_real_pipelines(tmp_path, monkeypatch, pipeline_name, 
     pipeline = getattr(pipelines, pipeline_name)(session, config={}, skill_paths=[], max_idle=0,
         terminal_backend="headless", mode_defs=default_modes() if pipeline_name == "build_default_pipeline" else rlm_modes(),
         on_interrupt=lambda _: None)
+    session.pipeline = pipeline
+    session.ensure_initialized()
+    registration = next(c for c in pipeline if type(c).__name__ == "SwarmSkillRegistration")
+    registration(session.state)
+    assert bool(session.state.skill_registry.get("Swarms")) == (not is_member)
+    prompt = next(c for c in pipeline if type(c).__name__ == "SwarmSystemPrompt")
+    rendered = prompt.transform([{"role": "system", "content": "Base"}], session.state)[0]["content"]
+    assert ("# Swarm worker" in rendered) == is_member
+    assert pipeline.index(registration) < next(i for i, c in enumerate(pipeline) if type(c).__name__ == "MessageRenderer")
     tools = {c.name for c in pipeline if isinstance(c, Tool)}
     assert {t for t in tools if t.startswith("swarm_")} == {
         "swarm_broadcast", "swarm_interrupt", "swarm_continue", "swarm_cancel", "swarm_post"}

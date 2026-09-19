@@ -18,9 +18,14 @@ import time
 import uuid
 
 from agents.llm import require_model_enabled
-from agent_utils import Feature, Tool
-from agent_utils.components import ToolDispatchStart, InterruptCheck, InterruptDelivery, HarnessEventHandler
+from agent_utils import Feature, Tool, MODEL_RENDER_CHANNEL
+from agent_utils.components import (
+    ToolDispatchStart, InterruptCheck, InterruptDelivery, HarnessEventHandler,
+    RenderTransformRegistrar, MessageRenderer,
+)
+from agents.system_prompt import SystemPromptSkillList
 from agent_utils.session_repository import SessionRepository
+from agent_utils.skills import SkillSource
 from agent_utils.files.buffer_manager import ReadonlyBufferView
 from agent_utils.session_cwd import get_session_cwd
 from agent_zoo.runtime.commands import Command, CommandError, CommandResult
@@ -37,6 +42,101 @@ from tmux_pilot.process_identity import local_host_identity, capture_process_ide
 
 LOG = logging.getLogger(__name__)
 NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\Z")
+
+
+WORKER_KIND = re.compile(r"(?P<swarm>sw[0-9]+)p(?P<pod>[0-9]+)a(?P<agent>[0-9]+)\Z")
+
+
+def worker_identity(state):
+    """Durable runtime kind, not inherited environment or a display name."""
+    return WORKER_KIND.fullmatch(str(getattr(state, "_session_kind", "") or ""))
+
+
+def load_worker_prompt():
+    """Read once while building the pipeline, never while rendering or polling."""
+    relative = Path("config/worker_prompt.md")
+    installed = Path(resolve_state_root()) / "plugin-configs" / "azo-plugin-swarms" / relative
+    bundled = Path(__file__).resolve().parent.parent / relative
+    for path in (installed, bundled):
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError):
+            LOG.warning("Cannot read swarm worker guidance at %s", path, exc_info=True)
+    return ('Read view(buffer="swarm:index") for your pod boards and teammates. '
+            'Do your assigned work yourself; do not spawn subagents. Share findings with swarm_post.')
+
+
+class SwarmSkillRegistration(RenderTransformRegistrar):
+    """Bind the bundled coordinator skill once to each live/restored registry."""
+    optional_reads = {"skill_registry", "_session_kind"}
+    writes = {"skill_registry"}
+
+    def __init__(self):
+        self.registry = None
+        self.worker = None
+
+    def __call__(self, state):
+        registry = getattr(state, "skill_registry", None)
+        worker = bool(worker_identity(state))
+        if registry is None or (registry is self.registry and worker == self.worker):
+            return state
+        if worker:
+            # A restored worker may carry an old parent catalog; don't advertise
+            # coordinator instructions through either list_skills or skill.
+            existing = registry.get("Swarms")
+            if existing is not None:
+                registry.add_exclusions(existing.root)
+        else:
+            relative = Path("skills/swarm/SKILL.md")
+            installed = Path(resolve_state_root()) / "plugin-configs" / "azo-plugin-swarms" / relative
+            package = installed if installed.is_file() else Path(__file__).resolve().parent.parent / relative
+            registry.add_sources(SkillSource(package, kind="azo-plugin-swarms", scope="bundled",
+                                             precedence=-5000, native=True, always_list=True))
+        self.registry, self.worker = registry, worker
+        return state
+
+
+class SwarmSystemPrompt(RenderTransformRegistrar):
+    """Reapply role guidance to the current system entry after reload/compaction."""
+    reads = {"entries"}
+    optional_reads = {"_session_kind", "swarm_access"}
+    transform_name = "swarm role guidance"
+
+    def __init__(self, worker_prompt):
+        self.worker_prompt = worker_prompt
+
+    def __call__(self, state):
+        if not state.entries:
+            return state
+        entry = state.entries[0]
+        if self.transform_name not in entry.render_transform_names(MODEL_RENDER_CHANNEL, pending=True):
+            entry.append_render_transform(MODEL_RENDER_CHANNEL, self.transform, name=self.transform_name)
+        return state
+
+    def transform(self, messages, state):
+        if not messages or messages[0].get("role") != "system":
+            return messages
+        identity = worker_identity(state)
+        if identity:
+            block = (f"# Swarm worker\nYou are {identity.group(0)}, worker {identity['agent']} "
+                     f"in swarm {identity['swarm']}, pod {identity['pod']}.\n\n{self.worker_prompt}")
+        elif getattr(state, "swarm_access", {}):
+            block = ('# Swarm coordination\nThis session has user-created swarm resources. '
+                     'Activate skill(name="Swarms") before directing them. '
+                     'Read view(buffer="swarm:index") for boards and member transcripts. '
+                     'Use existing workers; do not create additional agents unless the user asks.')
+        else:
+            return messages
+        first = dict(messages[0])
+        content = first.get("content") or ""
+        if isinstance(content, list):
+            kind = "input_text" if any(item.get("type") == "input_text" for item in content if isinstance(item, dict)) else "text"
+            first["content"] = [*content, {"type": kind, "text": block}]
+        else:
+            first["content"] = str(content).rstrip() + "\n\n" + block
+        return [first, *messages[1:]]
 
 
 def name(value: str) -> str:
@@ -618,9 +718,7 @@ def launch_member(state, swarm_id: str, member_id: str, settings: RuntimeSetting
         target=target, source=Resume(checkpoint) if checkpoint else Fresh(), settings=settings,
         parent_session_id=state._session_id, kind=member["label"],
         title=f"{pool['name']} / {member['label']}", lifetime="independent", startup_mode="paused",
-        first_user_message="", startup_system_message=(
-            f"You belong to swarm {swarm_id}, pod index {next(p['index'] for p in pool['pods'] if p['id'] == pod_id)}. "
-            "Read swarm:index for boards. Only a new user message or explicit continue authorizes work."),
+        first_user_message="",
     )
     grant = dict(store.grant, role="member", instance_id=target.instance_id,
                  session_id=member_id, attempt_id=attempt_id)
@@ -1676,7 +1774,16 @@ class SwarmController:
 
     def complete(self, ctx, result):
         self.apply(ctx.state, result)
-        ctx.session.inject(result["summary"], role="system", system_generated=True)
+        if not worker_identity(ctx.state):
+            message = result.get("model_message", result["summary"])
+            operation = result.get("operation", {})
+            if operation.get("action") == "bcast":
+                pool = result["pool"]
+                receivers = ", ".join(row["label"] for row in operation["outcomes"])
+                message = (f"The user broadcast to {pool_label(pool)}; target workers: {receivers}. "
+                           f"{result['summary']}\nUser message (already submitted; do not resend):\n"
+                           + operation["message"])
+            ctx.session.inject(message, role="system", system_generated=True)
         return CommandResult.notice(result["summary"], level=result.get("level", "info"))
 
     def submit(self, state, request):
@@ -1732,7 +1839,11 @@ class SwarmController:
         summary += (f" {len(pool['pods'])} pod{'s' if len(pool['pods']) != 1 else ''}; "
                     f"channels: {', '.join(pool['channels'])}; profile: {profile}. "
                     "Swarm tools are available; see swarm:index.")
-        return dict(pool=pool, summary=summary, level="warning" if audit_error or any(
+        model_message = (f"The user launched swarm {pool_label(pool)}. {summary} "
+                         'Activate skill(name="Swarms") to learn how to coordinate this pool. '
+                         'Read view(buffer="swarm:index") for its boards and member transcripts. '
+                         'Ready workers are waiting for an assignment; use swarm_broadcast to send it as a user message.')
+        return dict(pool=pool, summary=summary, model_message=model_message, level="warning" if audit_error or any(
             r.get("error") for r in outcomes) else "info")
 
     async def launch_members(self, state, store, pool, *, recovering, settings=None):
@@ -1968,7 +2079,7 @@ class SwarmController:
         return self.submit(state, request)
 
 
-RUNTIME_READS = {"swarm_access", "swarm_resource_uids", "_session_id", "_instance_id", "_agent_zoo_context",
+RUNTIME_READS = {"swarm_access", "swarm_resource_uids", "_session_id", "_instance_id", "_session_kind", "_agent_zoo_context",
                  "_session_websocket_server", "session_launcher", "session_cwd", "_persistence_local_root",
                  "_runtime_startup_paused"}
 
@@ -2053,7 +2164,8 @@ class SwarmCompletionCheck(InterruptCheck):
                 except Exception as exc:
                     c.ready_events.remove((event, fence))
                     LOG.exception("Swarm startup submission failed for %s", identity[1:3])
-                    state.pending_interrupts.append(f"Swarm startup failed: {brief_error(exc)}")
+                    if not worker_identity(state):
+                        state.pending_interrupts.append(f"Swarm startup failed: {brief_error(exc)}")
         for future, fence in list(c.pending):
             if not future.done():
                 continue
@@ -2066,19 +2178,19 @@ class SwarmCompletionCheck(InterruptCheck):
             try:
                 result = future.result()
                 c.apply(state, result)
-                if result.get("summary"):
-                    state.pending_interrupts.append(result["summary"])
+                if result.get("summary") and not worker_identity(state):
+                    state.pending_interrupts.append(result.get("model_message", result["summary"]))
             except Exception as exc:
                 LOG.exception("Swarm background operation failed for %s", identity[1:3])
-                state.pending_interrupts.append(f"Swarm operation failed: {brief_error(exc)}")
+                if not worker_identity(state):
+                    state.pending_interrupts.append(f"Swarm operation failed: {brief_error(exc)}")
         return state
 
 
 def register_features(builder, *, session, config):
     # launch_member assigns this durable kind; unlike environment or display
     # names it also identifies members during reload/recovery without disk IO.
-    kind = str(getattr(getattr(session, "state", None), "_session_kind", "") or "")
-    if re.fullmatch(r"sw[0-9]+p[0-9]+a[0-9]+", kind) and builder.has("rlm"):
+    if worker_identity(getattr(session, "state", None)) and builder.has("rlm"):
         # Restrict agent-directed delegation, not internal maintenance. Preserve
         # the existing shared queue/poller so automatic compaction still works.
         feature = builder._features["rlm"]
@@ -2093,8 +2205,11 @@ def register_features(builder, *, session, config):
         SwarmTool(controller, "continue_swarm", "swarm_continue"),
         SwarmTool(controller, "cancel", "swarm_cancel"),
         SwarmTool(controller, "post_message", "swarm_post", parent_only=False),
-        Command("/swarm", "Create, control, or explicitly recover pod-based swarms", controller.command,
-                raw=True, usage='/swarm -n N [-p PODS] [--profile PROFILE] | bcast|interrupt|continue|cancel \u2026 | recover ID --takeover --expected-epoch N --confirmed-stopped',
+        Command("/swarm", "Launch a swarm", controller.command,
+                raw=True, usage='/swarm -n AGENTS [-p PODS] [--channels NAME,...] [--name NAME] [--profile PROFILE]',
                 section="Swarm"),
     ], order=[RegisterSpecialBuffers, SwarmBuffers, SwarmRuntimeReady, Command,
               SwarmCompletionCheck, InterruptDelivery, ToolDispatchStart]))
+    builder.add(Feature("swarm_guidance", components=[
+        SwarmSkillRegistration(), SwarmSystemPrompt(load_worker_prompt()),
+    ], order=[SwarmSkillRegistration, SwarmSystemPrompt, SystemPromptSkillList, MessageRenderer]))

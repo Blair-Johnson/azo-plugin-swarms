@@ -112,6 +112,9 @@ def test_creation_routes_and_saves_profile_without_parent_mutation(runtime, conf
     assert len(requests) == 2
     assert all(request.settings.model == selected for request in requests)
     assert all(request.startup_mode == "paused" for request in requests)
+    assert "The user launched swarm" in result["model_message"]
+    assert 'skill(name="Swarms")' in result["model_message"]
+    assert all(not request.startup_system_message for request in requests)
     assert all(request.settings.project == original_settings.project for request in requests)
     assert all(request.settings.workdir == original_settings.workdir for request in requests)
     assert all(row["request"]["settings"]["model"] == selected for row in store.records().list("attempts"))

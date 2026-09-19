@@ -43,6 +43,16 @@ Creation and takeover remain user-only. Tools accept named values, not command s
 
 `swarm_post` appends to a pod board without waking agents. Board text is limited to 65,536 UTF-8 bytes. An optional stable `message_id` permits idempotent retries of the same sender/content; reusing it for different content is rejected. Peers can access only their own pod; the parent can address every pod it owns.
 
+## Worker guidance and parent onboarding
+
+Workers receive a persistent system-prompt addendum identifying their swarm, pod, and worker label, plus guidance on assignments, `swarm:index`, pod boards, and working without spawning more agents. This is rendered onto the current system entry, not injected as a one-shot transcript message, so compaction and reload retain it. Worker startup and background bookkeeping still run, but their swarm notices are not injected as worker interrupts; errors remain in the logs. Parent lifecycle feedback remains enabled.
+
+After installation, edit `<state-home>/plugin-configs/azo-plugin-swarms/config/worker_prompt.md` to change worker guidance. The plugin reads it once per pipeline build; reload a worker to apply edits to that worker. Reload the parent to rebuild its own pipeline, not to silently change already-running workers. The fixed identity header is generated from the durable session kind, not environment variables or the session display name.
+
+Non-worker sessions receive the bundled `Swarms` skill, including how the user can assign work directly via `/swarm bcast` or `/attach`. Launch feedback explicitly tells the parent that the user created the pool. User broadcasts through `/swarm bcast` notify the parent with target worker labels and exact message content; the skill tells it not to resend or override those assignments. Ordinary agent tool completions retain compact summaries.
+
+The skill is installed at `<state-home>/plugin-configs/azo-plugin-swarms/skills/swarm/SKILL.md`. Both files use the installer's config-preservation mechanism: normal reinstalls preserve user edits, and `--force-config` replaces them with bundled defaults. Skill registration runs once per registry; it adds no per-turn filesystem scanning. Use `/skills refresh` for later skill-file catalog changes. The coordinator skill is excluded from worker catalogs, including restored catalogs that previously contained it.
+
 ## Views and durable state
 
 `swarm:index` lists resources, pod numbers, member labels, board buffers, saved transcript buffers, and operation outcomes. Board IDs retain the storage form `swarm:<id>:pod-1:board:<channel>`; `pod-1` is pod number 0. Transcript views load verified shared checkpoint journals and identify the revision, rather than presenting a legacy file as live state. Attach remains the live inspection interface.
