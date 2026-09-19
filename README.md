@@ -13,10 +13,16 @@ Pod-based swarms with durable message boards, explicit agent tools, and paused r
 /swarm bcast exploration -p 0-2,3 "A message to selected pods"
 /swarm interrupt sw0
 /swarm continue sw0
+/swarm cancel
 /swarm cancel sw0
+/swarm release
+/swarm capture sw0
+/swarm afk sw0 Keep reviewing until the assigned scope is covered.
+/swarm afk "Keep reviewing.
+Post findings before stopping."
 ```
 
-`-n` is the total number of agents. `-p` defaults to one; pods are equal-sized. Bounds are 1–32 pods, 1–64 agents per pod, and 1–32 distinct channels. Channels default to `general`. Project-scoped IDs (`sw0`, `sw1`, …) are never reused; `--name` adds a unique alias. Omitting a broadcast target requires exactly one owned, non-cancelled swarm.
+`-n` is the total number of agents. `-p` defaults to one; pods are equal-sized. Bounds are 1–32 pods, 1–64 agents per pod, and 1–32 distinct channels. Channels default to `general`. Project-scoped IDs (`sw0`, `sw1`, …) are never reused; `--name` adds a unique alias. Omitting the target for `bcast`, `cancel`, `release`, `capture`, or `afk` selects the sole owned, non-cancelled swarm; otherwise specify its ID or name.
 
 `--profile NAME` (or `--profile=NAME`) selects an enabled named entry in `llm.models` for every peer, without changing the parent model. New pools save the selected profile, including the current default when omitted. Recovery uses each pool's saved profile and blocks relaunch if it is missing or disabled on the destination; legacy pools without a saved profile use the current default. Profile validation does not prevent interrupting preserved live peers after a verified parent replacement.
 
@@ -26,7 +32,9 @@ Peers have stable attach-menu labels such as `sw0p0a0`. Use the ordinary attach 
 
 Swarm-member pipelines exclude the agent-facing RLM tools (`submit_rlm`, `rlm_status`, and `cancel_rlm`) so peers cannot delegate additional RLM work. Automatic context compaction remains enabled, including its shared internal RLM queue and poller; occasional maintenance jobs are separate from agent-directed delegation. This restriction follows the member's durable session kind through reload and recovery; parent and ordinary sessions retain their RLM tools. It does not cancel descendants launched by older pipelines.
 
-Malformed slash commands report through the TUI status bar. Accepted operations run asynchronously and report their outcome. Cancel requests graceful save-and-shutdown and marks the resource terminal; it is not a force-kill or proof of exit. Interrupt cannot preempt an arbitrary synchronous tool. Continue does not invent a new prompt or bypass an independent provider-error gate.
+Malformed slash commands report through the TUI status bar. Accepted operations run asynchronously and report their outcome. Cancel requests graceful save-and-shutdown and permanently retires the resource: it cannot be recovered, continued, or assigned more work. Historical boards and transcripts remain readable. Interrupt cannot preempt an arbitrary synchronous tool. Continue does not invent a new prompt or bypass an independent provider-error gate.
+
+`release` and `capture` forward the native commands to every worker, selecting autonomous or interactive pace. `afk` sets the native continuation instructions without changing pace; with no message it queries those instructions, and `clear` clears them. Quote an AFK message when omitting the swarm target. After an explicit target, the message may be quoted or free text, including multiple lines. These commands address the whole swarm and never create replacement workers.
 
 ## Agent tools
 
@@ -55,7 +63,9 @@ The skill is installed at `<state-home>/plugin-configs/azo-plugin-swarms/skills/
 
 ## Views and durable state
 
-`swarm:index` lists resources, pod numbers, member labels, board buffers, saved transcript buffers, and operation outcomes. Board IDs retain the storage form `swarm:<id>:pod-1:board:<channel>`; `pod-1` is pod number 0. Transcript views load verified shared checkpoint journals and identify the revision, rather than presenting a legacy file as live state. Attach remains the live inspection interface.
+`swarm:index` is a compact directory of resources, pods, board buffers, and worker transcript aliases such as `swarm:sw0p0a0`. Cancelled swarms occupy one archive line. Open `swarm:sw0:index` for a specific swarm's directory, including historical members, or `swarm:sw0:operations` for its operation history. Operation details and transcripts are not loaded into the index.
+
+Board IDs retain the storage form `swarm:<id>:pod-1:board:<channel>`; `pod-1` is pod number 0. Existing long session buffer IDs remain valid. Transcript views render all saved messages on demand, with the newest turn first and chronological messages within each turn. Readable user and assistant text, tool calls, and tool results replace raw provider JSON; opaque provider metadata is omitted. Each view identifies its shared checkpoint revision and source. Attach remains the live inspection interface.
 
 Authoritative records live under `<state-home>/projects/<project>/swarms/`. Immutable message records and append-only references preserve board history. Host-local SQLite is a disposable projection; losing temporary files or caches does not erase acknowledged boards. Shared-storage failures are surfaced rather than hidden behind a stale cache. Ownership checks and mutations share a per-swarm lock; stale runtime grants cannot publish new board entries or overwrite successor outcomes.
 

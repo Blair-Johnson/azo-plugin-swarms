@@ -26,7 +26,7 @@ def test_registration_exposes_one_raw_user_command_without_work(monkeypatch):
     forbidden.assert_not_called()
 
 
-@pytest.mark.parametrize("raw", ["", "-n0", "-n3 -p2", 'bcast "unterminated', "cancel"])
+@pytest.mark.parametrize("raw", ["", "-n0", "-n3 -p2", 'bcast "unterminated', "cancel sw0 sw1"])
 def test_invalid_command_has_no_background_or_storage_work(runtime, monkeypatch, raw):
     ctx = SimpleNamespace(state=runtime.state, session=SimpleNamespace(inject=Mock()), defer=Mock())
     forbidden = Mock(side_effect=AssertionError("invalid command side effect"))

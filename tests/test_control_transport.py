@@ -11,7 +11,7 @@ from tmux_pilot.process_identity import capture_process_identity
 import swarm
 
 
-@pytest.mark.parametrize("action", ["bcast", "interrupt", "continue", "cancel"])
+@pytest.mark.parametrize("action", ["bcast", "interrupt", "continue", "cancel", "release", "capture", "afk"])
 def test_native_control_channels(tmp_path, monkeypatch, action):
     monkeypatch.setenv("AGENT_ZOO_LOCAL_STATE_ROOT", str(tmp_path / "local"))
     monkeypatch.setenv("AGENT_ZOO_HOME", str(tmp_path / "shared"))
@@ -38,7 +38,7 @@ def test_native_control_channels(tmp_path, monkeypatch, action):
             assert frame.payload == {"type": "shutdown", "save": True, "reason": "swarm-cancel"}
         else:
             assert frame.channel == "slash_command"
-            assert frame.payload == {"raw": "/" + action}
+            assert frame.payload == {"raw": "/afk " + text if action == "afk" else "/" + action}
     finally:
         assert server.stop_background(timeout_s=5)
 

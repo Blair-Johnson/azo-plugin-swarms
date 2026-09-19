@@ -158,7 +158,7 @@ def pod_selection(value: str) -> tuple[int, ...]:
     return tuple(sorted(selected))
 
 
-def quoted_message(source: str) -> str:
+def quoted_message(source: str, *, label="Broadcast") -> str:
     quote, chars, index = source[0], [], 1
     while index < len(source):
         char = source[index]
@@ -167,7 +167,7 @@ def quoted_message(source: str) -> str:
                 raise ValueError("The quoted message must be the final argument")
             message = "".join(chars)
             if not message.strip():
-                raise ValueError("Broadcast message must not be blank")
+                raise ValueError(f"{label} message must not be blank")
             return message
         if char == "\\" and index + 1 < len(source) and source[index + 1] in (quote, "\\"):
             index += 1
@@ -210,7 +210,7 @@ def parse_command(raw_args: str) -> dict:
     source = raw_args.lstrip()
     if not source:
         raise ValueError("Usage: /swarm -n AGENTS [-p PODS] [--channels NAMES] [--name NAME] [--profile PROFILE]; "
-                         "or /swarm bcast|interrupt|continue|cancel ...")
+                         "or /swarm bcast|interrupt|continue|cancel|release|capture|afk ...")
     if source.startswith("-"):
         values, positional = command_options(source.split(), {
             "-n": "agents", "-p": "pods", "--channels": "channels", "--name": "name",
@@ -250,11 +250,32 @@ def parse_command(raw_args: str) -> dict:
         return dict(action=action, target=name(targets[0]) if targets else None,
                     pods=pod_selection(values["pods"]) if "pods" in values else None,
                     message=quoted_message(rest[quote.start():]))
-    if action in {"cancel", "interrupt", "continue"}:
+    if action == "afk":
+        target, message = None, None
+        if rest:
+            if rest[0] in "\"'":
+                message = quoted_message(rest, label="AFK")
+            else:
+                target, *payload = rest.split(maxsplit=1)
+                target = name(target)
+                if payload:
+                    text = payload[0]
+                    if text[0] in "\"'":
+                        message = quoted_message(text, label="AFK")
+                    else:
+                        # A leading option is not a pod selector. Quote literal
+                        # dash-leading instructions; '-' remains native AFK clear.
+                        if text.startswith("-") and text.strip() != "-":
+                            raise ValueError("AFK addresses the whole swarm; quote dash-leading instructions")
+                        message = text
+        return dict(action=action, target=target, message=message)
+    if action in {"cancel", "release", "capture", "interrupt", "continue"}:
         targets = rest.split()
-        if len(targets) != 1:
-            raise ValueError(f"Usage: /swarm {action} NAME_OR_ID")
-        return dict(action=action, target=name(targets[0]))
+        optional = action in {"cancel", "release", "capture"}
+        if len(targets) > 1 or (not optional and not targets):
+            argument = "[NAME_OR_ID]" if optional else "NAME_OR_ID"
+            raise ValueError(f"Usage: /swarm {action} {argument}")
+        return dict(action=action, target=name(targets[0]) if targets else None)
     raise ValueError(f"Unknown swarm operation: {action}")
 
 
@@ -625,17 +646,166 @@ def shared_checkpoint(state, session_id, revision_id=None):
 
 
 def saved_transcript(state, session_id):
+    """Readable projection of all messages in the canonical shared checkpoint."""
     header = f"Session {session_id}\nShared saved transcript, not a live stream.\n"
     try:
         saved = shared_checkpoint(state, session_id)
     except FileNotFoundError:
         return header + "No shared checkpoint is available; local-only state may still exist.\n"
-    lines = [header, f"Revision: {saved.commit_id}; source: {saved.repository} ({saved.source_format})"]
-    for entry in saved.document.get("entries", []):
-        for message in entry.get("messages", []):
-            if message.get("role") in {"user", "assistant", "tool"}:
-                lines.append(json.dumps(message, ensure_ascii=False))
-    return "\n".join(lines) + "\n"
+    lines = [header, f"Source Commit: {saved.commit_id}",
+             f"Source Instance: {saved.instance_id}",
+             f"Source Repository: {saved.repository}", f"Source Format: {saved.source_format}",
+             "Order: Newest turn first; messages within each turn remain chronological.",
+             "Entry pointers: canonical document indices, not journal file lines."]
+    entries = saved.document.get("entries")
+    if not isinstance(entries, list):
+        nested = saved.document.get("state")
+        entries = nested.get("entries", []) if isinstance(nested, dict) else []
+    turns, current = [], []
+    title = "Context before first user turn"
+    for position, entry in enumerate(entries or []):
+        if not isinstance(entry, dict):
+            continue
+        index = entry.get("index", position)
+        if type(index) is not int:
+            index = position
+        messages = [m for m in (entry.get("messages") or []) if isinstance(m, dict)]
+        calls_seen, results_seen = set(), set()
+        for ordinal, message in enumerate(messages, 1):
+            role = str(message.get("role") or message.get("type") or "message")
+            generated = bool(entry.get("system_generated") or message.get("system_generated"))
+            if role == "user" and not generated:
+                if current:
+                    turns.append((title, current))
+                current = []
+                title = f"Turn [entry {index}]"
+            if role in {"tool", "function", "tool_result", "function_call_output"}:
+                label = "TOOL RESULT"
+            elif role in {"tool_use", "function_call"}:
+                label = "TOOL CALL"
+            else:
+                label = role.upper()
+            qualifiers = []
+            if generated:
+                qualifiers.append("system-generated")
+            if message.get("channel"):
+                qualifiers.append(str(message["channel"]))
+            if message.get("name"):
+                qualifiers.append(str(message["name"]))
+            if qualifiers:
+                label += " (" + ", ".join(qualifiers) + ")"
+            pointer = f"entry {index}; message {ordinal}"
+            call_id = message.get("tool_call_id") or message.get("call_id")
+            if call_id:
+                pointer += f"; call {call_id}"
+                if role in {"tool", "function"}:
+                    results_seen.add(str(call_id))
+            current.extend(["", f"### {label} [{pointer}]"])
+            body = _swarm_content_text(message if message.get("type") in {
+                "tool_use", "function_call", "tool_result", "function_call_output"
+            } else message.get("content"))
+            if body:
+                current.append(body)
+            for field in ("reasoning_content", "thinking_blocks", "refusal"):
+                readable = _swarm_content_text(message.get(field))
+                if readable:
+                    current.extend([f"{field.replace('_', ' ').title()}:", readable])
+            message_calls = [*(message.get("tool_calls") or []),
+                             *(message.get("provider_tool_calls") or [])]
+            if isinstance(message.get("function_call"), dict):
+                message_calls.append(message["function_call"])
+            for call in message_calls:
+                if isinstance(call, dict):
+                    key = str(call.get("id") or call.get("call_id") or "")
+                    if key and key in calls_seen:
+                        continue
+                    current.extend(_swarm_call_lines(call))
+                    if key:
+                        calls_seen.add(key)
+            # Content-block and direct provider calls/results can duplicate the
+            # native entry mirror; record both shapes before rendering that mirror.
+            content = message.get("content")
+            blocks = [message, *(content if isinstance(content, list) else [])]
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") in {"tool_use", "function_call"}:
+                    calls_seen.add(str(block.get("id") or block.get("call_id") or ""))
+                elif block.get("type") in {"tool_result", "function_call_output"}:
+                    results_seen.add(str(block.get("tool_use_id") or block.get("call_id") or ""))
+        # Native ToolCall records may have arguments/results not yet mirrored into
+        # messages at the saved boundary. Include them without repeating mirrors.
+        for call in entry.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            key = str(call.get("id") or call.get("call_id") or "")
+            if not key or key not in calls_seen:
+                current.extend(["", f"### TOOL CALL [entry {index}]"])
+                current.extend(_swarm_call_lines(call))
+            if call.get("result") is not None and (not key or key not in results_seen):
+                status = " (error)" if call.get("error") else ""
+                current.extend(["", f"### TOOL RESULT{status} [entry {index}; call {key}]",
+                                _swarm_content_text(call["result"])])
+    if current:
+        turns.append((title, current))
+    for title, messages in reversed(turns):
+        lines.extend(["", f"## {title}", *messages])
+    if not turns:
+        lines.append("No saved messages.")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _swarm_argument_text(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return value
+    return json.dumps(value, ensure_ascii=False, indent=2)
+
+
+def _swarm_call_lines(call):
+    function = call.get("function") if isinstance(call.get("function"), dict) else call
+    label = str(function.get("name") or "(unnamed)")
+    call_id = call.get("id") or call.get("call_id")
+    suffix = f" [call {call_id}]" if call_id else ""
+    arguments = next((function[key] for key in ("arguments", "raw_args", "input", "parsed_args")
+                      if key in function), None)
+    lines = [f"Tool call: {label}{suffix}"]
+    if arguments is not None:
+        lines.extend(["Arguments:", _swarm_argument_text(arguments)])
+    return lines
+
+
+def _swarm_content_text(value):
+    """Keep plaintext and structured tool payloads, not ciphertext/media blobs."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(text for item in value if (text := _swarm_content_text(item)))
+    if not isinstance(value, dict):
+        return str(value)
+    kind = value.get("type")
+    if kind in {"redacted_thinking", "encrypted_reasoning"}:
+        return ""
+    if kind in {"tool_use", "function_call"}:
+        return "\n".join(_swarm_call_lines(value))
+    if kind in {"tool_result", "function_call_output"}:
+        call_id = value.get("tool_use_id") or value.get("call_id") or ""
+        status = " (error)" if value.get("is_error") else ""
+        body = _swarm_content_text(value.get("content", value.get("output")))
+        return f"Tool result{status} [call {call_id}]:\n{body}"
+    if kind in {"image", "image_url", "input_image", "audio", "input_audio", "video",
+                "file", "input_file", "document"}:
+        return f"[{kind}: non-text payload omitted]"
+    text_fields = ("text", "content", "thinking", "refusal", "summary")
+    if kind in {"text", "input_text", "output_text", "summary_text", "thinking", "reasoning", "refusal"} or (
+            not kind and value and set(value).issubset(text_fields)):
+        return "\n".join(filter(None, (_swarm_content_text(value[key])
+                                      for key in text_fields if key in value)))
+    return json.dumps(value, ensure_ascii=False, indent=2)
 
 
 class SwarmBuffers:
@@ -648,32 +818,72 @@ class SwarmBuffers:
         state.buffer_manager.register_special_buffer_namespace("swarm:", self.render, replace=True)
         return state
 
+    @staticmethod
+    def index_lines(state, swarm_id, *, collapse_cancelled=False):
+        store = allowed_store(state, swarm_id)
+        scope = effective_scope(state, swarm_id, store)
+        pool = store.pool()
+        alias = pool.get("name", swarm_id)
+        label = swarm_id if alias == swarm_id else f"{swarm_id} ({alias})"
+        index_id = f"swarm:{swarm_id}:index"
+        if collapse_cancelled and pool["desired_state"] == "cancelled":
+            return [f"{label} — cancelled (archived): {index_id}"]
+        lines = [f"{label} — {pool['desired_state']}: {index_id}"]
+        if not scope:
+            lines.append(f"Operations: swarm:{swarm_id}:operations")
+        for pod in pool["pods"]:
+            if scope and scope != pod["id"]:
+                continue
+            prefix = f"swarm:{swarm_id}:{pod['id']}"
+            lines.append(f"Pod {pod['index']} ({pod['id']})")
+            lines.extend(f"  {channel}: {prefix}:board:{channel}" for channel in pool["channels"])
+            for member in pod["members"]:
+                expected = f"{swarm_id}p{pod['index']}a{member['index']}"
+                # Older nonstandard labels retain their original long buffer IDs.
+                target = (f"swarm:{expected}" if member["label"] == expected and WORKER_KIND.fullmatch(expected)
+                          else f"{prefix}:session:{member['session_id']}")
+                lines.append(f"  {member['label']}: {target}")
+        return lines
+
     def render(self, state, buffer_id):
         parts = buffer_id.split(":")
+        if not parts or parts[0] != "swarm":
+            return None
         if parts == ["swarm", "index"]:
-            lines = ["Swarm resources", "Recovery restores verified shared checkpoints paused; it never replays work.",
-                     "Saved membership is not evidence that a peer is running or stopped."]
+            lines = ["Swarm resources"]
             for swarm_id in getattr(state, "swarm_access", {}):
-                store = allowed_store(state, swarm_id)
-                scope = effective_scope(state, swarm_id, store)
-                pool = store.pool()
-                lines.append(f"\nSwarm {swarm_id} ({pool.get('name', swarm_id)}); desired state: {pool['desired_state']}")
-                if not scope:
-                    recent = sorted(store.records().list("operations"), key=lambda row: row.get("created_ns", 0))[-10:]
-                    for operation in recent:
-                        lines.append("Operation: " + json.dumps({key: value for key, value in operation.items()
-                                     if key != "message"}, ensure_ascii=False))
-                for pod in pool["pods"]:
-                    if scope and scope != pod["id"]:
-                        continue
-                    prefix = f"swarm:{swarm_id}:{pod['id']}"
-                    lines.append(f"Pod {pod['id']} (index {pod['index']}; {len(pod['members'])} agents)")
-                    lines.extend(f"Agent: {m['label']} / {m['session_id']}" for m in pod["members"])
-                    lines.extend(f"Board: {prefix}:board:{channel}" for channel in pool["channels"])
-                    lines.extend(f"Transcript: {prefix}:session:{m['session_id']}" for m in pod["members"])
+                lines.extend(["", *self.index_lines(state, swarm_id, collapse_cancelled=True)])
             if not getattr(state, "swarm_access", {}):
                 lines.append("No swarm resource is bound to this session.")
             text = "\n".join(lines) + "\n"
+        elif len(parts) == 3 and parts[2] in {"index", "operations"}:
+            swarm_id, kind = parts[1:]
+            if kind == "index":
+                text = "\n".join(self.index_lines(state, swarm_id)) + "\n"
+            else:
+                store = allowed_store(state, swarm_id)
+                if effective_scope(state, swarm_id, store) or store.pool()["owner_session_id"] != state._session_id:
+                    raise ValueError("Only the owning parent may read swarm operations")
+                operations = sorted(store.records().list("operations"), key=lambda row: row.get("created_ns", 0),
+                                    reverse=True)
+                text = f"{swarm_id} operations — saved records, newest first.\n"
+                text += "\n\n".join(json.dumps(row, ensure_ascii=False, indent=2) for row in operations)
+                text += "\n" if operations else "No saved operations.\n"
+        elif len(parts) == 2 and (identity := WORKER_KIND.fullmatch(parts[1])):
+            swarm_id = identity["swarm"]
+            store = allowed_store(state, swarm_id)
+            pool = store.pool()
+            pod = next((p for p in pool["pods"] if p["index"] == int(identity["pod"])), None)
+            if pod is None:
+                return None
+            scope = effective_scope(state, swarm_id, store)
+            if scope and pod["id"] != scope:
+                raise ValueError("Pod is outside this session's swarm scope")
+            member = next((m for m in pod["members"] if m["index"] == int(identity["agent"])
+                           and m["label"] == parts[1]), None)
+            if member is None:
+                return None
+            text = saved_transcript(state, member["session_id"])
         elif len(parts) == 5:
             _, swarm_id, pod_id, kind, target = parts
             store = allowed_store(state, swarm_id, pod_id)
@@ -1306,6 +1516,8 @@ def resolve_pool(state, target):
 
 def control_members(pool, request):
     selected = request.get("pods")
+    if selected is not None and request["action"] != "bcast":
+        raise ValueError("This control addresses the whole swarm; pod targeting is not supported")
     available = {pod["index"] for pod in pool["pods"]}
     if selected is not None and (not selected or any(type(p) is not int for p in selected) or set(selected) - available):
         raise ValueError("Pod selection is outside this swarm")
@@ -1323,6 +1535,17 @@ def validate_broadcast(message):
     frame = dict(type="send", channel="user_text", payload={"text": message}, client_id="0" * 32)
     if len(json.dumps(frame).encode("utf-8")) > MAX_BROADCAST_FRAME_BYTES:
         raise ValueError("Broadcast exceeds the 1 MiB encoded message limit; send a shorter message")
+
+
+def afk_command(message=None):
+    """Forward native AFK query/configuration, never a pace or lifecycle change."""
+    if message is not None and (not isinstance(message, str) or not message.strip()):
+        raise ValueError("AFK message must not be blank; use clear to reset instructions")
+    raw = "/afk" if message is None else "/afk " + message
+    frame = dict(type="send", channel="slash_command", payload={"raw": raw}, client_id="0" * 32)
+    if len(json.dumps(frame).encode("utf-8")) > MAX_BROADCAST_FRAME_BYTES:
+        raise ValueError("AFK exceeds the 1 MiB encoded message limit; send shorter instructions")
+    return raw
 
 
 class PreSendRace(ValueError):
@@ -1478,8 +1701,8 @@ def revalidate_target(store, member, proposal):
             raise PreSendRace("Replacement discovery changed before dispatch")
 
 
-def cas_adopt(store, member, proposal):
-    with store.mutation(allow_cancelled=True) as (records, pool):
+def cas_adopt(store, member, proposal, *, allow_cancelled=False):
+    with store.mutation(allow_cancelled=allow_cancelled) as (records, pool):
         with records.transaction("attempts", member["session_id"]) as saved:
             if (saved.get("attempt_id") != proposal["attempt_id"]
                     or saved.get("binding_revision", 0) != proposal["revision"]
@@ -1488,6 +1711,12 @@ def cas_adopt(store, member, proposal):
                 raise PreSendRace("Binding CAS lost; rediscovery required")
             previous = saved.get("current")
             facts = proposal["facts"]
+            if pool["desired_state"] == "cancelled":
+                if proposal["path"] or facts["instance_id"] != (previous or saved)["instance_id"]:
+                    raise ValueError("Cancelled swarms cannot adopt replacement peers")
+                # Shutdown can reach the exact recorded instance without adopting
+                # even its first registry binding into a terminal pool.
+                return saved.get("binding_revision", 0)
             if previous and all(previous.get(k) == v for k, v in facts.items()):
                 return saved["binding_revision"]
             saved["current"] = dict(facts, registry_store_root=proposal["registry_store_root"],
@@ -1508,13 +1737,16 @@ def exact_hello(client, target):
 
 async def send_to_member(target, request, *, store=None, member=None):
     """Validate once, send once on that socket; takeover cannot cross dispatch admission."""
+    action = request["action"]
+    needed = {"bcast": "input:user_text", "interrupt": "input:slash_command",
+              "continue": "input:slash_command", "cancel": "control:shutdown",
+              "release": "input:slash_command", "capture": "input:slash_command",
+              "afk": "input:slash_command"}[action]
+    raw = afk_command(request.get("message")) if action == "afk" else "/" + action
+    if store is not None and needed not in target["facts"]["capabilities"]:
+        raise ValueError(f"Peer lacks capability {needed}; no send attempted")
     client = AzoWs.attach(endpoint(target["ready"]["websocket_url"]), modern=False,
                           terminate_on_close=False, connect_timeout_s=10)
-    if store is not None:
-        needed = {"bcast": "input:user_text", "interrupt": "input:slash_command",
-                  "continue": "input:slash_command", "cancel": "control:shutdown"}[request["action"]]
-        if needed not in target["facts"]["capabilities"]:
-            raise ValueError(f"Peer lacks capability {needed}; no send attempted")
     dispatched = False
     loop = asyncio.get_running_loop()
     identity = ProcessIdentity.from_dict(target["process_identity"])
@@ -1530,7 +1762,7 @@ async def send_to_member(target, request, *, store=None, member=None):
             elif action == "cancel":
                 await client.control("shutdown", {"save": True, "reason": "swarm-cancel"})
             else:
-                await client.slash("/" + action)
+                await client.slash(raw)
 
     try:
         async with asyncio.timeout(30):
@@ -1540,12 +1772,12 @@ async def send_to_member(target, request, *, store=None, member=None):
                 raise ValueError("Peer process changed during connection")
             if store is not None:
                 await blocking(revalidate_target, store, member, target)
-                revision = await blocking(cas_adopt, store, member, target)
+                revision = await blocking(cas_adopt, store, member, target, allow_cancelled=action == "cancel")
                 def admitted_send():
                     # Keep acquisition, send wait and release in one worker thread. File-lock
                     # thread-local tracking must not be spread over arbitrary executor workers.
                     # This is the separate external-effect gate, NOT a record transaction body.
-                    with store.mutation(allow_cancelled=True) as (records, pool):
+                    with store.mutation(allow_cancelled=action == "cancel") as (records, pool):
                         final = connection_target(store, member)
                         if final["facts"] != target["facts"] or final["revision"] != revision:
                             raise PreSendRace("Peer changed after adoption")
@@ -1650,7 +1882,7 @@ def failure_summary(outcomes):
             shown += f" and {len(labels) - 4} others"
         lines.append(f"{shown}: {error}")
     if len(groups) > 3:
-        lines.append("More details in swarm:index.")
+        lines.append("Full outcomes are in the operations buffer linked from swarm:index.")
     return " ".join(lines)
 
 
@@ -1678,6 +1910,9 @@ def operation_summary(pool, operation, *, audit_error=""):
         "interrupt": f"pause requested for {agents}",
         "continue": f"continue requested for {agents}",
         "cancel": f"shutdown requested for {agents}",
+        "release": f"autonomous pace requested for {agents}",
+        "capture": f"interactive pace requested for {agents}",
+        "afk": f"AFK instructions {'query' if operation.get('message') is None else 'update'} requested for {agents}",
         "create": f"{agents} ready (paused)",
         "recover": f"{agents} restored (paused)",
     }[action]
@@ -1729,6 +1964,8 @@ class SwarmController:
             require_parent(ctx.state)
             if request["action"] == "bcast":
                 validate_broadcast(request["message"])
+            elif request["action"] == "afk":
+                afk_command(request.get("message"))
             request["operation_id"] = uuid.uuid4().hex
             snapshot = self.snapshot(ctx.state, settings=request["action"] in {"create", "recover"},
                                      profile=request.get("profile"))
@@ -1749,6 +1986,8 @@ class SwarmController:
                     f"in {request['pods']} pod{'s' if request['pods'] != 1 else ''}...")
         verb = {"bcast": "Sending message to", "interrupt": "Requesting pause for",
                 "continue": "Requesting continue for", "cancel": "Requesting shutdown for",
+                "release": "Requesting autonomous pace for", "capture": "Requesting interactive pace for",
+                "afk": "Querying AFK instructions for" if request.get("message") is None else "Updating AFK instructions for",
                 "recover": "Restoring"}[action]
         scope = "" if request.get("pods") is None else " (pods " + ", ".join(map(str, request["pods"])) + ")"
         return f"{verb} {request.get('target') or 'swarm'}{scope}..."
@@ -1882,6 +2121,8 @@ class SwarmController:
         # Validate before ownership claim, but preserve the live-successor interrupt
         # path above: it does not launch peers and needs no destination profile.
         saved_pool = await blocking(store.pool)
+        if saved_pool["desired_state"] == "cancelled":
+            raise ValueError("Cancelled swarms remain cancelled")
         settings = pool_launch_settings(state.settings, self.config, saved_pool)
         pool = await blocking(claim_recovery, state, store,
                              expected_epoch=request.get("expected_epoch"),
@@ -1950,7 +2191,7 @@ class SwarmController:
             return str(exc)
 
     async def control(self, state, request):
-        if request.get("action") not in {"bcast", "interrupt", "continue", "cancel"}:
+        if request.get("action") not in {"bcast", "interrupt", "continue", "cancel", "release", "capture", "afk"}:
             raise ValueError("Unsupported existing-swarm control")
         store, pool = await blocking(resolve_pool, state, request["target"])
         if request.get("canonical") and pool["id"] != request["target"]:
@@ -1958,7 +2199,9 @@ class SwarmController:
         members = control_members(pool, request)
         if request["action"] == "bcast":
             validate_broadcast(request["message"])
-        if request["action"] in {"continue", "bcast"}:
+        elif request["action"] == "afk":
+            afk_command(request.get("message"))
+        if request["action"] in {"continue", "bcast", "release"}:
             for member in members:
                 row = await blocking(lambda: store.records().get("members", member["session_id"], {}))
                 if row.get("recovery_status") not in {"ready_paused", "ready"} or row.get("work_blocked"):
@@ -1972,6 +2215,8 @@ class SwarmController:
                     raise ValueError("Operation already exists; replay forbidden")
                 records.put("operations", operation["id"], operation)
                 desired = {"bcast": "running", "continue": "running", "interrupt": "paused", "cancel": "cancelled"}
+                if request["action"] not in desired:
+                    return  # Pace/AFK configuration is not a lifecycle transition.
                 with records.transaction("swarm", "pool") as saved:
                     states = saved.setdefault("pod_states", {p["id"]: "paused" for p in saved["pods"]})
                     ids = {m["session_id"] for m in members}

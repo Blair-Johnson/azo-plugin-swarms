@@ -272,9 +272,15 @@ def test_control_verbs_return_only_action_and_target(verb):
     assert swarm.parse_command(f" \n{verb}\t sw0 \n") == {"action": verb, "target": "sw0"}
 
 
-@pytest.mark.parametrize("verb", ["cancel", "interrupt", "continue"])
-@pytest.mark.parametrize("tail", ["", "sw0 sw1", "sw0 -p 0", "--bogus", "../bad"],
-                         ids=["missing", "two-targets", "extra-option", "unknown-option", "invalid-id"])
-def test_control_verbs_require_exactly_one_valid_target(verb, tail):
+@pytest.mark.parametrize("verb", ["cancel", "interrupt", "continue", "release", "capture"])
+@pytest.mark.parametrize("tail", ["sw0 sw1", "sw0 -p 0", "--bogus", "../bad"],
+                         ids=["two-targets", "extra-option", "unknown-option", "invalid-id"])
+def test_control_verbs_reject_extra_or_invalid_targets(verb, tail):
     with pytest.raises(ValueError):
         swarm.parse_command(f"{verb} {tail}")
+
+
+@pytest.mark.parametrize("verb", ["interrupt", "continue"])
+def test_lifecycle_resume_pause_still_require_explicit_target(verb):
+    with pytest.raises(ValueError):
+        swarm.parse_command(verb)

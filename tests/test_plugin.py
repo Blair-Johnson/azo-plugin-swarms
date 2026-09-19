@@ -33,7 +33,8 @@ def test_namespace_readonly_lazy_and_refreshes_same_step(buffers):
     assert manager.special_buffer_namespaces() == ["swarm:"] and manager.buffers() == []
     index = read(state, "swarm:index")
     assert isinstance(index, ReadonlyBufferView) and "pod-1" in index.text and "pod-2" in index.text
-    assert "not evidence" in index.text
+    assert "swarm:sw0:index" in index.text and "swarm:sw0p0a0" in index.text
+    assert "not evidence" not in index.text and "Operation:" not in index.text
     board_id = "swarm:sw0:pod-1:board:general"
     before = read(state, board_id)
     r.store.post("pod-1", "general", "first post", "parent", message_id="stable-id")
@@ -56,6 +57,9 @@ def test_saved_transcript_uses_verified_shared_journal(buffers):
     view = read(r.state, identifier)
     assert saved.commit_id in view.text and "saved durable text" in view.text and view.readonly
     assert str(saved.repository) in view.text
+    assert "USER [entry" in view.text and "SYSTEM [entry" in view.text
+    assert "Source Commit:" in view.text and "Newest turn first" in view.text
+    assert read(r.state, "swarm:sw0p0a0").text == view.text
     with pytest.raises(KeyError):
         read(r.state, f"swarm:sw0:pod-1:session:{r.members[1]['session_id']}")
 
