@@ -2089,24 +2089,25 @@ class SwarmController:
         settings = pool_launch_settings(state.settings, self.config, pool) if settings is None else settings
         limit = asyncio.Semaphore(4)
         async def launch(member):
-            async with limit:
-                try:
+            try:
+                async with limit:
                     checkpoint = await blocking(pin_checkpoint, state, store, member) if recovering else None
                     handle = await blocking(launch_member, state, pool["id"], member["session_id"],
                                             settings, handles=self.handles, checkpoint=checkpoint)
-                    return await await_member_ready(state, store, member, handle)
-                except Exception as exc:
-                    status = "missing_checkpoint" if isinstance(exc, FileNotFoundError) else "blocked"
-                    def record_failure():
-                        with store.mutation() as (records, _):
-                            row = records.get("members", member["session_id"], {})
-                            row.update(session_id=member["session_id"], recovery_status=status, error=str(exc))
-                            records.put("members", member["session_id"], row)
-                    try:
-                        await blocking(record_failure)
-                    except Exception:
-                        LOG.warning("Cannot persist member failure", exc_info=True)
-                    return dict(label=member["label"], session_id=member["session_id"], state=status, error=str(exc))
+                # A slow startup must not hold a slot needed to spawn the rest of the batch.
+                return await await_member_ready(state, store, member, handle)
+            except Exception as exc:
+                status = "missing_checkpoint" if isinstance(exc, FileNotFoundError) else "blocked"
+                def record_failure():
+                    with store.mutation() as (records, _):
+                        row = records.get("members", member["session_id"], {})
+                        row.update(session_id=member["session_id"], recovery_status=status, error=str(exc))
+                        records.put("members", member["session_id"], row)
+                try:
+                    await blocking(record_failure)
+                except Exception:
+                    LOG.warning("Cannot persist member failure", exc_info=True)
+                return dict(label=member["label"], session_id=member["session_id"], state=status, error=str(exc))
         async with asyncio.TaskGroup() as group:
             tasks = [group.create_task(launch(m)) for p in pool["pods"] for m in p["members"]]
         return [task.result() for task in tasks]
