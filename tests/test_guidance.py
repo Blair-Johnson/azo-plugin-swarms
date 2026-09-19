@@ -153,7 +153,7 @@ def test_parent_launch_message_separate_from_short_status():
     ctx = SimpleNamespace(state=state, session=SimpleNamespace(inject=Mock()))
     result = dict(summary="sw0: 16 agents ready (paused).", model_message="The user launched swarm sw0. Read the Swarms skill.")
     swarm.SwarmController({}).complete(ctx, result)
-    ctx.session.inject.assert_called_once_with(result["model_message"], role="system", system_generated=True)
+    ctx.session.inject.assert_called_once_with(result["model_message"], role="user", system_generated=True)
     ctx.state._session_kind = "sw0p0a0"
     ctx.session.inject.reset_mock()
     swarm.SwarmController({}).complete(ctx, result)

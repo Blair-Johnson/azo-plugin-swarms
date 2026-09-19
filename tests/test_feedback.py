@@ -25,7 +25,7 @@ def test_completion_is_plain_language_without_internal_ids(action, expected):
     assert OP_ID not in text and len(text) < 90
     ctx = SimpleNamespace(state=SimpleNamespace(), session=SimpleNamespace(inject=Mock()))
     result = swarm.SwarmController({}).complete(ctx, dict(summary=text))
-    ctx.session.inject.assert_called_once_with(text, role="system", system_generated=True)
+    ctx.session.inject.assert_called_once_with(text, role="user", system_generated=True)
     assert result == swarm.CommandResult.notice(text, level="info")
 
 

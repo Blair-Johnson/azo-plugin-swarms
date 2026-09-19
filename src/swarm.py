@@ -1783,7 +1783,7 @@ class SwarmController:
                 message = (f"The user broadcast to {pool_label(pool)}; target workers: {receivers}. "
                            f"{result['summary']}\nUser message (already submitted; do not resend):\n"
                            + operation["message"])
-            ctx.session.inject(message, role="system", system_generated=True)
+            ctx.session.inject(message, role="user", system_generated=True)
         return CommandResult.notice(result["summary"], level=result.get("level", "info"))
 
     def submit(self, state, request):
@@ -1922,7 +1922,6 @@ class SwarmController:
             pool = await blocking(store.pool)
             state.swarm_access[swarm_id] = ""
             if pool["desired_state"] == "cancelled":
-                summaries.append(f"{swarm_id}: cancelled; not restored")
                 continue
             try:
                 result = await self.recover(state, store, {})
