@@ -103,6 +103,43 @@ def test_malformed_slash_only_status_no_model_injection(tool_runtime):
     ctx.defer.assert_not_called(); ctx.session.inject.assert_not_called()
 
 
+@pytest.mark.parametrize("raw", [
+    "afk This is an afk message.", "afk missing", "release missing", "capture missing",
+    "interrupt missing", "continue missing", "cancel missing", 'bcast missing "hello"',
+])
+def test_deferred_slash_failure_is_status_only(tool_runtime, monkeypatch, raw):
+    t = tool_runtime
+    state = t.runtime.state
+    ctx = SimpleNamespace(state=state, session=SimpleNamespace(inject=Mock()), defer=Mock())
+    send = AsyncMock(side_effect=AssertionError("invalid target must not send"))
+    monkeypatch.setattr(swarm, "send_to_member", send)
+    t.controller.command(ctx, raw_args=raw)
+    ctx.defer.assert_called_once()
+    result = asyncio.run(ctx.defer.call_args.args[0]())
+    assert result["level"] == "warning"
+    assert swarm.parse_command(raw)["target"] in result["summary"]
+    notice = ctx.defer.call_args.kwargs["then"](ctx, result)
+    assert notice == swarm.CommandResult.notice(result["summary"], level="warning")
+    ctx.session.inject.assert_not_called()
+    assert not state.pending_interrupts
+    assert not t.runtime.store.records().list("operations")
+    send.assert_not_awaited()
+
+
+def test_deferred_tool_failure_still_notifies_model(tool_runtime):
+    t = tool_runtime
+    state = t.runtime.state
+    t.controller.interrupt("missing", state)
+    result = asyncio.run(t.factories[0]())
+    assert result["level"] == "warning"
+    t.futures[0].set_result(result)
+    check = swarm.SwarmCompletionCheck(t.controller)
+    check(state)
+    check(state)
+    assert state.pending_interrupts == [result["summary"]]
+    assert not t.controller.pending
+
+
 def test_user_takeover_parser_is_exact_and_not_model_request():
     parsed = swarm.parse_command("recover sw0 --takeover --expected-epoch 12 --confirmed-stopped")
     assert parsed == dict(action="recover", target="sw0", expected_epoch=12, confirmed_stopped=True)

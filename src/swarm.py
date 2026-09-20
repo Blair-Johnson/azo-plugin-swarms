@@ -2045,7 +2045,8 @@ class SwarmController:
 
     def complete(self, ctx, result):
         self.apply(ctx.state, result)
-        if not worker_identity(ctx.state):
+        # Rejected user commands are notices, not requests for the model to act.
+        if not result.get("failed") and not worker_identity(ctx.state):
             message = result.get("model_message", result["summary"])
             operation = result.get("operation", {})
             if operation.get("action") == "bcast":
@@ -2095,7 +2096,7 @@ class SwarmController:
             except Exception as exc:
                 LOG.warning("Swarm operation %s failed", request["operation_id"], exc_info=True)
                 return dict(summary=f"{request.get('target') or 'Swarm'}: {brief_error(exc)}", level="warning",
-                            access=state.swarm_access, grants=state.grants)
+                            failed=True, access=state.swarm_access, grants=state.grants)
 
     async def create(self, state, request):
         profile = validate_model_profile(self.config, request.get("profile", state.settings.model))
