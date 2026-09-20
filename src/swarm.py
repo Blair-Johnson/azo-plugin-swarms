@@ -2089,7 +2089,7 @@ class SwarmController:
                     result = await self.post(state, request)
                 else:
                     result = await self.control(state, request)
-                result.update(access=state.swarm_access, grants=state.grants,
+                result.update(action=request["action"], access=state.swarm_access, grants=state.grants,
                               resource_uids=getattr(state, "swarm_resource_uids", {}))
                 return result
             except Exception as exc:
@@ -2455,7 +2455,9 @@ class SwarmCompletionCheck(InterruptCheck):
             try:
                 result = future.result()
                 c.apply(state, result)
-                if result.get("summary") and not worker_identity(state):
+                quiet_success = (result.get("action") in {"bcast", "post"}
+                                 and result.get("level", "info") == "info")
+                if result.get("summary") and not worker_identity(state) and not quiet_success:
                     state.pending_interrupts.append(result.get("model_message", result["summary"]))
             except Exception as exc:
                 LOG.exception("Swarm background operation failed for %s", identity[1:3])

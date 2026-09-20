@@ -42,7 +42,7 @@ def test_tool_nonblocking_payload_preserved_and_completion_once(tool_runtime):
     receipt = c.broadcast("sw0", text, [1, 0, 1], state)
     assert receipt == "Sending message to sw0 (pods 1, 0)..."
     assert len(t.futures) == 1 and not t.futures[0].done()
-    execute = AsyncMock(return_value=dict(summary="OK sent=2/2", access={"sw0": ""}, grants={}))
+    execute = AsyncMock(return_value=dict(action="bcast", summary="OK sent=2/2", access={"sw0": ""}, grants={}))
     c.execute = execute
     result = asyncio.run(t.factories[0]())
     request = execute.call_args.args[1]
@@ -51,7 +51,7 @@ def test_tool_nonblocking_payload_preserved_and_completion_once(tool_runtime):
     t.futures[0].set_result(result)
     check = swarm.SwarmCompletionCheck(c)
     check(state); check(state)
-    assert state.pending_interrupts == ["OK sent=2/2"] and not c.pending
+    assert not state.pending_interrupts and not c.pending
     state._session_websocket_server.session_io.send.assert_not_called()
 
 

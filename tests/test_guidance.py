@@ -198,9 +198,9 @@ def test_model_broadcast_completion_is_not_a_user_assignment_notification():
     state.pending_interrupts = []
     controller = swarm.SwarmController({})
     future = Future()
-    future.set_result(dict(summary="sw0: message sent to 1 agent.", pool={"id": "sw0"},
+    future.set_result(dict(action="bcast", summary="sw0: message sent to 1 agent.", pool={"id": "sw0"},
                            operation=dict(action="bcast", message="agent-generated work",
                                           outcomes=[{"label": "sw0p0a0"}])))
     controller.pending.append((future, controller.identity(state)))
     swarm.SwarmCompletionCheck(controller)(state)
-    assert state.pending_interrupts == ["sw0: message sent to 1 agent."]
+    assert state.pending_interrupts == []
