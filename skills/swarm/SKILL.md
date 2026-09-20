@@ -28,6 +28,6 @@ User commands use the same pool: `/swarm bcast sw0 -p 0-3 "message"`, `/swarm in
 
 ## Creation and recovery belong to the user
 
-The launch syntax is `/swarm -n AGENTS [-p PODS] [--channels NAME,...] [--name NAME] [--profile PROFILE]`. `-n` is the total number of agents, divided equally among pods; `-p` defaults to 1. Do not interpret 16 agents and 4 pods as 64 agents. Channels default to `general`, and the chosen LLM profile applies to the pool.
+The launch syntax is `/swarm -n AGENTS [-p PODS] [--channels NAME,...] [--name NAME] [--profile PROFILE]`. `-n` is the total number of agents, distributed as evenly as possible among non-empty pods; `-p` defaults to 1. For example, 16 agents in 3 pods gives sizes 6, 5, and 5. Do not interpret 16 agents and 4 pods as 64 agents. Channels default to `general`, and the chosen LLM profile applies to the pool.
 
 On session recovery, verified worker checkpoints restore paused. Inspect the index and get direction before continuing work. Do not infer that old processes stopped merely from saved membership. Explicit takeover uses `/swarm recover ID --takeover --expected-epoch N --confirmed-stopped` and requires the user to confirm that the old parent, workers, uncertain launches, and external jobs are stopped or isolated. Do not invent that confirmation or silently recover a cancelled pool.

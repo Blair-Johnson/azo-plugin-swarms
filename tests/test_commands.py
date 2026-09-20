@@ -109,8 +109,8 @@ def test_create_rejects_nonpositive_or_noninteger_counts(raw):
         swarm.parse_command(raw)
 
 
-@pytest.mark.parametrize("raw", ["-n 3 -p 2", "-n 1 -p 2", "-n 33 -p 33", "-n 65", "-n 130 -p 2"])
-def test_create_rejects_uneven_or_excessive_topology(raw):
+@pytest.mark.parametrize("raw", ["-n 1 -p 2", "-n 33 -p 33", "-n 65", "-n 129 -p 2", "-n 130 -p 2"])
+def test_create_rejects_empty_or_excessive_topology(raw):
     with pytest.raises(ValueError):
         swarm.parse_command(raw)
 

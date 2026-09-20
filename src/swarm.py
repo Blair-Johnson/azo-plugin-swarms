@@ -221,8 +221,8 @@ def parse_command(raw_args: str) -> dict:
             agents, pods = int(values["agents"]), int(values.get("pods", "1"))
         except ValueError:
             raise ValueError("-n and -p must be positive integers") from None
-        if agents < 1 or not 1 <= pods <= 32 or agents % pods or agents // pods > 64:
-            raise ValueError("Expected 1–32 equal-sized pods, with 1–64 agents per pod")
+        if not 1 <= pods <= 32 or not pods <= agents <= 64 * pods:
+            raise ValueError("Expected 1–32 non-empty pods, with at most 64 agents per pod")
         channels = tuple(name(channel) for channel in values.get("channels", "general").split(","))
         if not 1 <= len(channels) <= 32 or len(set(channels)) != len(channels):
             raise ValueError("Expected 1–32 distinct channel names")
@@ -301,7 +301,7 @@ class SwarmStore:
 
     def create(self, swarm_id: str, *, pods=1, agents_per_pod=1, boards=1,
                channels=None, display_name=None, owner_session_id="", owner_instance_id="",
-               model_profile=None):
+               model_profile=None, agents=None):
         name(swarm_id)
         if model_profile is not None and (not isinstance(model_profile, str) or not model_profile.strip()):
             raise ValueError("Invalid swarm model profile")
@@ -314,13 +314,17 @@ class SwarmStore:
         if (type(pods) is not int or type(agents_per_pod) is not int
                 or not 1 <= pods <= 32 or not 1 <= agents_per_pod <= 64):
             raise ValueError("Expected 1–32 pods and 1–64 agents per pod")
+        agents = pods * agents_per_pod if agents is None else agents
+        if type(agents) is not int or not pods <= agents <= 64 * pods:
+            raise ValueError("Expected non-empty pods with at most 64 agents per pod")
+        base, extra = divmod(agents, pods)
         if not owner_session_id or not owner_instance_id:
             raise ValueError("Creation requires explicit owner session and runtime instance identities")
         name(owner_session_id); name(owner_instance_id)
         topology = [dict(id=f"pod-{i + 1}", index=i, members=[
             dict(session_id=InstanceRef.new_session().session_id, index=j,
                  label=f"{swarm_id}p{i}a{j}")
-            for j in range(agents_per_pod)]) for i in range(pods)]
+            for j in range(base + (i < extra))]) for i in range(pods)]
         records = RecordStore(self.durable)
         with records.transaction("swarm", "pool", default={}) as pool:
             if pool:
@@ -1477,7 +1481,7 @@ def allocate_pool(state, request):
         index["pools"][swarm_id] = dict(name=alias or swarm_id, owner=state._session_id)
     store = store_for(state, swarm_id)
     pool = store.create(swarm_id, pods=request["pods"],
-                        agents_per_pod=request["agents"] // request["pods"],
+                        agents=request["agents"],
                         channels=request["channels"], display_name=alias,
                         owner_session_id=state._session_id, owner_instance_id=state._instance_id,
                         model_profile=request.get("profile"))

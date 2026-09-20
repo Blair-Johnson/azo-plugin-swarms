@@ -22,7 +22,7 @@ Pod-based swarms with durable message boards, explicit agent tools, and paused r
 Post findings before stopping."
 ```
 
-`-n` is the total number of agents. `-p` defaults to one; pods are equal-sized. Bounds are 1–32 pods, 1–64 agents per pod, and 1–32 distinct channels. Channels default to `general`. Project-scoped IDs (`sw0`, `sw1`, …) are never reused; `--name` adds a unique alias. Omitting the target for `bcast`, `cancel`, `release`, `capture`, or `afk` selects the sole owned, non-cancelled swarm; otherwise specify its ID or name.
+`-n` is the total number of agents. `-p` defaults to one. Agents are distributed as evenly as possible, with extra agents assigned to the first pods: `-n 16 -p 3` creates pods of 6, 5, and 5. Each pod must have at least one agent. Bounds are 1–32 pods, 1–64 agents per pod, and 1–32 distinct channels. Channels default to `general`. Project-scoped IDs (`sw0`, `sw1`, …) are never reused; `--name` adds a unique alias. Omitting the target for `bcast`, `cancel`, `release`, `capture`, or `afk` selects the sole owned, non-cancelled swarm; otherwise specify its ID or name.
 
 `--profile NAME` (or `--profile=NAME`) selects an enabled named entry in `llm.models` for every peer, without changing the parent model. New pools save the selected profile, including the current default when omitted. Recovery uses each pool's saved profile and blocks relaunch if it is missing or disabled on the destination; legacy pools without a saved profile use the current default. Profile validation does not prevent interrupting preserved live peers after a verified parent replacement.
 
