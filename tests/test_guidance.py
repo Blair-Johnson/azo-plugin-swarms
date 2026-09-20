@@ -185,7 +185,7 @@ def test_manifest_packages_config_and_skill():
     root = Path(swarm.__file__).resolve().parent.parent
     manifest = tomllib.loads((root / "pixi.toml").read_text())
     files = manifest["tool"]["agent-zoo"]["plugin"]["config"]["files"]
-    assert set(files) == {"config/worker_prompt.md", "skills/swarm/SKILL.md"}
+    assert set(files) == {"config/swarm.json", "config/worker_prompt.md", "skills/swarm/SKILL.md"}
     assert all((root / path).is_file() for path in files)
     skill = (root / "skills/swarm/SKILL.md").read_text()
     assert "The user can assign work directly" in skill

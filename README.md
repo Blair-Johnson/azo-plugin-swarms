@@ -24,7 +24,7 @@ Post findings before stopping."
 
 `-n` is the total number of agents. `-p` defaults to one. Agents are distributed as evenly as possible, with extra agents assigned to the first pods: `-n 16 -p 3` creates pods of 6, 5, and 5. Each pod must have at least one agent. Bounds are 1–32 pods, 1–64 agents per pod, and 1–32 distinct channels. Channels default to `general`. Project-scoped IDs (`sw0`, `sw1`, …) are never reused; `--name` adds a unique alias. Omitting the target for `bcast`, `cancel`, `release`, `capture`, or `afk` selects the sole owned, non-cancelled swarm; otherwise specify its ID or name.
 
-`--profile NAME` (or `--profile=NAME`) selects an enabled named entry in `llm.models` for every peer, without changing the parent model. New pools save the selected profile, including the current default when omitted. Recovery uses each pool's saved profile and blocks relaunch if it is missing or disabled on the destination; legacy pools without a saved profile use the current default. Profile validation does not prevent interrupting preserved live peers after a verified parent replacement.
+`--profile NAME` (or `--profile=NAME`) selects an enabled named entry in `llm.models` for every peer, without changing the parent model. New pools save the selected profile, using the plugin default or Agent Zoo's default when omitted. Recovery uses each pool's saved profile and blocks relaunch if it is missing or disabled on the destination; legacy pools without a saved profile use the current default. Profile validation does not prevent interrupting preserved live peers after a verified parent replacement.
 
 Pod selectors are zero-based indices and inclusive ranges. Quoted messages may span lines and preserve whitespace. Escape the matching quote or backslash; other escape sequences remain literal. Broadcasts arrive as ordinary user messages, even when their contents begin with `/`. Encoded websocket frames are limited to 1 MiB; oversized messages are rejected, never truncated or split.
 
@@ -36,6 +36,19 @@ Malformed slash commands report through the TUI status bar. Accepted operations 
 
 `release` and `capture` forward the native commands to every worker, selecting autonomous or interactive pace. `afk` sets the native continuation instructions without changing pace; with no message it queries those instructions, and `clear` clears them. Quote an AFK message when omitting the swarm target. After an explicit target, the message may be quoted or free text, including multiple lines. These commands address the whole swarm and never create replacement workers.
 
+## Default model profile
+
+After installation, edit `<state-home>/plugin-configs/azo-plugin-swarms/config/swarm.json` (normally `~/.local/share/agent-zoo/plugin-configs/azo-plugin-swarms/config/swarm.json`):
+
+```json
+{
+  "default_profile": "gpt-5.6-luna-max"
+}
+```
+
+New swarms use `--profile` first, then this plugin default, then Agent Zoo's `llm.default`. The profile must name an enabled entry in `llm.models`. The bundled value is `null`, which keeps the Agent Zoo default; omitting the key does the same. This does not change the parent session's model.
+
+The file is read for each new launch without an explicit `--profile`, so later edits apply to the next launch without a reload. The chosen profile is pinned when the command is accepted and saved with the swarm; changing the JSON does not alter queued launches, existing workers, or recovery of existing pools. Invalid settings report in the status bar before allocation. Explicit `--profile` bypasses the default file, and lifecycle commands do not read it. Normal reinstalls preserve user edits; `--force-config` resets the file to the bundled default.
 ## Agent tools
 
 ```python

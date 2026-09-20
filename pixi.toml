@@ -15,4 +15,4 @@ rlm = []
 test = "bash scripts/test.sh"
 
 [tool.agent-zoo.plugin.config]
-files = ["config/worker_prompt.md", "skills/swarm/SKILL.md"]
+files = ["config/swarm.json", "config/worker_prompt.md", "skills/swarm/SKILL.md"]

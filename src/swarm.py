@@ -52,6 +52,30 @@ def worker_identity(state):
     return WORKER_KIND.fullmatch(str(getattr(state, "_session_kind", "") or ""))
 
 
+def load_default_profile():
+    """Read launch defaults only when a new swarm has no explicit --profile."""
+    relative = Path("config/swarm.json")
+    installed = Path(resolve_state_root()) / "plugin-configs" / "azo-plugin-swarms" / relative
+    bundled = Path(__file__).resolve().parent.parent / relative
+    for path in (installed, bundled):
+        try:
+            settings = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot read swarm config {path}: {exc}") from exc
+        if not isinstance(settings, dict):
+            raise ValueError(f"Swarm config {path} must be a JSON object")
+        unknown = settings.keys() - {"default_profile"}
+        if unknown:
+            raise ValueError(f"Unknown swarm config setting in {path}: {', '.join(sorted(unknown))}")
+        profile = settings.get("default_profile")
+        if profile is not None and (not isinstance(profile, str) or not profile.strip()):
+            raise ValueError(f"default_profile in {path} must be a nonempty profile name or null")
+        return profile
+    return None
+
+
 def load_worker_prompt():
     """Read once while building the pipeline, never while rendering or polling."""
     relative = Path("config/worker_prompt.md")
@@ -1966,6 +1990,10 @@ class SwarmController:
         try:
             request = parse_command(raw_args)
             require_parent(ctx.state)
+            if request["action"] == "create" and "profile" not in request:
+                profile = load_default_profile()
+                if profile is not None:
+                    request["profile"] = profile
             if request["action"] == "bcast":
                 validate_broadcast(request["message"])
             elif request["action"] == "afk":
