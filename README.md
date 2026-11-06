@@ -38,7 +38,7 @@ Malformed slash commands report through the TUI status bar. Accepted operations 
 
 ## Default model profile
 
-After installation, edit `<state-home>/plugin-configs/azo-plugin-swarms/config/swarm.json` (normally `~/.local/share/agent-zoo/plugin-configs/azo-plugin-swarms/config/swarm.json`):
+Use `/config` → **Swarms** → **Default model profile** to save a concrete enabled profile for future swarms, or edit `<state-home>/plugin-configs/azo-plugin-swarms/config/swarm.json` (normally `~/.local/share/agent-zoo/plugin-configs/azo-plugin-swarms/config/swarm.json`):
 
 ```json
 {
@@ -46,7 +46,7 @@ After installation, edit `<state-home>/plugin-configs/azo-plugin-swarms/config/s
 }
 ```
 
-New swarms use `--profile` first, then this plugin default, then Agent Zoo's `llm.default`. The profile must name an enabled entry in `llm.models`. The bundled value is `null`, which keeps the Agent Zoo default; omitting the key does the same. This does not change the parent session's model.
+New swarms use `--profile` first, then this plugin default, then Agent Zoo's **saved** `llm.default` (home config layers plus an explicit `--config` file, excluding session model changes and CLI `--set` overrides). The profile must name an enabled entry in `llm.models`. The bundled value is `null`, which keeps the Agent Zoo default; omitting the key does the same. There is no session-inheritance menu option. This does not change the parent session's model. The menu lists saved enabled model profiles; reload after changing that catalog.
 
 The file is read for each new launch without an explicit `--profile`, so later edits apply to the next launch without a reload. The chosen profile is pinned when the command is accepted and saved with the swarm; changing the JSON does not alter queued launches, existing workers, or recovery of existing pools. Invalid settings report in the status bar before allocation. Explicit `--profile` bypasses the default file, and lifecycle commands do not read it. Normal reinstalls preserve user edits; `--force-config` resets the file to the bundled default.
 ## Agent tools

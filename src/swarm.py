@@ -14,10 +14,14 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
+import tempfile
 import time
 import uuid
 
-from agents.llm import require_model_enabled
+from yaml import YAMLError
+
+from agents.llm import enabled_llm_models, require_model_enabled
 from agent_utils import Feature, Tool, MODEL_RENDER_CHANNEL
 from agent_utils.components import (
     ToolDispatchStart, InterruptCheck, InterruptDelivery, HarnessEventHandler,
@@ -29,6 +33,8 @@ from agent_utils.skills import SkillSource
 from agent_utils.files.buffer_manager import ReadonlyBufferView
 from agent_utils.session_cwd import get_session_cwd
 from agent_zoo.runtime.commands import Command, CommandError, CommandResult
+from agent_zoo.runtime.settings import Setting, SettingError
+from agent_zoo.config_loader import CONFIG_PATH, load_layered_config
 from agent_zoo.wsctl import AzoWs
 from agent_zoo.projects import resolve_state_root
 from agent_zoo.session_store import resolve_local_root
@@ -52,28 +58,103 @@ def worker_identity(state):
     return WORKER_KIND.fullmatch(str(getattr(state, "_session_kind", "") or ""))
 
 
+def swarm_config_path():
+    return Path(resolve_state_root()) / "plugin-configs/azo-plugin-swarms/config/swarm.json"
+
+
+def read_swarm_config(path):
+    try:
+        settings = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise SettingError("Cannot read swarm config") from None
+    if not isinstance(settings, dict):
+        raise SettingError("Swarm config must be a JSON object")
+    profile = settings.get("default_profile")
+    if profile is not None and (not isinstance(profile, str) or not profile.strip()):
+        raise SettingError("Swarm default_profile must be a nonempty profile name or null")
+    return settings
+
+
 def load_default_profile():
-    """Read launch defaults only when a new swarm has no explicit --profile."""
-    relative = Path("config/swarm.json")
-    installed = Path(resolve_state_root()) / "plugin-configs" / "azo-plugin-swarms" / relative
-    bundled = Path(__file__).resolve().parent.parent / relative
-    for path in (installed, bundled):
-        try:
-            settings = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            continue
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Cannot read swarm config {path}: {exc}") from exc
-        if not isinstance(settings, dict):
-            raise ValueError(f"Swarm config {path} must be a JSON object")
-        unknown = settings.keys() - {"default_profile"}
-        if unknown:
-            raise ValueError(f"Unknown swarm config setting in {path}: {', '.join(sorted(unknown))}")
-        profile = settings.get("default_profile")
-        if profile is not None and (not isinstance(profile, str) or not profile.strip()):
-            raise ValueError(f"default_profile in {path} must be a nonempty profile name or null")
-        return profile
+    """Read the plugin override without creating or modifying any config files."""
+    bundled = Path(__file__).resolve().parent.parent / "config/swarm.json"
+    for path in (swarm_config_path(), bundled):
+        settings = read_swarm_config(path)
+        if settings is not None:
+            return settings.get("default_profile")
     return None
+
+
+def saved_model_config(config):
+    """Persistent layers only: never the session model or CLI config_sets."""
+    path = (config.get("_runtime_launch", {}) or {}).get("config_path")
+    try:
+        # The CLI's bundled alias is not an explicit user override of home layers.
+        if path and Path(path).resolve() == CONFIG_PATH.resolve():
+            path = None
+        return load_layered_config(state_root=resolve_state_root(), config_path=path or None)
+    except (OSError, ValueError, TypeError, AttributeError, YAMLError):
+        raise SettingError("Cannot read saved Agent Zoo model settings") from None
+
+
+def validate_saved_profile(config, profile):
+    try:
+        return validate_model_profile(config, profile)
+    except (ValueError, TypeError, AttributeError):
+        raise SettingError("Swarm default must name an enabled saved model profile") from None
+
+
+def default_model_profile(config):
+    saved = saved_model_config(config)
+    profile = load_default_profile()
+    if profile is None:
+        profile = (saved.get("llm", {}) or {}).get("default")
+    return validate_saved_profile(saved, profile)
+
+
+def save_default_profile(config, profile):
+    validate_saved_profile(saved_model_config(config), profile)
+    path = swarm_config_path().resolve()
+    temporary = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with file_lock(path.with_suffix(".lock")):
+            settings = read_swarm_config(path)
+            mode = stat.S_IMODE(path.stat().st_mode) if settings is not None else 0o600
+            settings = {} if settings is None else settings
+            settings["default_profile"] = profile
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                             prefix=".swarm-", delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump(settings, stream, indent=2)
+                stream.write("\n")
+            temporary.chmod(mode)
+            os.replace(temporary, path)
+    except OSError:
+        raise SettingError("Cannot save swarm default profile") from None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def profile_setting(config):
+    # Choice metadata is fixed until reload; callbacks revalidate persisted values.
+    try:
+        choices = tuple(enabled_llm_models(saved_model_config(config)))
+    except (SettingError, ValueError, TypeError, AttributeError):
+        LOG.warning("Cannot expose Swarms profile choices from saved model settings")
+        return []
+    if not choices or len(choices) > 128 or any(len(key.encode("utf-8")) > 256 for key in choices):
+        return []
+    return [Setting(
+        "swarm.default_profile", "Default model profile", "choice",
+        get=lambda ctx: default_model_profile(config),
+        set=lambda ctx, value: save_default_profile(config, value),
+        group="Swarms", choices=choices,
+        help="Saved default for new swarms only; --profile overrides it. Existing swarms are unchanged.",
+    )]
 
 
 def load_worker_prompt():
@@ -1991,9 +2072,7 @@ class SwarmController:
             request = parse_command(raw_args)
             require_parent(ctx.state)
             if request["action"] == "create" and "profile" not in request:
-                profile = load_default_profile()
-                if profile is not None:
-                    request["profile"] = profile
+                request["profile"] = default_model_profile(self.config)
             if request["action"] == "bcast":
                 validate_broadcast(request["message"])
             elif request["action"] == "afk":
@@ -2467,6 +2546,7 @@ class SwarmCompletionCheck(InterruptCheck):
 
 
 def register_features(builder, *, session, config):
+    builder.add(Feature("swarm_settings", components=profile_setting(config), order=[Setting]))
     # launch_member assigns this durable kind; unlike environment or display
     # names it also identifies members during reload/recovery without disk IO.
     if worker_identity(getattr(session, "state", None)) and builder.has("rlm"):

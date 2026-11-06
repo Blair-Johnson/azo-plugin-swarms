@@ -1,5 +1,7 @@
 """Named swarm model profiles: offline admission, launch routing and recovery."""
 import asyncio
+import json
+from pathlib import Path
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
@@ -17,11 +19,15 @@ PROFILE = "gpt-5.6-luna-max"
 
 @pytest.fixture
 def config():
-    return {"llm": {"default": "offline", "models": {
+    config = {"llm": {"default": "offline", "models": {
         "offline": {"enabled": True},
         PROFILE: {"enabled": True},
         "other": {"enabled": True},
     }}}
+    path = Path(swarm.resolve_state_root()) / "config.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config))
+    return config
 
 
 @pytest.fixture
