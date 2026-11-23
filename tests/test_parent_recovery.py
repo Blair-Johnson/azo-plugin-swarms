@@ -31,12 +31,11 @@ def test_parent_pauses_before_first_restored_work_pass(runtime, saved_access):
     state.grants = {}
     if not saved_access:
         state.swarm_access = {}
-    state._runtime_startup_paused = False
     state.startup_paused = False
     state.buffer_manager = BufferManager()
     controller = swarm.SwarmController({})
     notify(state, controller)
-    assert state._runtime_startup_paused is True and state.startup_paused is True
+    assert state.startup_paused is True
     assert state.buffer_manager.special_buffer_namespaces() == ["swarm:"]
     assert len(controller.in_flight) == 1
     _, source_kind, payload = next(iter(controller.in_flight.values()))
@@ -50,14 +49,13 @@ def test_unrelated_restored_session_hold_can_be_released(runtime):
     state._instance_id = "other"
     state.swarm_access = {}
     state.grants = {}
-    state._runtime_startup_paused = False
     state.startup_paused = False
     state.buffer_manager = BufferManager()
     controller = swarm.SwarmController({})
     notify(state, controller)
-    assert state._runtime_startup_paused is True and state.startup_paused is True
+    assert state.startup_paused is True
     controller.apply(state, {"release_startup_hold": True})
-    assert state._runtime_startup_paused is False and state.startup_paused is False
+    assert state.startup_paused is False
 
 
 def test_proven_parent_successor_reattaches_children_without_epoch_rotation(runtime, monkeypatch):

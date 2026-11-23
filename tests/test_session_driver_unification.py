@@ -123,7 +123,6 @@ def test_sim_full_swarm_lifecycle_spawn_bcast_race_retry_unknown_data_cancel(tmp
     # Warning summary surfaced because m1 had delivery_unknown (buffered by InterruptDelivery while last entry is user)
     delivered_texts = (
         list(st.pending_interrupts)
-        + list(getattr(st, "_buffered_interrupts", []))
         + [str(m.get("content", "")) for e in st.entries for m in e.messages]
     )
     assert any("delivery unknown" in msg for msg in delivered_texts)

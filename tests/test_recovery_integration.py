@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 from agent_utils import Entry, Feature, PipelineBuilder, Runtime, Session, ToolCall, core_feature, interrupts_feature
-from agent_utils.core.events import BeforeLLM, RunToolCall
+from agent_utils.core.events import AwaitRequest, BeforeLLM, RunToolCall
 from agent_utils.features.buffers import BufferManager
 from agent_utils.storage.repository import SessionRepository
 from agent_utils.storage.serialization import capture_session_document
@@ -116,7 +116,6 @@ def host_runtime(r, monkeypatch, *, sid, iid, checkpoint=None):
     state.session_launcher = r.state.session_launcher
     startup_mode = "normal" if checkpoint else "paused"
     state._runtime_startup_mode = startup_mode
-    state._runtime_startup_paused = startup_mode == "paused"
     state.startup_paused = startup_mode == "paused"
 
     if checkpoint is not None:
@@ -130,7 +129,6 @@ def host_runtime(r, monkeypatch, *, sid, iid, checkpoint=None):
             "project_store_root": str(r.tmp / "registry"),
         }
         state.session_launcher = r.state.session_launcher
-        state._runtime_startup_paused = False
         state.startup_paused = False
         revision_id = checkpoint.state.commit_id
     else:
@@ -206,7 +204,7 @@ def test_real_fresh_paused_member_bootstrap_publishes_exact_shared_seed(runtime,
         shared = swarm.shared_checkpoint(b.controller.snapshot(state), member["session_id"], revision)
         assert shared.commit_id == revision
         assert b.controller.grants["sw0"]["instance_id"] == attempt["instance_id"]
-        assert state._runtime_startup_paused and state.startup_paused
+        assert state.startup_paused
         assert state.pending_interrupts  # completion retained, not injected/delivered while paused
         assert len(state.entries) == 1
 
@@ -247,7 +245,7 @@ def parent_checkpoint(r):
     )
     session.state.pending_tool_calls = [call]
     session.state.last_tool_calls = [call]
-    session.state._await_requested = True
+    session.state.await_request = AwaitRequest()
     repo = SessionRepository(r.tmp / "parent-source")
     writer = repo.create_instance(session_id="parent", instance_id="old-parent", origin_host_id="host-a")
     saved = writer.commit(capture_session_document(session.state, session.pipeline, session_id="parent"))
@@ -262,11 +260,11 @@ def test_real_restored_parent_holds_saved_work_through_recovery_poll(runtime, mo
     with host_runtime(r, monkeypatch, sid="parent", iid="restored-parent", checkpoint=checkpoint) as b:
         assert b.seen[0]["restored"] is True
         assert b.seen[0]["revision_id"] == checkpoint.state.commit_id
-        assert b.session.state._runtime_startup_paused and b.session.state.startup_paused
+        assert b.session.state.startup_paused
         assert b.work == []
         b.drain_until(lambda: not b.controller.in_flight)
         assert b.work == []
-        assert b.session.state._runtime_startup_paused and b.session.state.startup_paused
+        assert b.session.state.startup_paused
         assert b.session.state.entries[-1].tool_calls[0].id == "old-call"
         assert any("blocked" in str(x) for x in b.session.state.pending_interrupts)
         r.state.session_launcher.start.assert_not_called()

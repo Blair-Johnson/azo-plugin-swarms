@@ -59,7 +59,6 @@ def startup_runtime(tmp_path, monkeypatch):
     state = session.state
     state._session_id = "startup-session"
     state._instance_id = "startup-instance"
-    state._runtime_startup_paused = True
     state.startup_paused = True
     state._agent_zoo_context = {}
     state.swarm_access = {}
@@ -92,7 +91,7 @@ def startup_runtime(tmp_path, monkeypatch):
         deadline = time.monotonic() + timeout_s
         while not predicate():
             runtime.step_once(timeout=0.02)
-            assert state._runtime_startup_paused is True
+            assert state.startup_paused is True
             assert state.entries == entries
             assert work == []
             assert time.monotonic() < deadline, "background startup did not finish"

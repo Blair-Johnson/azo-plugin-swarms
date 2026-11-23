@@ -8,7 +8,7 @@ import pytest
 
 from agent_zoo.cli.wsctl import AzoWs
 from agent_zoo.features.commands import CommandError
-from agent_zoo.features.commands.core import _afk
+from agent_zoo.features.turn.commands import _afk
 import swarm
 from conftest import execute_swarm_request
 from test_adoption import client_for, discover_proposal, lineage, reload, send_via_driver
@@ -69,9 +69,9 @@ def test_afk_oversize_rejected_before_background_or_socket(runtime, monkeypatch)
     ("Keep working\non the next task", "Keep working\non the next task"),
 ])
 def test_native_afk_is_instructions_not_pace(message, expected):
-    state = SimpleNamespace(afk_message="saved instructions", _afk_message="saved instructions")
+    state = SimpleNamespace(afk_message="saved instructions")
     result = _afk(SimpleNamespace(state=state), message=message)
-    assert not result.events and state.afk_message == expected and state._afk_message == expected
+    assert not result.events and state.afk_message == expected
     assert swarm.afk_command(message) == ("/afk" if message is None else "/afk " + message)
 
 

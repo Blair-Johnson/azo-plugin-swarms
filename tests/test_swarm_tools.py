@@ -284,7 +284,6 @@ def test_snapshot_rejects_grant_from_replaced_runtime(tool_runtime):
 
 def test_restored_ready_gates_historical_work_until_discovery(tool_runtime):
     t = tool_runtime; state = t.runtime.state
-    state._runtime_startup_paused = False
     state.startup_paused = False
     event = SessionReady(
         session_id=state._session_id,
@@ -295,17 +294,16 @@ def test_restored_ready_gates_historical_work_until_discovery(tool_runtime):
         revision_id="saved",
     )
     swarm.SwarmRuntimeReady(t.controller).handle(event, state, lambda _ev: None)
-    assert state._runtime_startup_paused is True and state.startup_paused is True
+    assert state.startup_paused is True
     # A completion with ordinary recovery information cannot release the hold.
     t.controller.apply(state, dict(summary="restored paused", grants={}))
-    assert state._runtime_startup_paused is True and state.startup_paused is True
+    assert state.startup_paused is True
     t.controller.apply(state, dict(release_startup_hold=True))
-    assert state._runtime_startup_paused is False and state.startup_paused is False
+    assert state.startup_paused is False
 
 
 def test_explicit_paused_start_is_not_released_by_empty_discovery(tool_runtime):
     t = tool_runtime; state = t.runtime.state
-    state._runtime_startup_paused = True
     state.startup_paused = True
     event = SessionReady(
         session_id=state._session_id,
@@ -317,4 +315,4 @@ def test_explicit_paused_start_is_not_released_by_empty_discovery(tool_runtime):
     )
     swarm.SwarmRuntimeReady(t.controller).handle(event, state, lambda _ev: None)
     t.controller.apply(state, dict(release_startup_hold=True))
-    assert state._runtime_startup_paused is True and state.startup_paused is True
+    assert state.startup_paused is True

@@ -100,7 +100,7 @@ def _append_interrupt(state, message: str, emit: EmitFn | None = None) -> None:
         pending = []
         state.pending_interrupts = pending
     pending.append(message)
-    paused = bool(getattr(state, "_runtime_startup_paused", False) or getattr(state, "startup_paused", False))
+    paused = bool(getattr(state, "startup_paused", False))
     if emit is not None and not paused:
         emit(InterruptQueued(source="swarm"))
 
@@ -2149,7 +2149,6 @@ class SwarmController:
             state.swarm_access = dict(result["access"]) if result.get("replace_access") else {
                 **getattr(state, "swarm_access", {}), **result["access"]}
         if result.get("release_startup_hold") and self.startup_hold == self.identity(state):
-            state._runtime_startup_paused = False
             state.startup_paused = False
             self.startup_hold = None
         for resource, grant in result.get("grants", {}).items():
@@ -2675,13 +2674,13 @@ class SwarmController:
 RUNTIME_READS = {
     "swarm_access", "swarm_resource_uids", "_session_id", "_instance_id", "_session_kind",
     "_agent_zoo_context", "_project_name", "_store_root", "cwd",
-    "session_cwd", "_persistence_local_root", "_runtime_startup_paused", "startup_paused",
+    "session_cwd", "_persistence_local_root", "startup_paused",
 }
 
 
 class SwarmTool(Tool):
     optional_reads = RUNTIME_READS
-    writes = {"swarm_access", "swarm_resource_uids", "_runtime_startup_paused", "startup_paused"}
+    writes = {"swarm_access", "swarm_resource_uids", "startup_paused"}
 
     def __init__(self, controller, method, tool_name, *, parent_only=True):
         self.controller = controller
@@ -2697,7 +2696,7 @@ class SwarmRuntimeReady:
     """Handle ``SessionReady`` by registering buffers, holding restored work, and scheduling startup."""
     handles = (SessionReady,)
     optional_reads = RUNTIME_READS | {"buffer_manager"}
-    writes = {"_runtime_startup_paused", "startup_paused", "buffer_manager", "pending_interrupts"}
+    writes = {"startup_paused", "buffer_manager", "pending_interrupts"}
     init = {"pending_interrupts": list}
 
     def __init__(self, controller):
@@ -2720,12 +2719,10 @@ class SwarmRuntimeReady:
         if getattr(state, "buffer_manager", None) is not None:
             SwarmBuffers().register(state)
         if payload["restored"] and not payload["paused"]:
-            state._runtime_startup_paused = True
             state.startup_paused = True
             controller.startup_hold = controller.bound
         payload["paused"] = bool(
-            getattr(state, "_runtime_startup_paused", False)
-            or getattr(state, "startup_paused", False) or payload["paused"]
+            getattr(state, "startup_paused", False) or payload["paused"]
         )
         controller.grants.clear()
         fence = controller.bound
@@ -2747,7 +2744,7 @@ class SwarmCompletionHandler:
     optional_reads = RUNTIME_READS | {"pending_interrupts", "swarm_received_data"}
     writes = {
         "swarm_access", "swarm_resource_uids", "pending_interrupts", "swarm_received_data",
-        "_runtime_startup_paused", "startup_paused", "dirty",
+        "startup_paused", "dirty",
     }
     init = {"pending_interrupts": list, "swarm_received_data": list}
 
