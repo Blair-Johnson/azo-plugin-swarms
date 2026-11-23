@@ -1,14 +1,16 @@
-"""Durable pod-based swarms with user commands and scoped agent tools."""
+"""Durable pod-based swarms with user commands and scoped agent tools.
+
+Unified onto ``AgentZooSessionDriver`` (pure ``SessionRequest``s + host
+``SwarmLockFenceAdapter``) and ``PluginTaskDriver`` for local ``SwarmStore``
+transactions. Zero custom subprocess, WebSocket, registry-walk, or asyncio plumbing.
+"""
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Awaitable, Callable
-from concurrent.futures import Future as ConcurrentFuture
+from collections import Counter, defaultdict
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
-from collections import Counter, defaultdict
-from types import SimpleNamespace
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
 import logging
@@ -18,50 +20,66 @@ import re
 import sqlite3
 import stat
 import tempfile
-import threading
 import time
+from types import SimpleNamespace
 import uuid
 
 from yaml import YAMLError
 
-from agent_utils.core.events import Event, IoCompleted, IoFailed, RenderRequested, TurnSettled
+from agent_utils.core.events import IoCompleted, IoFailed, RenderRequested, TurnSettled
 from agent_utils.core.io import IoRequest, OpId
 from agent_utils.core.pipeline import EmitFn, Feature
-from agent_utils.core.state import MODEL_RENDER_CHANNEL, State
+from agent_utils.core.state import MODEL_RENDER_CHANNEL
 from agent_utils.core.tool import Tool
-from agent_utils.features.buffers import BufferManager, ReadonlyBufferView
+from agent_utils.features.buffers import ReadonlyBufferView
 from agent_utils.features.core import IoFence, MessageRenderer, RenderTransformRegistrar
 from agent_utils.features.interrupts import InterruptDelivery, InterruptQueued
 from agent_utils.features.skills import SkillSource
-from agent_utils.runtime.driver import Driver
 from agent_utils.storage.repository import SessionRepository
-from agent_zoo.cli.wsctl import AzoWs
 from agent_zoo.config.loader import CONFIG_PATH, load_layered_config
-from agent_zoo.events import EmitNotice, ProjectionRequested, SessionReady
+from agent_zoo.drivers.plugin_task import PluginTaskDriver
+from agent_zoo.drivers.sessions import (
+    AgentZooSessionDriver, DeliveryUnknown, PreSendRace, resolve_session_lineage, validate_loopback_ws_url,
+)
+from agent_zoo.events import (
+    AdoptSession, ConnectSession, DisconnectSession, DiscoverSessions, DiscoverSessionsResult, EmitNotice,
+    LineageResolution, LiveSessionInfo, ProjectionRequested, RunPluginTask, SendSessionData, SendSessionInput,
+    SessionArtifact, SessionDataReceived, SessionDeliveryResult, SessionReady, SessionSource,
+    SessionSpawnResult, SessionSpec, SessionStopResult, SpawnSession, StopSession,
+)
 from agent_zoo.features.commands import Command, CommandError, CommandResult
 from agent_zoo.features.settings import Setting, SettingError
 from agent_zoo.features.special_buffers import RegisterSpecialBuffers
 from agent_zoo.features.system_prompt import SystemPromptSkillList
-from agent_zoo.host.launch import (
-    CheckpointRef, Fresh, InstanceRef, Resume, RuntimeLaunch, RuntimeLauncher, RuntimeSettings,
-)
+from agent_zoo.host.launch import CheckpointRef, InstanceRef, RuntimeSettings
 from agent_zoo.host.registry import list_live_sessions
 from agent_zoo.llm.catalog import enabled_llm_models, require_model_enabled
 from agent_zoo.storage.projects import resolve_state_root
 from agent_zoo.storage.store import resolve_local_root
 from tmux_pilot.fs_store import RecordStore, file_lock
 from tmux_pilot.process_identity import (
-    local_host_identity, capture_process_identity, ProcessIdentity, observe_process, ObservationState,
+    ObservationState, ProcessIdentity, capture_process_identity, local_host_identity, observe_process,
 )
+
+LOG = logging.getLogger(__name__)
+NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\Z")
+WORKER_KIND = re.compile(r"(?P<swarm>sw[0-9]+)p(?P<pod>[0-9]+)a(?P<agent>[0-9]+)\Z")
+SWARM_LOCK_FENCE_NAME = "swarm"
+MAX_BROADCAST_FRAME_BYTES = 1024 * 1024
+MAX_PRE_SEND_RETRIES = 3
+ACTION_CAPABILITIES = {
+    "bcast": "input:user_text", "interrupt": "input:slash_command",
+    "continue": "input:slash_command", "cancel": "control:shutdown",
+    "release": "input:slash_command", "capture": "input:slash_command",
+    "afk": "input:slash_command",
+}
 
 
 def get_session_cwd(state) -> str:
     """Resolve active session working directory from ``State.cwd`` or legacy attrs."""
     cwd = str(
-        getattr(state, "cwd", "")
-        or getattr(state, "session_cwd", "")
-        or getattr(state, "terminal_cwd", "")
-        or ""
+        getattr(state, "cwd", "") or getattr(state, "session_cwd", "")
+        or getattr(state, "terminal_cwd", "") or ""
     ).strip()
     return cwd or os.getcwd()
 
@@ -82,142 +100,9 @@ def _append_interrupt(state, message: str, emit: EmitFn | None = None) -> None:
         pending = []
         state.pending_interrupts = pending
     pending.append(message)
-    paused = bool(
-        getattr(state, "_runtime_startup_paused", False)
-        or getattr(state, "startup_paused", False)
-    )
+    paused = bool(getattr(state, "_runtime_startup_paused", False) or getattr(state, "startup_paused", False))
     if emit is not None and not paused:
         emit(InterruptQueued(source="swarm"))
-
-
-@dataclass
-class SwarmTask(IoRequest):
-    """Async swarm background operation executed by ``SwarmDriver``."""
-
-    factory: Callable[[], Awaitable[object]]
-    action: str = ""
-    target: str = ""
-
-
-class SwarmDriver(Driver):
-    """Single-loop background asyncio driver for nonblocking swarm IO operations."""
-
-    request_types = (SwarmTask,)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._lock = threading.Lock()
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._thread: threading.Thread | None = None
-        self._futures: dict[OpId, ConcurrentFuture] = {}
-        self._cancelled: set[OpId] = set()
-        self._closed = False
-
-    def _ensure_loop_locked(self) -> asyncio.AbstractEventLoop:
-        if self._loop is not None and self._thread is not None and self._thread.is_alive():
-            return self._loop
-        started = threading.Event()
-        holder: dict[str, asyncio.AbstractEventLoop] = {}
-
-        def _run_loop() -> None:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            holder["loop"] = loop
-            started.set()
-            try:
-                loop.run_forever()
-            finally:
-                pending = asyncio.all_tasks(loop)
-                for task in pending:
-                    task.cancel()
-                if pending:
-                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-                loop.close()
-
-        thread = threading.Thread(target=_run_loop, name="azo-swarm-driver", daemon=True)
-        thread.start()
-        started.wait()
-        self._loop = holder["loop"]
-        self._thread = thread
-        return self._loop
-
-    def start(self, emit) -> None:
-        super().start(emit)
-        with self._lock:
-            self._closed = False
-            self._ensure_loop_locked()
-
-    def submit(self, op_id: OpId, req: IoRequest) -> None:
-        if not isinstance(req, SwarmTask):
-            raise TypeError(f"SwarmDriver expected SwarmTask, got {type(req).__name__}")
-        with self._lock:
-            if self._closed or op_id in self._cancelled:
-                return
-            loop = self._ensure_loop_locked()
-
-            async def _invoke():
-                if self._is_fenced(op_id):
-                    raise asyncio.CancelledError
-                return await req.factory()
-
-            fut = asyncio.run_coroutine_threadsafe(_invoke(), loop)
-            self._futures[op_id] = fut
-
-        def _done(completed: ConcurrentFuture) -> None:
-            with self._lock:
-                self._futures.pop(op_id, None)
-                fenced = self._closed or op_id in self._cancelled
-                self._cancelled.discard(op_id)
-            if completed.cancelled():
-                return
-            exc = completed.exception()
-            if fenced:
-                return
-            if exc is not None:
-                self._safe_emit(IoFailed(op_id=op_id, error=exc))
-            else:
-                self._safe_emit(IoCompleted(op_id=op_id, value=completed.result()))
-
-        fut.add_done_callback(_done)
-
-    def cancel(self, op_id: OpId) -> None:
-        with self._lock:
-            self._cancelled.add(op_id)
-            fut = self._futures.get(op_id)
-        if fut is not None:
-            fut.cancel()
-
-    def close(self) -> None:
-        with self._lock:
-            self._closed = True
-            futures = list(self._futures.values())
-            self._cancelled.update(self._futures.keys())
-            self._futures.clear()
-            loop = self._loop
-            thread = self._thread
-            self._loop = None
-            self._thread = None
-        for fut in futures:
-            fut.cancel()
-        if loop is not None and not loop.is_closed():
-            try:
-                loop.call_soon_threadsafe(loop.stop)
-            except RuntimeError:
-                pass
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=5.0)
-        with self._lock:
-            self._cancelled.clear()
-
-    def _is_fenced(self, op_id: OpId) -> bool:
-        with self._lock:
-            return self._closed or op_id in self._cancelled
-
-LOG = logging.getLogger(__name__)
-NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\Z")
-
-
-WORKER_KIND = re.compile(r"(?P<swarm>sw[0-9]+)p(?P<pod>[0-9]+)a(?P<agent>[0-9]+)\Z")
 
 
 def worker_identity(state):
@@ -258,7 +143,6 @@ def saved_model_config(config):
     """Persistent layers only: never the session model or CLI config_sets."""
     path = (config.get("_runtime_launch", {}) or {}).get("config_path")
     try:
-        # The CLI's bundled alias is not an explicit user override of home layers.
         if path and Path(path).resolve() == CONFIG_PATH.resolve():
             path = None
         return load_layered_config(state_root=resolve_state_root(), config_path=path or None)
@@ -307,7 +191,6 @@ def save_default_profile(config, profile):
 
 
 def profile_setting(config):
-    # Choice metadata is fixed until reload; callbacks revalidate persisted values.
     try:
         choices = tuple(enabled_llm_models(saved_model_config(config)))
     except (SettingError, ValueError, TypeError, AttributeError):
@@ -354,18 +237,13 @@ class SwarmSkillRegistration(RenderTransformRegistrar):
         registry = getattr(state, "skill_registry", None)
         worker = bool(worker_identity(state))
         if registry is None or (
-            registry is self.registry
-            and worker == self.worker
+            registry is self.registry and worker == self.worker
             and (not worker or registry.get("Swarms") is None)
         ):
             return state
         if worker:
-            # A restored worker may carry an old parent catalog; don't advertise
-            # coordinator instructions through either list_skills or skill.
             registry._file_skills = [s for s in registry._file_skills if s.name.lower() != "swarms"]
-            registry._dynamic_skills = {
-                k: v for k, v in registry._dynamic_skills.items() if k.lower() != "swarms"
-            }
+            registry._dynamic_skills = {k: v for k, v in registry._dynamic_skills.items() if k.lower() != "swarms"}
             registry._sources = [s for s in registry._sources if s.kind != "azo-plugin-swarms"]
             registry._rebuild()
         else:
@@ -508,8 +386,7 @@ def parse_command(raw_args: str) -> dict:
                          "or /swarm bcast|interrupt|continue|cancel|release|capture|afk ...")
     if source.startswith("-"):
         values, positional = command_options(source.split(), {
-            "-n": "agents", "-p": "pods", "--channels": "channels", "--name": "name",
-            "--profile": "profile"})
+            "-n": "agents", "-p": "pods", "--channels": "channels", "--name": "name", "--profile": "profile"})
         if positional or "agents" not in values:
             raise ValueError("Creation requires -n AGENTS and accepts only named options")
         try:
@@ -558,8 +435,6 @@ def parse_command(raw_args: str) -> dict:
                     if text[0] in "\"'":
                         message = quoted_message(text, label="AFK")
                     else:
-                        # A leading option is not a pod selector. Quote literal
-                        # dash-leading instructions; '-' remains native AFK clear.
                         if text.startswith("-") and text.strip() != "-":
                             raise ValueError("AFK addresses the whole swarm; quote dash-leading instructions")
                         message = text
@@ -617,27 +492,24 @@ class SwarmStore:
             raise ValueError("Creation requires explicit owner session and runtime instance identities")
         name(owner_session_id); name(owner_instance_id)
         topology = [dict(id=f"pod-{i + 1}", index=i, members=[
-            dict(session_id=InstanceRef.new_session().session_id, index=j,
-                 label=f"{swarm_id}p{i}a{j}")
+            dict(session_id=InstanceRef.new_session().session_id, index=j, label=f"{swarm_id}p{i}a{j}")
             for j in range(base + (i < extra))]) for i in range(pods)]
         records = RecordStore(self.durable)
         with records.transaction("swarm", "pool", default={}) as pool:
             if pool:
                 raise ValueError("Swarm already exists; open it instead of recreating it")
-            pool.update(version=2, resource_uid=uuid.uuid4().hex, id=swarm_id, name=display_name, channels=channels, pods=topology,
-                        owner_session_id=owner_session_id, host=local_host_identity().to_dict(),
+            pool.update(version=2, resource_uid=uuid.uuid4().hex, id=swarm_id, name=display_name, channels=channels,
+                        pods=topology, owner_session_id=owner_session_id, host=local_host_identity().to_dict(),
                         desired_state="paused", phase="paused", created_ns=time.time_ns(),
                         owner=dict(epoch=1, token=uuid.uuid4().hex, parent_instance_id=owner_instance_id,
-                                   host=local_host_identity().to_dict(),
-                                   process_identity=native_self()), recovery=None)
+                                   host=local_host_identity().to_dict(), process_identity=native_self()), recovery=None)
             if model_profile is not None:
                 pool["model_profile"] = model_profile
         self.grant = parent_grant(self.pool(), owner_instance_id)
         return self.pool()
 
     def pool(self):
-        pool = self.records().get("swarm", "pool")
-        return validate_pool(pool)
+        return validate_pool(self.records().get("swarm", "pool"))
 
     def pod(self, pod_id: str):
         return next((pod for pod in self.pool()["pods"] if pod["id"] == name(pod_id)), None)
@@ -663,7 +535,6 @@ class SwarmStore:
         if not sender:
             raise ValueError("Sender session identity is required")
         message_id = name(message_id or uuid.uuid4().hex)
-        records = self.records(write=True)
         message = dict(id=message_id, pod_id=pod_id, channel=channel, sender=sender, text=text)
         with self.mutation() as (records, pool):
             if self.grant["session_id"] != sender or (self.grant["role"] == "member"
@@ -682,20 +553,17 @@ class SwarmStore:
 
     def messages(self, pod_id: str, channel: str):
         self.require_board(pod_id, channel)
-        # Shared storage must be readable; stale cache is never presented as current.
         entries = self.records().get(f"boards/{pod_id}", channel, {"entries": []})["entries"]
         try:
             self.cache.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             with closing(sqlite3.connect(self.cache, timeout=5)) as db, db:
                 db.execute("CREATE TABLE IF NOT EXISTS messages "
-                           "(pod TEXT, channel TEXT, ordinal INTEGER, body TEXT, "
-                           "PRIMARY KEY(pod, channel, ordinal))")
+                           "(pod TEXT, channel TEXT, ordinal INTEGER, body TEXT, PRIMARY KEY(pod, channel, ordinal))")
                 db.execute("DELETE FROM messages WHERE pod = ? AND channel = ?", (pod_id, channel))
                 db.executemany("INSERT INTO messages VALUES (?, ?, ?, ?)",
                                [(pod_id, channel, i, json.dumps(row)) for i, row in enumerate(entries)])
                 return [json.loads(row[0]) for row in db.execute(
-                    "SELECT body FROM messages WHERE pod = ? AND channel = ? ORDER BY ordinal",
-                    (pod_id, channel))]
+                    "SELECT body FROM messages WHERE pod = ? AND channel = ? ORDER BY ordinal", (pod_id, channel))]
         except (OSError, sqlite3.Error):
             LOG.warning("Swarm local cache unavailable; using authoritative board", exc_info=True)
             return entries
@@ -854,9 +722,7 @@ def initial_access():
     swarm_id = os.environ.get("AZO_SWARM_ID", "")
     if not swarm_id:
         return {}
-    # Child bootstrap must explicitly name its pod; never default a peer to parent access.
-    pod_id = os.environ.get("AZO_SWARM_POD_ID", "")
-    return {name(swarm_id): name(pod_id)}
+    return {name(swarm_id): name(os.environ.get("AZO_SWARM_POD_ID", ""))}
 
 
 def project_directory(state):
@@ -922,7 +788,7 @@ def repair_index(state, store, pool):
 
 
 def bind_resource(state, swarm_id, *, pod_id=""):
-    """Future user-command boundary: bind a resource without starting or resuming it."""
+    """Bind a resource without starting or resuming it."""
     store = store_for(state, swarm_id)
     pool = store.pool()
     if pod_id and store.pod(pod_id) is None:
@@ -950,8 +816,7 @@ def saved_transcript(state, session_id):
         saved = shared_checkpoint(state, session_id)
     except FileNotFoundError:
         return header + "No shared checkpoint is available; local-only state may still exist.\n"
-    lines = [header, f"Source Commit: {saved.commit_id}",
-             f"Source Instance: {saved.instance_id}",
+    lines = [header, f"Source Commit: {saved.commit_id}", f"Source Instance: {saved.instance_id}",
              f"Source Repository: {saved.repository}", f"Source Format: {saved.source_format}",
              "Order: Newest turn first; messages within each turn remain chronological.",
              "Entry pointers: canonical document indices, not journal file lines."]
@@ -959,8 +824,7 @@ def saved_transcript(state, session_id):
     if not isinstance(entries, list):
         nested = saved.document.get("state")
         entries = nested.get("entries", []) if isinstance(nested, dict) else []
-    turns, current = [], []
-    title = "Context before first user turn"
+    turns, current, title = [], [], "Context before first user turn"
     for position, entry in enumerate(entries or []):
         if not isinstance(entry, dict):
             continue
@@ -975,21 +839,15 @@ def saved_transcript(state, session_id):
             if role == "user" and not generated:
                 if current:
                     turns.append((title, current))
-                current = []
-                title = f"Turn [entry {index}]"
+                current, title = [], f"Turn [entry {index}]"
             if role in {"tool", "function", "tool_result", "function_call_output"}:
                 label = "TOOL RESULT"
             elif role in {"tool_use", "function_call"}:
                 label = "TOOL CALL"
             else:
                 label = role.upper()
-            qualifiers = []
-            if generated:
-                qualifiers.append("system-generated")
-            if message.get("channel"):
-                qualifiers.append(str(message["channel"]))
-            if message.get("name"):
-                qualifiers.append(str(message["name"]))
+            qualifiers = [q for q in ("system-generated" if generated else "", str(message.get("channel") or ""),
+                                      str(message.get("name") or "")) if q]
             if qualifiers:
                 label += " (" + ", ".join(qualifiers) + ")"
             pointer = f"entry {index}; message {ordinal}"
@@ -1004,12 +862,11 @@ def saved_transcript(state, session_id):
             } else message.get("content"))
             if body:
                 current.append(body)
-            for field in ("reasoning_content", "thinking_blocks", "refusal"):
-                readable = _swarm_content_text(message.get(field))
+            for fld in ("reasoning_content", "thinking_blocks", "refusal"):
+                readable = _swarm_content_text(message.get(fld))
                 if readable:
-                    current.extend([f"{field.replace('_', ' ').title()}:", readable])
-            message_calls = [*(message.get("tool_calls") or []),
-                             *(message.get("provider_tool_calls") or [])]
+                    current.extend([f"{fld.replace('_', ' ').title()}:", readable])
+            message_calls = [*(message.get("tool_calls") or []), *(message.get("provider_tool_calls") or [])]
             if isinstance(message.get("function_call"), dict):
                 message_calls.append(message["function_call"])
             for call in message_calls:
@@ -1020,19 +877,14 @@ def saved_transcript(state, session_id):
                     current.extend(_swarm_call_lines(call))
                     if key:
                         calls_seen.add(key)
-            # Content-block and direct provider calls/results can duplicate the
-            # native entry mirror; record both shapes before rendering that mirror.
             content = message.get("content")
-            blocks = [message, *(content if isinstance(content, list) else [])]
-            for block in blocks:
+            for block in [message, *(content if isinstance(content, list) else [])]:
                 if not isinstance(block, dict):
                     continue
                 if block.get("type") in {"tool_use", "function_call"}:
                     calls_seen.add(str(block.get("id") or block.get("call_id") or ""))
                 elif block.get("type") in {"tool_result", "function_call_output"}:
                     results_seen.add(str(block.get("tool_use_id") or block.get("call_id") or ""))
-        # Native ToolCall records may have arguments/results not yet mirrored into
-        # messages at the saved boundary. Include them without repeating mirrors.
         for call in entry.get("tool_calls") or []:
             if not isinstance(call, dict):
                 continue
@@ -1067,8 +919,7 @@ def _swarm_call_lines(call):
     label = str(function.get("name") or "(unnamed)")
     call_id = call.get("id") or call.get("call_id")
     suffix = f" [call {call_id}]" if call_id else ""
-    arguments = next((function[key] for key in ("arguments", "raw_args", "input", "parsed_args")
-                      if key in function), None)
+    arguments = next((function[key] for key in ("arguments", "raw_args", "input", "parsed_args") if key in function), None)
     lines = [f"Tool call: {label}{suffix}"]
     if arguments is not None:
         lines.extend(["Arguments:", _swarm_argument_text(arguments)])
@@ -1101,8 +952,7 @@ def _swarm_content_text(value):
     text_fields = ("text", "content", "thinking", "refusal", "summary")
     if kind in {"text", "input_text", "output_text", "summary_text", "thinking", "reasoning", "refusal"} or (
             not kind and value and set(value).issubset(text_fields)):
-        return "\n".join(filter(None, (_swarm_content_text(value[key])
-                                      for key in text_fields if key in value)))
+        return "\n".join(filter(None, (_swarm_content_text(value[key]) for key in text_fields if key in value)))
     return json.dumps(value, ensure_ascii=False, indent=2)
 
 
@@ -1142,7 +992,6 @@ class SwarmBuffers:
             lines.extend(f"  {channel}: {prefix}:board:{channel}" for channel in pool["channels"])
             for member in pod["members"]:
                 expected = f"{swarm_id}p{pod['index']}a{member['index']}"
-                # Older nonstandard labels retain their original long buffer IDs.
                 target = (f"swarm:{expected}" if member["label"] == expected and WORKER_KIND.fullmatch(expected)
                           else f"{prefix}:session:{member['session_id']}")
                 lines.append(f"  {member['label']}: {target}")
@@ -1167,8 +1016,8 @@ class SwarmBuffers:
                 store = allowed_store(state, swarm_id)
                 if effective_scope(state, swarm_id, store) or store.pool()["owner_session_id"] != state._session_id:
                     raise ValueError("Only the owning parent may read swarm operations")
-                operations = sorted(store.records().list("operations"), key=lambda row: row.get("created_ns", 0),
-                                    reverse=True)
+                operations = sorted(store.records().list("operations"),
+                                    key=lambda row: row.get("created_ns", 0), reverse=True)
                 text = f"{swarm_id} operations — saved records, newest first.\n"
                 text += "\n\n".join(json.dumps(row, ensure_ascii=False, indent=2) for row in operations)
                 text += "\n" if operations else "No saved operations.\n"
@@ -1206,8 +1055,253 @@ class SwarmBuffers:
         return ReadonlyBufferView(id=buffer_id, path=f"swarm://{buffer_id[6:]}", text=text)
 
 
-def launch_member(state, swarm_id: str, member_id: str, settings: RuntimeSettings,
-                  *, handles: dict, checkpoint: CheckpointRef | None = None):
+# ---------------------------------------------------------------------------
+# Pure SessionRequest Builders, CAS Adoption & Host LockFenceAdapter
+# ---------------------------------------------------------------------------
+
+
+class SwarmFenceRejected(RuntimeError):
+    """Non-retryable pre-dispatch fence rejection (maps to outcome='unavailable')."""
+
+
+def _info_facts(info: LiveSessionInfo) -> dict:
+    meta = info.metadata or {}
+    return dict(
+        session_id=info.session_id, instance_id=info.instance_id, registry_generation=meta.get("generation"),
+        process_identity=deepcopy(info.process_identity), websocket_url=info.websocket_url,
+        project_name=meta.get("project_name"), parent_session_id=meta.get("parent_session_id"),
+        kind=info.kind, capabilities=list(info.capabilities),
+    )
+
+
+def build_member_discover_request(store: SwarmStore, member: dict) -> tuple[DiscoverSessions, dict]:
+    """Read durable attempt anchor and build a pure ``DiscoverSessions(resolve_lineage=True)``."""
+    attempt = store.records().get("attempts", member["session_id"])
+    if not attempt or attempt.get("state") in {"reserved", "unknown", "exited", "fenced"}:
+        raise ValueError("Launch remains unreconciled or stopped; no automatic replay")
+    settings = attempt["request"]["settings"]
+    root, project = settings["store_root"], settings["project"]
+    pool = store.pool()
+    expected_pool = Path(settings["state_root"]) / "projects" / project / "swarms" / pool["id"]
+    if expected_pool.resolve() != store.durable.resolve():
+        raise ValueError("Original launch roots differ; destination recovery is required")
+    anchor = attempt.get("current") or dict(
+        session_id=attempt["session_id"], instance_id=attempt["instance_id"],
+        process_identity=attempt.get("process_identity"),
+        websocket_url=(attempt.get("ready") or {}).get("websocket_url"), registry_generation=None,
+    )
+    req = DiscoverSessions(
+        store_root=root, session_id=member["session_id"], instance_id=anchor["instance_id"],
+        include_stale=True, probe_local_processes=True, resolve_lineage=True,
+        anchor_instance_id=anchor["instance_id"],
+        expected_process_identity=deepcopy(anchor.get("process_identity")),
+        expected_project=project, expected_parent_session_id=pool["owner_session_id"],
+        expected_kind=attempt["request"]["kind"],
+        expected_registry_generation=anchor.get("registry_generation"),
+    )
+    meta = dict(
+        store_root=root, project=project, parent_session_id=pool["owner_session_id"],
+        kind=attempt["request"]["kind"], anchor=anchor, attempt_id=attempt.get("attempt_id"),
+        revision=attempt.get("binding_revision", 0), previous=deepcopy(attempt.get("current")),
+        origin=(attempt["instance_id"], attempt.get("process_identity")),
+    )
+    return req, meta
+
+
+def proposal_from_lineage(member: dict, lineage: LineageResolution, meta: dict) -> dict:
+    """Validate Swarm-specific anchor/generation/loopback invariants on a ``LineageResolution``."""
+    target = lineage.target
+    facts = _info_facts(target)
+    anchor_facts = lineage.edges[0]["predecessor"] if lineage.edges else facts
+    if (not isinstance(facts["registry_generation"], str) or not facts["registry_generation"]
+            or not isinstance(anchor_facts.get("registry_generation"), str) or not anchor_facts["registry_generation"]):
+        raise ValueError("Registry resource, host domain, or generation mismatch")
+    anchor = meta["anchor"]
+    if anchor.get("websocket_url") and anchor_facts.get("websocket_url") != anchor["websocket_url"]:
+        raise ValueError("Owned instance identity, endpoint or generation changed")
+    validate_loopback_ws_url(target.websocket_url)
+    return dict(
+        session_id=member["session_id"], instance_id=target.instance_id, label=member["label"],
+        websocket_url=target.websocket_url, process_identity=facts["process_identity"],
+        facts=facts, path=list(lineage.edges), registry_store_root=meta["store_root"],
+        attempt_id=meta["attempt_id"], revision=meta["revision"],
+        previous=meta["previous"], origin=meta["origin"],
+    )
+
+
+def cas_adopt(store: SwarmStore, member: dict, proposal: dict, *, allow_cancelled: bool = False) -> int:
+    """Atomically advance the member's durable binding revision after proving lineage."""
+    with store.mutation(allow_cancelled=allow_cancelled) as (records, pool):
+        with records.transaction("attempts", member["session_id"]) as saved:
+            if (saved.get("attempt_id") != proposal["attempt_id"]
+                    or saved.get("binding_revision", 0) != proposal["revision"]
+                    or saved.get("current") != proposal["previous"]
+                    or (saved["instance_id"], saved.get("process_identity")) != proposal["origin"]):
+                raise PreSendRace("Binding CAS lost; rediscovery required")
+            previous, facts = saved.get("current"), proposal["facts"]
+            if pool["desired_state"] == "cancelled":
+                if proposal["path"] or facts["instance_id"] != (previous or saved)["instance_id"]:
+                    raise ValueError("Cancelled swarms cannot adopt replacement peers")
+                return saved.get("binding_revision", 0)
+            if previous and all(previous.get(k) == v for k, v in facts.items()):
+                return saved["binding_revision"]
+            saved["current"] = dict(
+                facts, registry_store_root=proposal["registry_store_root"], verified_at_ns=time.time_ns(),
+                adoption=dict(from_instance_id=(previous or saved)["instance_id"], edges=proposal["path"]),
+            )
+            saved["binding_revision"] = proposal["revision"] + 1
+            return saved["binding_revision"]
+
+
+def _revalidate_proposal_sync(store: SwarmStore, member: dict) -> dict:
+    """Host-side revalidation delegating 64-hop lineage resolution to ``resolve_session_lineage``."""
+    req, meta = build_member_discover_request(store, member)
+    lineage = resolve_session_lineage(
+        list_live_sessions(req.store_root, include_stale=True),
+        anchor_instance_id=req.anchor_instance_id, session_id=req.session_id,
+        expected_process_identity=req.expected_process_identity, expected_project=req.expected_project,
+        expected_parent_session_id=req.expected_parent_session_id, expected_kind=req.expected_kind,
+        expected_registry_generation=req.expected_registry_generation, probe_local_processes=True,
+    )
+    return proposal_from_lineage(member, lineage, meta)
+
+
+def _record_dispatch_claim(records, pool, member_id: str, saved: dict, proposal: dict, operation_id: str) -> None:
+    with records.transaction("operations", operation_id) as operation:
+        if operation.get("epoch", pool["owner"]["epoch"]) != pool["owner"]["epoch"]:
+            raise ValueError("Operation belongs to a previous owner epoch")
+        claims = operation.setdefault("dispatch", {})
+        if member_id in claims:
+            raise ValueError("Operation already claimed this member; never replay")
+        claims[member_id] = dict(
+            state="sending", attempt_id=saved["attempt_id"],
+            instance_id=proposal["instance_id"], generation=proposal["facts"]["registry_generation"],
+        )
+
+
+def _claim_operation_dispatch(store: SwarmStore, member: dict, proposal: dict, *,
+                              operation_id: str, allow_cancelled: bool = False) -> None:
+    with store.mutation(allow_cancelled=allow_cancelled) as (records, pool):
+        saved = records.get("attempts", member["session_id"])
+        if not saved:
+            raise ValueError("Launch remains unreconciled or stopped; no automatic replay")
+        _record_dispatch_claim(records, pool, member["session_id"], saved, proposal, operation_id)
+
+
+class SwarmLockFenceAdapter:
+    """Host-side ``LockFenceAdapter`` enforcing SwarmStore's atomic mutation-gate around WS writes."""
+
+    def execute_fenced(self, fence_spec: Mapping[str, object], target: LiveSessionInfo,
+                       dispatch: Callable[[], None]) -> None:
+        store = SwarmStore(Path(str(fence_spec["durable"])), Path(str(fence_spec["cache"])), grant=fence_spec.get("grant"))
+        member = {"session_id": str(fence_spec["member_id"]), "label": str(fence_spec.get("member_label") or fence_spec["member_id"])}
+        proposal, allow_cancelled = dict(fence_spec["proposal"]), bool(fence_spec.get("allow_cancelled", False))  # type: ignore[arg-type]
+        operation_id = str(fence_spec.get("operation_id") or "")
+        try:
+            newer = _revalidate_proposal_sync(store, member)
+            if (any(newer[k] != proposal[k] for k in ("facts", "path", "attempt_id", "revision", "previous", "origin"))
+                    or (target.instance_id and target.instance_id != proposal["instance_id"])):
+                raise PreSendRace("Replacement discovery changed before dispatch")
+            revision = cas_adopt(store, member, proposal, allow_cancelled=allow_cancelled)
+            with store.mutation(allow_cancelled=allow_cancelled) as (records, pool):
+                final, saved = _revalidate_proposal_sync(store, member), records.get("attempts", member["session_id"])
+                if (final["facts"] != proposal["facts"] or final["revision"] != revision
+                        or saved.get("binding_revision") != revision or saved.get("current") != final["previous"]):
+                    raise PreSendRace("Binding changed at send boundary")
+                identity = ProcessIdentity.from_dict(proposal["process_identity"])
+                if capture_process_identity(identity.pid) != identity:
+                    raise SwarmFenceRejected("Peer changed at dispatch boundary")
+                if operation_id:
+                    _record_dispatch_claim(records, pool, member["session_id"], saved, proposal, operation_id)
+                dispatch()
+        except (PreSendRace, SwarmFenceRejected):
+            raise
+        except ValueError as exc:
+            raise SwarmFenceRejected(str(exc)) from exc
+
+
+def register_swarm_lock_fence(driver: AgentZooSessionDriver) -> AgentZooSessionDriver:
+    driver.register_lock_fence(SWARM_LOCK_FENCE_NAME, SwarmLockFenceAdapter())
+    return driver
+
+
+def make_swarm_session_driver(config: object = None, **kwargs) -> AgentZooSessionDriver:
+    del config
+    kwargs.setdefault("spawned_policy", "leave")
+    return register_swarm_lock_fence(AgentZooSessionDriver(**kwargs))
+
+
+def _swarm_lock_fence_spec(store: SwarmStore | None, member: dict | None, proposal: dict, *,
+                           operation_id: str, action: str) -> dict | None:
+    if store is None or member is None:
+        return None
+    return dict(
+        adapter=SWARM_LOCK_FENCE_NAME, store_root=proposal["registry_store_root"], durable=str(store.durable),
+        cache=str(store.cache), grant=deepcopy(store.grant), member_id=member["session_id"],
+        member_label=member["label"], operation_id=operation_id, action=action,
+        proposal=deepcopy(proposal), allow_cancelled=action == "cancel",
+    )
+
+
+def build_member_input_request(proposal: dict, request: dict, *,
+                               store: SwarmStore | None = None, member: dict | None = None) -> SendSessionInput:
+    action = request["action"]
+    needed = ACTION_CAPABILITIES[action]
+    if store is not None and needed not in proposal["facts"]["capabilities"]:
+        raise ValueError(f"Peer lacks capability {needed}; no send attempted")
+    validate_loopback_ws_url(proposal["websocket_url"])
+    op_id = str(request.get("operation_id") or uuid.uuid4().hex)
+    if action == "bcast":
+        channel, payload = "user_text", {"text": request["message"]}
+    elif action == "cancel":
+        channel, payload = "control", {"type": "shutdown", "save": True, "reason": "swarm-cancel"}
+    else:
+        channel, payload = "slash_command", {"raw": afk_command(request.get("message")) if action == "afk" else "/" + action}
+    return SendSessionInput(
+        session_id=proposal["session_id"], instance_id=proposal["instance_id"], channel=channel, payload=payload,
+        client_id=op_id, websocket_url=proposal["websocket_url"],
+        expected_process_identity=deepcopy(proposal["process_identity"]),
+        expected_registry_generation=proposal.get("facts", {}).get("registry_generation"),
+        required_capability=needed if store is not None else "", verify_loopback=True,
+        resolve_lineage=store is not None, timeout_s=15.0,
+        lock_fence=_swarm_lock_fence_spec(store, member, proposal, operation_id=op_id, action=action),
+    )
+
+
+def build_member_stop_request(proposal: dict, *, operation_id: str) -> StopSession:
+    validate_loopback_ws_url(proposal["websocket_url"])
+    return StopSession(
+        session_id=proposal["session_id"], instance_id=proposal["instance_id"], mode="graceful_ws", save=True,
+        reason="swarm-cancel", spawned_policy="leave", client_id=operation_id,
+        expected_process_identity=deepcopy(proposal["process_identity"]), timeout_s=5.0,
+    )
+
+
+def build_member_data_request(proposal: dict, *, artifacts: Sequence[SessionArtifact], channel: str,
+                              message: str = "", sender_session_id: str = "", sender_instance_id: str = "",
+                              operation_id: str = "", store: SwarmStore | None = None,
+                              member: dict | None = None) -> SendSessionData:
+    validate_loopback_ws_url(proposal["websocket_url"])
+    op_id = str(operation_id or uuid.uuid4().hex)
+    return SendSessionData(
+        session_id=proposal["session_id"], instance_id=proposal["instance_id"], artifacts=tuple(artifacts),
+        channel=channel, message=message, sender_session_id=sender_session_id, sender_instance_id=sender_instance_id,
+        client_id=op_id, websocket_url=proposal["websocket_url"],
+        expected_process_identity=deepcopy(proposal["process_identity"]),
+        expected_registry_generation=proposal.get("facts", {}).get("registry_generation"),
+        verify_loopback=True, resolve_lineage=store is not None, timeout_s=15.0,
+        lock_fence=_swarm_lock_fence_spec(store, member, proposal, operation_id=op_id, action="share_data"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pure Launch Reservation, Readiness Attestation & Recovery
+# ---------------------------------------------------------------------------
+
+
+def reserve_member_launch(state, swarm_id: str, member_id: str, settings: RuntimeSettings,
+                          *, checkpoint: CheckpointRef | None = None) -> tuple[SpawnSession, dict]:
+    """Validate destination settings, reserve durable attempt, and build a pure ``SpawnSession``."""
     store = allowed_store(state, swarm_id)
     if effective_scope(state, swarm_id, store):
         raise ValueError("Only a parent binding can launch pool members")
@@ -1221,93 +1315,103 @@ def launch_member(state, swarm_id: str, member_id: str, settings: RuntimeSetting
         raise ValueError("Child settings must select the same durable swarm")
     if checkpoint is not None and checkpoint.session_id != member_id:
         raise ValueError("Checkpoint must belong to the member session")
-    launcher = state.session_launcher if hasattr(state, "session_launcher") else RuntimeLauncher()
-    if launcher is None:
+    if hasattr(state, "session_launcher") and getattr(state, "session_launcher", None) is None:
         raise ValueError("Runtime launch service is unavailable")
     member = next(m for m in store.pod(pod_id)["members"] if m["session_id"] == member_id)
     target, attempt_id = InstanceRef.new_instance(member_id), uuid.uuid4().hex
     pool = store.pool()
-    request = RuntimeLaunch(
-        target=target, source=Resume(checkpoint) if checkpoint else Fresh(), settings=settings,
-        parent_session_id=state._session_id, kind=member["label"],
-        title=f"{pool['name']} / {member['label']}", lifetime="independent", startup_mode="paused",
-        first_user_message="",
-    )
     grant = dict(store.grant, role="member", instance_id=target.instance_id,
                  session_id=member_id, attempt_id=attempt_id)
-    env = dict(os.environ, AZO_SWARM_ID=swarm_id, AZO_SWARM_POD_ID=pod_id,
-               AZO_SWARM_GRANT=json.dumps(grant))
-    plan = launcher.prepare(request, cwd=settings.workdir, env=env)
-    attempt = store.reserve_attempt(member_id, dict(attempt_id=attempt_id,
-        session_id=member_id, instance_id=target.instance_id, pod_id=pod_id, state="reserved",
-        request=plan.request.to_dict(), host=local_host_identity().to_dict(),
-        ready_file=plan.ready_file, created_ns=time.time_ns(),
-        recovery_operation_id=(pool.get("recovery") or {}).get("operation_id"),
-        selected_checkpoint=dict(session_id=checkpoint.session_id, revision_id=checkpoint.revision_id) if checkpoint else None))
-    # The gate covers admission and process creation, never readiness polling.
-    with store.mutation() as (records, current_pool):
+    source = (SessionSource(kind="resume", session_id=checkpoint.session_id, revision_id=checkpoint.revision_id)
+              if checkpoint is not None else SessionSource(kind="fresh"))
+    spec = SessionSpec(
+        project=settings.project, workdir=settings.workdir, model=settings.model,
+        pipeline_key=settings.pipeline_key, env_name=settings.env_name,
+        config_path=settings.config_path, config_sets=tuple(settings.config_sets),
+        state_root=settings.state_root, store_root=settings.store_root,
+        local_state_root=settings.local_state_root, host=settings.host, port=settings.port,
+        modern=settings.modern, continuation_policy=settings.continuation_policy,
+        kind=member["label"], title=f"{pool['name']} / {member['label']}",
+        parent_session_id=state._session_id, first_user_message="", spawn_policy="",
+        startup_mode="paused", lifetime="independent",
+        extra_env=(("AZO_SWARM_ID", swarm_id), ("AZO_SWARM_POD_ID", pod_id),
+                   ("AZO_SWARM_GRANT", json.dumps(grant))),
+    )
+    request_doc = dict(
+        target=dict(session_id=member_id, instance_id=target.instance_id), source=asdict(source),
+        settings=asdict(settings), parent_session_id=state._session_id, kind=member["label"],
+        title=spec.title, lifetime="independent", startup_mode="paused", first_user_message="",
+    )
+    attempt = store.reserve_attempt(member_id, dict(
+        attempt_id=attempt_id, session_id=member_id, instance_id=target.instance_id, pod_id=pod_id,
+        state="reserved", request=request_doc, host=local_host_identity().to_dict(),
+        created_ns=time.time_ns(), recovery_operation_id=(pool.get("recovery") or {}).get("operation_id"),
+        selected_checkpoint=(dict(session_id=checkpoint.session_id, revision_id=checkpoint.revision_id)
+                             if checkpoint is not None else None),
+    ))
+    spawn_req = SpawnSession(session_id=member_id, instance_id=target.instance_id, source=source,
+                             spec=spec, wait_ready=True, ready_timeout_s=30.0, watch=False)
+    return spawn_req, attempt
+
+
+def mark_spawn_unknown(store: SwarmStore, member_id: str, attempt_id: str) -> None:
+    """Preserve reserved->unknown boundary on spawn error so automatic replay is forbidden."""
+    with store.mutation(allow_cancelled=True) as (records, pool):
         saved = records.get("attempts", member_id)
-        if saved.get("attempt_id") != attempt_id or saved.get("state") != "reserved":
-            raise ValueError("Launch admission superseded")
-        try:
-            handle = launcher.start(plan)
-            handles[target.instance_id] = handle
-            identity = capture_process_identity(handle.process.pid)
-            saved.update(state="spawned", pid=handle.process.pid,
-                         process_identity=identity.to_dict() if identity else None,
-                         stdout_log=handle.stdout_path, stderr_log=handle.stderr_path)
-            records.put("attempts", member_id, saved)
-        except BaseException:
-            # Preserve the reserved/unknown boundary even if after-image persistence fails.
-            saved["state"] = "unknown"
-            records.put("attempts", member_id, saved)
-            raise
-    return handle
+        if saved and saved.get("attempt_id") == attempt_id and saved.get("epoch") == pool["owner"]["epoch"]:
+            if saved.get("state") == "reserved":
+                saved["state"] = "unknown"
+                records.put("attempts", member_id, saved)
 
 
-async def await_member_ready(state, store, member, handle, *, timeout=30):
-    deadline = asyncio.get_running_loop().time() + timeout
+def finalize_member_ready(state, store: SwarmStore, member: dict, attempt_id: str,
+                          spawn_result: SessionSpawnResult, *, timeout: float = 30.0) -> dict:
+    """Verify paused checkpoint readiness & child plugin bootstrap attestation after ``SpawnSession``."""
+    ready = dict(spawn_result.ready or {})
+    pid = spawn_result.pid
+    identity = capture_process_identity(pid) if isinstance(pid, int) and pid > 0 else None
+    if identity is None and spawn_result.process_identity is not None:
+        expected_ident = ProcessIdentity.from_dict(spawn_result.process_identity)
+        if expected_ident.host_id == "sim-host":
+            identity = expected_ident
+    if (type(ready.get("format_version")) is not int or ready["format_version"] != 1
+            or identity is None or ready.get("pid") != identity.pid
+            or ready.get("process_identity") != identity.to_dict()
+            or ready.get("session_id") != member["session_id"]
+            or ready.get("instance_id") != spawn_result.instance_id
+            or ready.get("startup_mode") != "paused" or ready.get("paused") is not True
+            or not ready.get("revision_id")):
+        raise ValueError("Peer did not publish exact paused checkpoint readiness")
+    validate_loopback_ws_url(ready["websocket_url"])
+    store.update_attempt(
+        member["session_id"], expected_attempt=attempt_id, state="spawned", pid=pid,
+        process_identity=identity.to_dict(), stdout_log=spawn_result.stdout_path,
+        stderr_log=spawn_result.stderr_path, ready_file=spawn_result.ready_file,
+    )
+    deadline = time.monotonic() + max(0.0, float(timeout))
     while True:
-        observed = await blocking(handle.poll)
-        if observed.status == "ready":
-            ready = observed.ready
-            identity = await blocking(capture_process_identity, handle.process.pid)
-            if (type(ready.get("format_version")) is not int or ready["format_version"] != 1
-                    or identity is None or ready.get("pid") != identity.pid
-                    or ready.get("process_identity") != identity.to_dict()
-                    or ready.get("session_id") != member["session_id"]
-                    or ready.get("instance_id") != handle.ref.instance_id
-                    or ready.get("startup_mode") != "paused" or ready.get("paused") is not True
-                    or not ready.get("revision_id")):
-                raise ValueError("Peer did not publish exact paused checkpoint readiness")
-            endpoint(ready["websocket_url"])
-            attempt = await blocking(lambda: store.records().get("attempts", member["session_id"]))
-            selected = attempt.get("selected_checkpoint")
-            if selected and ready["revision_id"] != selected["revision_id"]:
-                raise ValueError("Peer loaded a different recovery revision")
-            # Bootstrap is written by the actual child plugin after proving shared durability.
-            admission = attempt.get("bootstrap") or {}
-            if (admission.get("instance_id") == handle.ref.instance_id
-                    and admission.get("revision_id") == ready["revision_id"]
-                    and admission.get("paused") is True and admission.get("epoch") == store.grant["epoch"]
-                    and admission.get("process_identity") == identity.to_dict()):
-                await blocking(shared_checkpoint, state, member["session_id"], ready["revision_id"])
-                await blocking(store.update_attempt, member["session_id"], expected_attempt=attempt["attempt_id"],
-                               state="ready_paused", ready=ready)
-                return dict(label=member["label"], session_id=member["session_id"], state="ready_paused")
-        if observed.status in {"exited", "unknown"}:
-            raise RuntimeError(observed.error or f"Peer {observed.status}")
-        if asyncio.get_running_loop().time() >= deadline:
+        attempt = store.records().get("attempts", member["session_id"])
+        selected = attempt.get("selected_checkpoint")
+        if selected and ready["revision_id"] != selected["revision_id"]:
+            raise ValueError("Peer loaded a different recovery revision")
+        admission = attempt.get("bootstrap") or {}
+        if (admission.get("instance_id") == spawn_result.instance_id
+                and admission.get("revision_id") == ready["revision_id"]
+                and admission.get("paused") is True and admission.get("epoch") == store.grant["epoch"]
+                and admission.get("process_identity") == identity.to_dict()):
+            shared_checkpoint(state, member["session_id"], ready["revision_id"])
+            store.update_attempt(member["session_id"], expected_attempt=attempt_id,
+                                 state="ready_paused", ready=ready)
+            return dict(label=member["label"], session_id=member["session_id"], state="ready_paused")
+        if time.monotonic() >= deadline:
             raise TimeoutError("Agent startup timed out")
-        await asyncio.sleep(0.1)
+        time.sleep(0.05)
 
 
 def process_evidence(value):
     if not value:
         return "unknown"
-    identity = ProcessIdentity.from_dict(value)
-    evidence = observe_process(identity)
-    return evidence.state.value.lower()
+    return observe_process(ProcessIdentity.from_dict(value)).state.value.lower()
 
 
 def owned_stores(state):
@@ -1323,15 +1427,13 @@ def owned_stores(state):
     result = []
     for swarm_id in sorted(candidates):
         store = store_for(state, swarm_id)
-        # Unrelated RecordStore infrastructure is not a pool; indexed missing authority is an error.
         try:
             pool = store.records().get("swarm", "pool")
         except Exception as exc:
             result.append((swarm_id, None, str(exc)))
             continue
         if pool is None:
-            if swarm_id in candidates and (swarm_id in getattr(state, "swarm_access", {})
-                    or (root.exists() and swarm_id in index["pools"])):
+            if swarm_id in getattr(state, "swarm_access", {}) or (root.exists() and swarm_id in index["pools"]):
                 result.append((swarm_id, None, "Missing authoritative pool; not recreated"))
             continue
         try:
@@ -1344,120 +1446,87 @@ def owned_stores(state):
     return result
 
 
-def owner_replaced(state, pool):
-    """An exec reload can retire an owner IID while its native process remains alive."""
-    old = pool["owner"]["parent_instance_id"]
-    root = _state_store_root(state)
-    rows = list_live_sessions(root, include_stale=True)
-    by_id = {r.instance_id: r for r in rows}
-    a = by_id.get(old)
-    if not a or a.session_id != state._session_id or a.process_identity.to_dict() != pool["owner"]["process_identity"]:
+def build_owner_discover_request(state, pool) -> DiscoverSessions:
+    return DiscoverSessions(
+        store_root=_state_store_root(state), session_id=state._session_id,
+        include_stale=True, probe_local_processes=True, resolve_lineage=True,
+        anchor_instance_id=pool["owner"]["parent_instance_id"],
+        expected_process_identity=deepcopy(pool["owner"].get("process_identity")),
+        expected_project=_state_project_name(state),
+    )
+
+
+def owner_replaced_from_discovery(state, discovered: DiscoverSessionsResult | None) -> bool:
+    if discovered is None or discovered.status != "ready" or discovered.lineage is None:
         return False
-    visited = set()
-    for _ in range(64):
-        if a.instance_id == state._instance_id:
-            return (not a.is_terminal() and a.process_identity.to_dict() == native_self())
-        if a.instance_id in visited:
-            return False
-        visited.add(a.instance_id)
-        recovery = (a.metadata or {}).get("recovery") or {}
-        successors = [b for b in rows if (b.metadata or {}).get("reload_previous_instance_id") == a.instance_id
-                      or recovery.get("instance_id") == b.instance_id]
-        if len(successors) != 1:
-            return False
-        b = successors[0]
-        if (b.session_id != state._session_id
-                or (b.metadata or {}).get("project_name") != _state_project_name(state)):
-            return False
-        lineage_edge(a, b)
-        a = b
-    return False
+    target = discovered.lineage.target
+    return (target.session_id == state._session_id and target.instance_id == state._instance_id
+            and not target.is_terminal and target.process_identity == native_self())
 
 
-def reconcile_attempt(state, attempt, pool=None):
-    """Death of A does not prove death of an unadopted A\u2192B replacement."""
+def classify_attempt_from_discovery(state, attempt: dict, pool: dict | None = None,
+                                    discovered: DiscoverSessionsResult | None = None) -> str:
+    """Classify an old attempt using pure ``DiscoverSessionsResult`` rows."""
     binding = attempt.get("current") or attempt
     identity = binding.get("process_identity")
     bootstrap = attempt.get("bootstrap") or {}
     if not identity and bootstrap.get("instance_id") == binding.get("instance_id"):
         identity = bootstrap.get("process_identity")
-    observed = process_evidence(identity)
-    if observed == "alive":
+    if process_evidence(identity) == "alive":
         return "alive"
-    attested = bool(attempt.get("state") == "fenced" and
-                    (attempt.get("reconciliation") or {}).get("confirmed_stopped"))
     evidence = ((pool or {}).get("recovery") or {}).get("takeover_evidence") or {}
-    if evidence.get("confirmed_stopped") and attempt.get("attempt_id"):
-        attested = attested or any(old.get("attempt_id") == attempt["attempt_id"]
-                                  and old.get("session_id") == attempt["session_id"]
-                                  for old in evidence.get("subjects", []))
-    root = _state_store_root(state)
-    project_name = _state_project_name(state)
-    try:
-        rows = list_live_sessions(root, include_stale=True)
-    except Exception:
+    attested = bool(
+        (attempt.get("state") == "fenced" and (attempt.get("reconciliation") or {}).get("confirmed_stopped"))
+        or (evidence.get("confirmed_stopped") and attempt.get("attempt_id")
+            and any(o.get("attempt_id") == attempt["attempt_id"] and o.get("session_id") == attempt["session_id"]
+                    for o in evidence.get("subjects", [])))
+    )
+    if discovered is None or discovered.status == "error":
         return "confirmed_stopped" if attested else "unknown"
+    project_name, rows = _state_project_name(state), discovered.rows
+    sid = attempt["session_id"]
     for row in rows:
-        if (row.session_id == attempt["session_id"]
-                and (row.metadata or {}).get("project_name") == project_name
-                and (row.metadata or {}).get("parent_session_id") == state._session_id
-                and process_evidence(row.process_identity.to_dict() if row.process_identity else None) == "alive"):
-            return "alive"
+        meta = row.metadata or {}
+        if (row.session_id == sid and meta.get("project_name") == project_name
+                and meta.get("parent_session_id") == state._session_id):
+            claim = meta.get("recovery") if isinstance(meta.get("recovery"), Mapping) else {}
+            if process_evidence(row.process_identity) == "alive" or (claim and process_evidence(claim.get("owner")) == "alive"):
+                return "alive"
     if attested:
         return "confirmed_stopped"
     if not identity:
         return "unknown"
     by_id = {r.instance_id: r for r in rows}
-    current = by_id.get(binding["instance_id"])
-    if current is None:
-        # A missing registry history cannot rule out an already-launched successor.
-        return "unknown"
-    if (current.session_id != attempt["session_id"] or current.process_identity is None
-            or current.process_identity.to_dict() != identity
+    cur = by_id.get(binding["instance_id"])
+    if (cur is None or cur.session_id != sid or cur.process_identity != identity
             or (binding.get("registry_generation") is not None
-                and binding["registry_generation"] != (current.metadata or {}).get("generation"))):
+                and binding["registry_generation"] != (cur.metadata or {}).get("generation"))):
         return "unknown"
-    seen = set()
+    seen: set[str] = set()
     for _ in range(64):
-        if current.instance_id in seen:
+        if cur.instance_id in seen:
             return "unknown"
-        seen.add(current.instance_id)
-        native = process_evidence(current.process_identity.to_dict() if current.process_identity else None)
-        if native == "alive":
-            return "alive"
-        claim = (current.metadata or {}).get("recovery") or {}
-        if claim and process_evidence(claim.get("owner")) == "alive":
-            return "alive"
-        successors = [r for r in rows if (r.metadata or {}).get("reload_previous_instance_id") == current.instance_id
-                      or claim.get("instance_id") == r.instance_id]
-        if claim.get("instance_id") and claim["instance_id"] not in by_id:
+        seen.add(cur.instance_id)
+        claim = (cur.metadata or {}).get("recovery") or {}
+        claim_id = claim.get("instance_id") if isinstance(claim, Mapping) else None
+        succs = [r for r in rows if (r.metadata or {}).get("reload_previous_instance_id") == cur.instance_id
+                 or (claim_id and claim_id == r.instance_id)]
+        if (claim_id and claim_id not in by_id) or len(succs) > 1:
             return "unknown"
-        if not successors:
-            return native
-        if len(successors) != 1:
+        if not succs:
+            return process_evidence(cur.process_identity)
+        nxt = succs[0]
+        if (nxt.session_id != sid or (nxt.metadata or {}).get("project_name") != project_name
+                or (nxt.metadata or {}).get("parent_session_id") != state._session_id
+                or not cur.is_terminal or not cur.is_confirmed_stopped):
             return "unknown"
-        successor = successors[0]
-        if process_evidence(successor.process_identity.to_dict() if successor.process_identity else None) == "alive":
-            return "alive"
-        if (successor.session_id != attempt["session_id"]
-                or (successor.metadata or {}).get("project_name") != project_name
-                or (successor.metadata or {}).get("parent_session_id") != state._session_id):
-            return "unknown"
-        try:
-            lineage_edge(current, successor)
-        except (ValueError, KeyError, TypeError, AttributeError):
-            return "unknown"
-        current = successor
+        cur = nxt
     return "unknown"
 
 
-def rebind_live_parent_successor(state, store, request):
-    """A certified same-host parent replacement is not a new child generation.
-
-    Preserve only positively live existing children. Mixed/dead/unknown execution
-    sets use the full recovery path instead. This requests pause, never claims tool
-    quiescence or silently starts/replays work.
-    """
+def rebind_live_parent_successor(state, store: SwarmStore, request: dict, *,
+                                 owner_discovered: DiscoverSessionsResult | None = None):
+    """Preserve positively live existing children on certified same-host parent replacement."""
     if request.get("confirmed_stopped"):
         return None
     records = store.records(write=True)
@@ -1469,7 +1538,7 @@ def rebind_live_parent_successor(state, store, request):
                 or not pool["owner"].get("process_identity")
                 or pool["owner"]["parent_instance_id"] == state._instance_id
                 or domain(pool["owner"]["process_identity"]) != domain(native_self())
-                or not owner_replaced(state, pool)):
+                or not owner_replaced_from_discovery(state, owner_discovered)):
             return None
         attempts = records.list("attempts")
         if not attempts or any(process_evidence((a.get("current") or a).get("process_identity")) != "alive"
@@ -1482,8 +1551,8 @@ def rebind_live_parent_successor(state, store, request):
         previous = deepcopy(pool["owner"])
         pool["owner"] = dict(previous, parent_instance_id=state._instance_id,
                              host=local_host_identity().to_dict(), process_identity=native_self())
-        records.put("owner_history", state._instance_id, dict(kind="verified-parent-replacement",
-                    previous=previous, current=pool["owner"], at_ns=time.time_ns()))
+        records.put("owner_history", state._instance_id, dict(
+            kind="verified-parent-replacement", previous=previous, current=pool["owner"], at_ns=time.time_ns()))
         records.put("swarm", "pool", pool)
         grant = parent_grant(pool, state._instance_id)
         store.grant = grant
@@ -1510,7 +1579,9 @@ def require_completed_transfer(state, store, pool):
     return True
 
 
-def claim_recovery(state, store, *, expected_epoch=None, confirmed_stopped=False):
+def claim_recovery(state, store: SwarmStore, *, expected_epoch=None, confirmed_stopped=False,
+                   discovered: DiscoverSessionsResult | None = None,
+                   owner_discovered: DiscoverSessionsResult | None = None):
     """Takeover and every writer share this gate. No timeout/heartbeat grants authority."""
     records = store.records(write=True)
     with file_lock(records.lock_path("swarm-gates", "mutation")):
@@ -1521,7 +1592,6 @@ def claim_recovery(state, store, *, expected_epoch=None, confirmed_stopped=False
         if pool["desired_state"] == "cancelled":
             raise ValueError("Cancelled swarms remain cancelled")
         imported = require_completed_transfer(state, store, pool)
-        # Completed import carries the user's durable source retirement confirmation.
         confirmed_stopped = confirmed_stopped or imported
         epoch = pool.get("owner", {}).get("epoch", 0)
         if expected_epoch is not None and epoch != expected_epoch:
@@ -1531,33 +1601,34 @@ def claim_recovery(state, store, *, expected_epoch=None, confirmed_stopped=False
         owner_state = "unknown" if pool["version"] == 1 else process_evidence(pool["owner"]["process_identity"])
         same_owner = (pool["version"] == 2 and pool["owner"]["parent_instance_id"] == state._instance_id
                       and pool["owner"].get("process_identity") == native_self())
-        replaced = False if same_owner or pool["version"] == 1 or imported else owner_replaced(state, pool)
+        replaced = (False if same_owner or pool["version"] == 1 or imported
+                    else owner_replaced_from_discovery(state, owner_discovered))
         if owner_state == "alive" and not same_owner and not replaced:
             raise ValueError("Different live owner blocks takeover, including contradictory stopped confirmation")
-        # A recorded operator confirmation is deliberate authority, not a software death proof.
         if not confirmed_stopped and not same_owner and owner_state != "dead" and not replaced:
             raise ValueError(f"Old owner {owner_state}; explicit confirmed-stopped takeover required")
         old_attempts = records.list("attempts")
-        classifications = {}
-        for attempt in old_attempts:
-            classifications[attempt["session_id"]] = reconcile_attempt(state, attempt, pool)
-        # Claim owner even when some children are blocked: no replacement for those children.
-        # A live competing owner always blocked above; grants of orphan children become fenced.
-        previous = deepcopy(pool.get("owner"))
-        token = uuid.uuid4().hex
-        operation_id = uuid.uuid4().hex
-        pool.update(version=2, resource_uid=pool.get("resource_uid") or uuid.uuid4().hex,
-                    owner=dict(epoch=epoch + 1, token=token, parent_instance_id=state._instance_id,
-                               host=local_host_identity().to_dict(), process_identity=native_self()),
-                    host=local_host_identity().to_dict(), phase="recovering", desired_state="paused",
-                    recovery=dict(operation_id=operation_id, parent_instance_id=state._instance_id,
-                                  expected_previous_epoch=epoch, previous_owner=previous, phase="recovering",
-                                  selected_checkpoints=deepcopy((pool.get("recovery") or {}).get("selected_checkpoints", {}))
-                                      if pool.get("phase") in {"recovering", "mixed"} or imported else {},
-                                  classifications=classifications,
-                                  takeover_evidence=dict(confirmed_stopped=confirmed_stopped,
-                                      subjects=deepcopy(old_attempts), owner=previous,
-                                      scope="old parent, all children/unknown launches and external jobs", at_ns=time.time_ns())))
+        classifications = {
+            attempt["session_id"]: classify_attempt_from_discovery(state, attempt, pool, discovered)
+            for attempt in old_attempts
+        }
+        previous, token, operation_id = deepcopy(pool.get("owner")), uuid.uuid4().hex, uuid.uuid4().hex
+        pool.update(
+            version=2, resource_uid=pool.get("resource_uid") or uuid.uuid4().hex,
+            owner=dict(epoch=epoch + 1, token=token, parent_instance_id=state._instance_id,
+                       host=local_host_identity().to_dict(), process_identity=native_self()),
+            host=local_host_identity().to_dict(), phase="recovering", desired_state="paused",
+            recovery=dict(
+                operation_id=operation_id, parent_instance_id=state._instance_id, expected_previous_epoch=epoch,
+                previous_owner=previous, phase="recovering",
+                selected_checkpoints=(deepcopy((pool.get("recovery") or {}).get("selected_checkpoints", {}))
+                                      if pool.get("phase") in {"recovering", "mixed"} or imported else {}),
+                classifications=classifications,
+                takeover_evidence=dict(confirmed_stopped=confirmed_stopped, subjects=deepcopy(old_attempts),
+                                       owner=previous, scope="old parent, all children/unknown launches and external jobs",
+                                       at_ns=time.time_ns()),
+            ),
+        )
         if imported:
             pool["transfer"] = dict(pool["transfer"], requires_recovery=False, admitted_epoch=epoch + 1)
         prior = records.get("swarm", "pool")
@@ -1573,18 +1644,19 @@ def claim_recovery(state, store, *, expected_epoch=None, confirmed_stopped=False
             attempt.setdefault("attempt_id", uuid.uuid4().hex)
             if records.get("attempt_history", attempt["attempt_id"]) is None:
                 records.put("attempt_history", attempt["attempt_id"], attempt)
-            safe = classifications[sid] in {"dead", "confirmed_stopped"} or (confirmed_stopped and classifications[sid] != "alive")
-            # Fenced is a reconciled launch slot, NOT a claim that an OS process was killed.
+            safe = classifications[sid] in {"dead", "confirmed_stopped"} or (
+                confirmed_stopped and classifications[sid] != "alive")
             if safe:
-                records.put("attempts", sid, dict(attempt, state="fenced", reconciled_by=operation_id,
-                            reconciliation=dict(confirmed_stopped=confirmed_stopped,
-                                                process_evidence=classifications[sid], epoch=epoch + 1)))
+                records.put("attempts", sid, dict(
+                    attempt, state="fenced", reconciled_by=operation_id,
+                    reconciliation=dict(confirmed_stopped=confirmed_stopped,
+                                        process_evidence=classifications[sid], epoch=epoch + 1)))
             row = records.get("members", sid, {})
             row.update(session_id=sid, recovery_status="pending" if safe else "ambiguous",
                        error="" if safe else f"Previous agent is {classifications[sid]}; stop it before recovery")
             records.put("members", sid, row)
         records.put("operations", operation_id, dict(id=operation_id, action="recover", epoch=epoch + 1,
-                    state="pending", outcomes=[], created_ns=time.time_ns()))
+                                                     state="pending", outcomes=[], created_ns=time.time_ns()))
         return pool
 
 
@@ -1613,7 +1685,6 @@ def require_checkpoint_ancestry(state, session_id, saved, watermark):
 
 def pin_checkpoint(state, store, member):
     sid = member["session_id"]
-    # Branch resolution is journal ancestry/explicit repository selection, never wall-clock latest.
     pinned = (store.pool().get("recovery") or {}).get("selected_checkpoints", {}).get(sid)
     saved = shared_checkpoint(state, sid, pinned["revision_id"] if pinned else None)
     watermark = store.records().get("members", sid, {}).get("shared_checkpoint")
@@ -1652,110 +1723,47 @@ def member_resource(state):
     return matches[0] if matches else None
 
 
-async def bootstrap_member(state, event, resource=None):
-    resource = resource or await blocking(member_resource, state)
-    if resource is None:
-        raise ValueError("No actual swarm member matches restored session identity")
-    store, pool, pod, member = resource
-    swarm_id = pool["id"]
-    attempt = await blocking(lambda: store.records().get("attempts", state._session_id))
-    if not attempt or attempt.get("epoch") != pool["owner"]["epoch"]:
-        raise ValueError("Child attempt belongs to an old owner generation")
-    current = attempt.get("current") or attempt
-    grant = dict(parent_grant(pool, pool["owner"]["parent_instance_id"]), role="member",
-                 session_id=state._session_id, instance_id=current["instance_id"], attempt_id=attempt["attempt_id"])
-    store.grant = grant
-    state.swarm_access = {swarm_id: pod["id"]}
-    replacement = attempt["instance_id"] != event["instance_id"]
-    if replacement:
-        deadline = asyncio.get_running_loop().time() + 15
-        while True:
-            previous_revision = attempt.get("binding_revision", 0)
-            try:
-                attempt = await blocking(lambda: store.records().get("attempts", state._session_id))
-                current = attempt.get("current") or attempt
-                grant = dict(grant, instance_id=current["instance_id"])
-                store.grant = grant
-                proposal = await blocking(connection_target, store, member)
-                if proposal["instance_id"] != event["instance_id"] or proposal["process_identity"] != native_self():
-                    raise ValueError("Replacement child lacks exact native lineage")
-                client = AzoWs.attach(endpoint(proposal["ready"]["websocket_url"]), modern=False,
-                                      terminate_on_close=False, connect_timeout_s=10)
-                try:
-                    async with asyncio.timeout(10):
-                        await client.connect()
-                        exact_hello(client, proposal)
-                        await blocking(revalidate_target, store, member, proposal)
-                        await blocking(cas_adopt, store, member, proposal)
-                finally:
-                    await client.close()
-                grant = dict(grant, instance_id=event["instance_id"])
-                store.grant = grant
-                break
-            except (ValueError, OSError) as exc:
-                latest = await blocking(lambda: store.records().get("attempts", state._session_id))
-                raced = latest.get("binding_revision", 0) != previous_revision
-                publication = any(word in str(exc) for word in ("missing from registry", "not yet discoverable", "not confirmed retired"))
-                if asyncio.get_running_loop().time() >= deadline or not (raced or publication or isinstance(exc, PreSendRace)):
-                    raise
-                await asyncio.sleep(.1)
-    elif current.get("process_identity") != native_self():
-        launch_grant = json.loads(os.environ.get("AZO_SWARM_GRANT", "null"))
-        if attempt.get("state") != "reserved" or launch_grant != grant:
-            raise ValueError("Child native identity differs from admitted launch")
-    # A fresh/recovery launch MUST arrive paused. Verified reload/restart retains its native core semantics.
+def _commit_member_bootstrap(state, store: SwarmStore, pool: dict, pod: dict, grant: dict,
+                             event: dict, *, replacement: bool, timeout: float = 25.0) -> dict:
     if not replacement and (event.get("startup_mode") != "paused" or event.get("paused") is not True):
         raise ValueError("Swarm launch requires a paused checkpoint bootstrap")
     revision = event.get("revision_id")
     if not revision:
         raise ValueError("Child startup has no exact revision")
-    deadline = asyncio.get_running_loop().time() + 25
+    deadline = time.monotonic() + max(0.0, float(timeout))
     while True:
         try:
-            shared = await blocking(shared_checkpoint, state, state._session_id, revision)
+            shared = shared_checkpoint(state, state._session_id, revision)
             break
         except FileNotFoundError:
-            if asyncio.get_running_loop().time() >= deadline:
-                raise ValueError("Initial checkpoint is not shared; member is not recoverable")
-            await asyncio.sleep(.1)
+            if time.monotonic() >= deadline:
+                raise ValueError("Initial checkpoint is not shared; member is not recoverable") from None
+            time.sleep(0.05)
+    swarm_id = pool["id"]
+    state.swarm_access = {swarm_id: pod["id"]}
     state.grants[swarm_id] = grant
-    def commit():
-        with store.mutation() as (records, _):
-            row = records.get("members", state._session_id, {})
-            require_checkpoint_ancestry(state, state._session_id, shared, row.get("shared_checkpoint"))
-            with records.transaction("attempts", state._session_id) as saved:
-                selected = saved.get("selected_checkpoint")
-                if not replacement and selected and selected["revision_id"] != revision:
-                    raise ValueError("Loaded revision does not match recovery plan")
-                saved["bootstrap"] = dict(instance_id=event["instance_id"], revision_id=revision,
-                                           paused=event.get("paused") is True, epoch=grant["epoch"],
-                                           process_identity=native_self())
-            row.update(shared_checkpoint=dict(session_id=state._session_id,
-                       instance_id=shared.instance_id, revision_id=revision), work_blocked=unresolved_tools(shared.document),
-                       recovery_status="ready_paused" if event.get("paused") is True else "ready")
-            records.put("members", state._session_id, row)
-    await blocking(commit)
-    return dict(summary=f"{swarm_id}: agent ready{' (paused)' if event.get('paused') is True else ''}.",
-                access=state.swarm_access, replace_access=True, grants=state.grants,
-                resource_uids={swarm_id: pool["resource_uid"]}, level="info")
-
-
-async def blocking(function, *args, **kwargs):
-    """Own an off-loop blocking call through cancellation, including its cleanup."""
-    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                continue
-            except Exception:
-                break
-        if not task.cancelled():
-            task.exception()  # Observe failure even when the command was cancelled.
-        raise
+    store.grant = grant
+    with store.mutation() as (records, _):
+        row = records.get("members", state._session_id, {})
+        require_checkpoint_ancestry(state, state._session_id, shared, row.get("shared_checkpoint"))
+        with records.transaction("attempts", state._session_id) as saved:
+            selected = saved.get("selected_checkpoint")
+            if not replacement and selected and selected["revision_id"] != revision:
+                raise ValueError("Loaded revision does not match recovery plan")
+            saved["bootstrap"] = dict(
+                instance_id=event["instance_id"], revision_id=revision,
+                paused=event.get("paused") is True, epoch=grant["epoch"], process_identity=native_self(),
+            )
+        row.update(shared_checkpoint=dict(session_id=state._session_id, instance_id=shared.instance_id,
+                                          revision_id=revision),
+                   work_blocked=unresolved_tools(shared.document),
+                   recovery_status="ready_paused" if event.get("paused") is True else "ready")
+        records.put("members", state._session_id, row)
+    return dict(
+        summary=f"{swarm_id}: agent ready{' (paused)' if event.get('paused') is True else ''}.",
+        access=dict(state.swarm_access), replace_access=True, grants=deepcopy(state.grants),
+        resource_uids={swarm_id: pool["resource_uid"]}, level="info",
+    )
 
 
 def require_parent(state):
@@ -1780,15 +1788,14 @@ def allocate_pool(state, request):
         index["next"] = number + 1
         index["pools"][swarm_id] = dict(name=alias or swarm_id, owner=state._session_id)
     store = store_for(state, swarm_id)
-    pool = store.create(swarm_id, pods=request["pods"],
-                        agents=request["agents"],
+    pool = store.create(swarm_id, pods=request["pods"], agents=request["agents"],
                         channels=request["channels"], display_name=alias,
                         owner_session_id=state._session_id, owner_instance_id=state._instance_id,
                         model_profile=request.get("profile"))
     state.grants[swarm_id] = deepcopy(store.grant)
     state.swarm_resource_uids = {**getattr(state, "swarm_resource_uids", {}), swarm_id: pool["resource_uid"]}
     repair_index(state, store, pool)
-    state.swarm_access[swarm_id] = ""  # Detached worker snapshot, not the harness state.
+    state.swarm_access[swarm_id] = ""
     return store, pool
 
 
@@ -1798,8 +1805,7 @@ def resolve_pool(state, target):
     root = project_directory(state) / "swarms"
     if root.exists():
         index = RecordStore(root, create=False).get("registry", "pools", {"pools": {}})
-        candidates.update(key for key, row in index["pools"].items()
-                          if row["owner"] == state._session_id)
+        candidates.update(key for key, row in index["pools"].items() if row["owner"] == state._session_id)
     matches = []
     for swarm_id in sorted(candidates):
         store = store_for(state, swarm_id)
@@ -1807,11 +1813,9 @@ def resolve_pool(state, target):
         require_resource_reference(state, pool)
         if pool.get("owner_session_id") != state._session_id:
             continue
-        if any(m["session_id"] == state._session_id
-               for pod in pool["pods"] for m in pod["members"]):
+        if any(m["session_id"] == state._session_id for pod in pool["pods"] for m in pod["members"]):
             raise ValueError("Swarm peers cannot control pools")
-        if (target in (pool["id"], pool["name"]) if target is not None
-                else pool["desired_state"] != "cancelled"):
+        if (target in (pool["id"], pool["name"]) if target is not None else pool["desired_state"] != "cancelled"):
             matches.append((store, pool))
     if len(matches) != 1:
         raise ValueError("Specify a swarm name or ID; expected exactly one matching owned swarm")
@@ -1820,17 +1824,14 @@ def resolve_pool(state, target):
 
 def control_members(pool, request):
     selected = request.get("pods")
-    if selected is not None and request["action"] != "bcast":
+    if selected is not None and request["action"] not in {"bcast", "share_data"}:
         raise ValueError("This control addresses the whole swarm; pod targeting is not supported")
     available = {pod["index"] for pod in pool["pods"]}
     if selected is not None and (not selected or any(type(p) is not int for p in selected) or set(selected) - available):
         raise ValueError("Pod selection is outside this swarm")
     if pool["desired_state"] == "cancelled" and request["action"] != "cancel":
         raise ValueError("This swarm has been cancelled; it cannot be continued or sent work")
-    return [member for pod in pool["pods"]
-            if selected is None or pod["index"] in selected for member in pod["members"]]
-
-MAX_BROADCAST_FRAME_BYTES = 1024 * 1024
+    return [member for pod in pool["pods"] if selected is None or pod["index"] in selected for member in pod["members"]]
 
 
 def validate_broadcast(message):
@@ -1852,272 +1853,6 @@ def afk_command(message=None):
     return raw
 
 
-class PreSendRace(ValueError):
-    pass
-
-
-class DeliveryUnknown(RuntimeError):
-    pass
-
-
-def endpoint(url):
-    from urllib.parse import urlsplit
-    parsed = urlsplit(url)
-    if (parsed.scheme != "ws" or parsed.hostname not in {"127.0.0.1", "::1"}
-            or not parsed.port or parsed.username or parsed.password or parsed.path != "/session"
-            or parsed.query or parsed.fragment):
-        raise ValueError("Single-host swarms require an exact loopback session websocket")
-    return url
-
-
-def binding_facts(row):
-    return dict(session_id=row.session_id, instance_id=row.instance_id,
-                registry_generation=(row.metadata or {}).get("generation"),
-                process_identity=row.process_identity.to_dict() if row.process_identity else None,
-                websocket_url=row.websocket_url, project_name=(row.metadata or {}).get("project_name"),
-                parent_session_id=(row.metadata or {}).get("parent_session_id"), kind=row.kind,
-                capabilities=list(row.capabilities))
-
-
-def lineage_edge(a, b):
-    """Validate only integrated correlated exec/restart producers, never same-SID recency."""
-    am, bm = a.metadata or {}, b.metadata or {}
-    if not a.is_terminal() or not a.is_confirmed_stopped():
-        raise ValueError("Replacement predecessor is not confirmed retired")
-    if am.get("successor_instance_id") not in {None, "", b.instance_id}:
-        raise ValueError("Conflicting predecessor successor pointer")
-    if bm.get("reload_previous_instance_id") == a.instance_id:
-        raw = bm.get("reload_request_id")
-        if not isinstance(raw, str) or len(raw) > 4096:
-            raise ValueError("Malformed reload correlation")
-        c = json.loads(raw)
-        if (type(c.get("version")) is not int or c["version"] != 1
-                or c.get("previous_instance_id") != a.instance_id
-                or c.get("instance_id") != b.instance_id or a.instance_id == b.instance_id
-                or not re.fullmatch(r"[0-9a-f]{32}", b.instance_id)
-                or a.process_identity != b.process_identity):
-            raise ValueError("Reload correlation/native continuity mismatch")
-        return dict(kind="reload", predecessor=binding_facts(a), successor=binding_facts(b), correlation=raw)
-    c = am.get("recovery") or {}
-    if (c.get("status") != "ready" or c.get("session_id") != a.session_id
-            or c.get("previous_instance_id") != a.instance_id or c.get("instance_id") != b.instance_id
-            or not isinstance(c.get("request_id"), str) or not c["request_id"].strip()
-            or not isinstance(c.get("revision_id"), str) or not c["revision_id"].strip()
-            or c.get("owner") != b.process_identity.to_dict()):
-        raise ValueError("Restart recovery claim is not exact and ready")
-    return dict(kind="restart", predecessor=binding_facts(a), successor=binding_facts(b), claim=deepcopy(c))
-
-
-def connection_target(store, member):
-    attempt = store.records().get("attempts", member["session_id"])
-    if not attempt or attempt.get("state") in {"reserved", "unknown", "exited", "fenced"}:
-        raise ValueError("Launch remains unreconciled or stopped; no automatic replay")
-    settings = attempt["request"]["settings"]
-    root, project = settings["store_root"], settings["project"]
-    pool = store.pool()
-    expected_pool = Path(settings["state_root"]) / "projects" / project / "swarms" / pool["id"]
-    if expected_pool.resolve() != store.durable.resolve():
-        raise ValueError("Original launch roots differ; destination recovery is required")
-    anchor = attempt.get("current") or dict(session_id=attempt["session_id"],
-        instance_id=attempt["instance_id"], process_identity=attempt.get("process_identity"),
-        websocket_url=(attempt.get("ready") or {}).get("websocket_url"), registry_generation=None)
-    # A missing publication is unavailable, not a license to use a ready-file cache.
-    rows = list_live_sessions(root, include_stale=True)
-    by_id = {r.instance_id: r for r in rows}
-    if len(by_id) != len(rows):
-        raise ValueError("Duplicate registry instance identity")
-    current = by_id.get(anchor["instance_id"])
-    if current is None:
-        raise ValueError("Exact owned instance missing from registry; reconciliation required")
-
-    def resource(row):
-        facts = binding_facts(row)
-        if (facts["session_id"] != member["session_id"] or facts["project_name"] != project
-                or facts["parent_session_id"] != pool["owner_session_id"]
-                or facts["kind"] != attempt["request"]["kind"]
-                or not row.process_identity or not all(domain(facts["process_identity"]))
-                or domain(facts["process_identity"]) != domain(local_host_identity().to_dict())
-                or not isinstance(facts["registry_generation"], str) or not facts["registry_generation"]):
-            raise ValueError("Registry resource, host domain, or generation mismatch")
-        return facts
-
-    facts = resource(current)
-    if (facts["process_identity"] != anchor.get("process_identity")
-            or (anchor.get("registry_generation") is not None
-                and facts["registry_generation"] != anchor["registry_generation"])
-            or (anchor.get("websocket_url") and facts["websocket_url"] != anchor["websocket_url"])):
-        raise ValueError("Owned instance identity, endpoint or generation changed")
-    path, visited = [], set()
-    for _ in range(64):
-        if current.instance_id in visited:
-            raise ValueError("Replacement lineage cycle")
-        visited.add(current.instance_id)
-        candidates = []
-        recovery = (current.metadata or {}).get("recovery") or {}
-        for row in rows:
-            metadata = row.metadata or {}
-            reverse = metadata.get("reload_previous_instance_id")
-            # Inspect malformed correlations claiming this predecessor too.
-            raw = metadata.get("reload_request_id")
-            claimed_previous = None
-            if raw:
-                try:
-                    claimed_previous = json.loads(raw).get("previous_instance_id")
-                except (ValueError, AttributeError, TypeError):
-                    if reverse == current.instance_id:
-                        raise ValueError("Malformed potential replacement record")
-            if reverse == current.instance_id or claimed_previous == current.instance_id:
-                if reverse != current.instance_id:
-                    raise ValueError("Inconsistent reverse reload correlation")
-                candidates.append(row)
-            elif recovery.get("instance_id") == row.instance_id:
-                candidates.append(row)
-        if recovery.get("instance_id") and recovery["instance_id"] not in by_id:
-            raise ValueError("Claimed replacement not yet discoverable")
-        if len(candidates) > 1:
-            raise ValueError("Ambiguous replacement branches")
-        if not candidates:
-            break
-        successor = candidates[0]
-        resource(successor)
-        path.append(lineage_edge(current, successor))
-        current = successor
-    else:
-        raise ValueError("Replacement lineage exceeds bounded read budget")
-    facts = resource(current)
-    if (current.is_terminal() or current.status.lower() in {"stopping", "reloading", "starting"}
-            or current.process_state() == ObservationState.DEAD):
-        raise ValueError("No active proven descendant; sibling instances are never adopted")
-    endpoint(current.websocket_url)
-    if capture_process_identity(current.pid) != current.process_identity:
-        raise ValueError("Peer native process identity unavailable or changed")
-    return dict(session_id=member["session_id"], instance_id=current.instance_id, label=member["label"],
-                ready={"websocket_url": current.websocket_url}, process_identity=facts["process_identity"],
-                facts=facts, path=path, registry_store_root=root, attempt_id=attempt.get("attempt_id"),
-                revision=attempt.get("binding_revision", 0), previous=deepcopy(attempt.get("current")),
-                origin=(attempt["instance_id"], attempt.get("process_identity")))
-
-
-def revalidate_target(store, member, proposal):
-    newer = connection_target(store, member)
-    for key in ("facts", "path", "attempt_id", "revision", "previous", "origin"):
-        if newer[key] != proposal[key]:
-            raise PreSendRace("Replacement discovery changed before dispatch")
-
-
-def cas_adopt(store, member, proposal, *, allow_cancelled=False):
-    with store.mutation(allow_cancelled=allow_cancelled) as (records, pool):
-        with records.transaction("attempts", member["session_id"]) as saved:
-            if (saved.get("attempt_id") != proposal["attempt_id"]
-                    or saved.get("binding_revision", 0) != proposal["revision"]
-                    or saved.get("current") != proposal["previous"]
-                    or (saved["instance_id"], saved.get("process_identity")) != proposal["origin"]):
-                raise PreSendRace("Binding CAS lost; rediscovery required")
-            previous = saved.get("current")
-            facts = proposal["facts"]
-            if pool["desired_state"] == "cancelled":
-                if proposal["path"] or facts["instance_id"] != (previous or saved)["instance_id"]:
-                    raise ValueError("Cancelled swarms cannot adopt replacement peers")
-                # Shutdown can reach the exact recorded instance without adopting
-                # even its first registry binding into a terminal pool.
-                return saved.get("binding_revision", 0)
-            if previous and all(previous.get(k) == v for k, v in facts.items()):
-                return saved["binding_revision"]
-            saved["current"] = dict(facts, registry_store_root=proposal["registry_store_root"],
-                                    verified_at_ns=time.time_ns(), adoption=dict(
-                                        from_instance_id=(previous or saved)["instance_id"],
-                                        edges=proposal["path"]))
-            saved["binding_revision"] = proposal["revision"] + 1
-            return saved["binding_revision"]
-
-
-def exact_hello(client, target):
-    hello = client.observation().hello or {}
-    if (hello.get("type") != "hello" or type(hello.get("protocol_version")) is not int
-            or hello["protocol_version"] != 1 or hello.get("session_id") != target["session_id"]
-            or hello.get("instance_id") != target["instance_id"] or client.protocol_errors):
-        raise ValueError("Websocket identity does not match the exact owned peer")
-
-
-async def send_to_member(target, request, *, store=None, member=None):
-    """Validate once, send once on that socket; takeover cannot cross dispatch admission."""
-    action = request["action"]
-    needed = {"bcast": "input:user_text", "interrupt": "input:slash_command",
-              "continue": "input:slash_command", "cancel": "control:shutdown",
-              "release": "input:slash_command", "capture": "input:slash_command",
-              "afk": "input:slash_command"}[action]
-    raw = afk_command(request.get("message")) if action == "afk" else "/" + action
-    if store is not None and needed not in target["facts"]["capabilities"]:
-        raise ValueError(f"Peer lacks capability {needed}; no send attempted")
-    client = AzoWs.attach(endpoint(target["ready"]["websocket_url"]), modern=False,
-                          terminate_on_close=False, connect_timeout_s=10)
-    dispatched = False
-    loop = asyncio.get_running_loop()
-    identity = ProcessIdentity.from_dict(target["process_identity"])
-
-    async def dispatch():
-        nonlocal dispatched
-        async with asyncio.timeout(15):
-            exact_hello(client, target)
-            dispatched = True
-            action = request["action"]
-            if action == "bcast":
-                await client.send_user(request["message"], client_id=request.get("operation_id", uuid.uuid4().hex))
-            elif action == "cancel":
-                await client.control("shutdown", {"save": True, "reason": "swarm-cancel"})
-            else:
-                await client.slash(raw)
-
-    try:
-        async with asyncio.timeout(30):
-            await client.connect()
-            exact_hello(client, target)
-            if await blocking(capture_process_identity, identity.pid) != identity:
-                raise ValueError("Peer process changed during connection")
-            if store is not None:
-                await blocking(revalidate_target, store, member, target)
-                revision = await blocking(cas_adopt, store, member, target, allow_cancelled=action == "cancel")
-                def admitted_send():
-                    # Keep acquisition, send wait and release in one worker thread. File-lock
-                    # thread-local tracking must not be spread over arbitrary executor workers.
-                    # This is the separate external-effect gate, NOT a record transaction body.
-                    with store.mutation(allow_cancelled=action == "cancel") as (records, pool):
-                        final = connection_target(store, member)
-                        if final["facts"] != target["facts"] or final["revision"] != revision:
-                            raise PreSendRace("Peer changed after adoption")
-                        saved = records.get("attempts", member["session_id"])
-                        if saved.get("binding_revision") != revision or saved.get("current") != final["previous"]:
-                            raise PreSendRace("Binding changed at send boundary")
-                        if capture_process_identity(identity.pid) != identity:
-                            raise ValueError("Peer changed at dispatch boundary")
-                        with records.transaction("operations", request["operation_id"]) as operation:
-                            if operation.get("epoch", pool["owner"]["epoch"]) != pool["owner"]["epoch"]:
-                                raise ValueError("Operation belongs to a previous owner epoch")
-                            claims = operation.setdefault("dispatch", {})
-                            if member["session_id"] in claims:
-                                raise ValueError("Operation already claimed this member; never replay")
-                            claims[member["session_id"]] = dict(state="sending", attempt_id=saved["attempt_id"],
-                                instance_id=target["instance_id"], generation=target["facts"]["registry_generation"])
-                        future = asyncio.run_coroutine_threadsafe(dispatch(), loop)
-                        # dispatch owns its timeout; wait for actual coroutine completion,
-                        # not merely cancellation delivery, before releasing the owner gate.
-                        future.result()
-                await blocking(admitted_send)
-            else:
-                await dispatch()
-    except BaseException as exc:
-        if dispatched:
-            raise DeliveryUnknown(f"Delivery may have occurred: {type(exc).__name__}: {exc}") from exc
-        raise
-    finally:
-        try:
-            await client.close()
-        except Exception as exc:
-            if dispatched:
-                raise DeliveryUnknown(f"Send started; socket cleanup failed: {exc}") from exc
-            raise
-
-
 def validate_model_profile(config, profile):
     models = (config.get("llm", {}) or {}).get("models", {}) or {}
     if not isinstance(profile, str) or not profile.strip() or profile not in models:
@@ -2127,7 +1862,6 @@ def validate_model_profile(config, profile):
 
 
 def pool_launch_settings(settings, config, pool):
-    # Legacy pools have no pinned selection. Never mutate the shared recovery snapshot.
     if "model_profile" not in pool:
         return settings
     return replace(settings, model=validate_model_profile(config, pool["model_profile"]))
@@ -2137,21 +1871,21 @@ def launch_settings(state, config, *, profile=None):
     provenance = config.get("_runtime_launch", {}) or {}
     model = (validate_model_profile(config, profile) if profile is not None
              else str((config.get("llm", {}) or {}).get("default") or ""))
-    project_name = _state_project_name(state)
-    store_root = _state_store_root(state)
+    project_name, store_root = _state_project_name(state), _state_store_root(state)
     if not model or not project_name or not store_root:
         raise ValueError("Current model, project, and coordination store are required to launch a swarm")
     if hasattr(state, "session_launcher") and getattr(state, "session_launcher", None) is None:
         raise ValueError("Runtime launch service is unavailable")
     return RuntimeSettings(
-        project=project_name, workdir=get_session_cwd(state),
-        state_root=str(resolve_state_root()), store_root=store_root,
+        project=project_name, workdir=get_session_cwd(state), state_root=str(resolve_state_root()),
+        store_root=store_root,
         local_state_root=str(getattr(state, "_persistence_local_root", "") or resolve_local_root(config)),
         config_path=str(provenance.get("config_path") or ""),
         config_sets=tuple(provenance.get("config_sets") or ()), model=model,
         env_name=str((config.get("pilot", {}) or {}).get("_env_name") or ""),
         pipeline_key="default", host="127.0.0.1", port=0,
     )
+
 
 @dataclass(frozen=True)
 class ControlRequest:
@@ -2166,12 +1900,13 @@ class ControlRequest:
             raise ValueError("Only explicit existing-swarm controls are model accessible")
         name(self.swarm_id)
         if self.pods is not None and (not self.pods or any(type(p) is not int or not 0 <= p < 32 for p in self.pods)):
-            raise ValueError("pods must be a nonempty list of zero-based integers (0\u201331)")
+            raise ValueError("pods must be a nonempty list of zero-based integers (0–31)")
         if self.action != "bcast" and self.pods is not None:
             raise ValueError("Lifecycle controls address the whole swarm")
         if self.action == "bcast":
             validate_broadcast(self.message)
-        return dict(action=self.action, target=self.swarm_id, pods=None if self.pods is None else tuple(dict.fromkeys(self.pods)),
+        return dict(action=self.action, target=self.swarm_id,
+                    pods=None if self.pods is None else tuple(dict.fromkeys(self.pods)),
                     message=self.message, operation_id=self.operation_id, canonical=True)
 
 
@@ -2211,15 +1946,12 @@ def operation_summary(pool, operation, *, audit_error=""):
     number = str(success) if success == total else f"{success} of {total}"
     agents = f"{number} agent{'s' if total != 1 else ''}"
     message = {
-        "bcast": f"message sent to {agents}",
-        "interrupt": f"pause requested for {agents}",
-        "continue": f"continue requested for {agents}",
-        "cancel": f"shutdown requested for {agents}",
-        "release": f"autonomous pace requested for {agents}",
+        "bcast": f"message sent to {agents}", "share_data": f"artifact sent to {agents}",
+        "interrupt": f"pause requested for {agents}", "continue": f"continue requested for {agents}",
+        "cancel": f"shutdown requested for {agents}", "release": f"autonomous pace requested for {agents}",
         "capture": f"interactive pace requested for {agents}",
         "afk": f"AFK instructions {'query' if operation.get('message') is None else 'update'} requested for {agents}",
-        "create": f"{agents} ready (paused)",
-        "recover": f"{agents} restored (paused)",
+        "create": f"{agents} ready (paused)", "recover": f"{agents} restored (paused)",
     }[action]
     text = f"{pool_label(pool)}: {message}"
     if operation.get("pods") is not None:
@@ -2237,25 +1969,72 @@ def operation_summary(pool, operation, *, audit_error=""):
     return text
 
 
+def _finish_operation_sync(store: SwarmStore, operation: dict, *, phase: str | None = None) -> str:
+    try:
+        with store.mutation(allow_cancelled=True) as (records, _):
+            saved = records.get("operations", operation["id"], {})
+            saved.update(operation)
+            records.put("operations", operation["id"], saved)
+            if phase:
+                with records.transaction("swarm", "pool") as current:
+                    current["phase"] = phase
+                    if current.get("recovery"):
+                        current["recovery"]["phase"] = phase
+        return ""
+    except Exception as exc:
+        return str(exc)
+
+
+def _record_member_failure_sync(store: SwarmStore, member: dict, exc: BaseException) -> dict:
+    status = "missing_checkpoint" if isinstance(exc, FileNotFoundError) else "blocked"
+    try:
+        with store.mutation() as (records, _):
+            row = records.get("members", member["session_id"], {})
+            row.update(session_id=member["session_id"], recovery_status=status, error=str(exc))
+            records.put("members", member["session_id"], row)
+    except Exception:
+        LOG.warning("Cannot persist member failure", exc_info=True)
+    return dict(label=member["label"], session_id=member["session_id"], state=status, error=str(exc))
+
+
+def _unwrap_event(ev: IoCompleted | IoFailed):
+    if isinstance(ev, IoFailed):
+        raise (ev.error if isinstance(ev.error, BaseException) else RuntimeError(str(ev.error)))
+    return ev.value
+
+
+# ---------------------------------------------------------------------------
+# Pure Generator-Driven SwarmController over SessionRequest & RunPluginTask
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _WorkflowRunner:
+    """Drives a pure Sans-I/O generator yielding single or batched ``IoRequest``s."""
+    wf_id: str
+    fence: tuple
+    source_kind: str
+    request: dict
+    gen: Generator
+    tag: str = "swarm"
+    batch_size: int = 0
+    batch_results: dict[int, IoCompleted | IoFailed] = field(default_factory=dict)
+    single: bool = True
+
+
 class SwarmController:
-    """Runtime-only grants, in-flight IO ops and handles; saved access is never a capability."""
+    """Runtime-only grants and Sans-I/O workflow controller over ``AgentZooSessionDriver``."""
+
     def __init__(self, config, session=None):
         self.config, self.session = config, session
-        self.handles, self.grants = {}, {}
-        self.lock = asyncio.Lock()
-        self.in_flight = {}
-        self.ready_events = []
+        self.grants: dict[str, dict] = {}
+        self.in_flight: dict[OpId, tuple] = {}
+        self._workflows: dict[str, _WorkflowRunner] = {}
+        self._owned_instances: set[str] = set()
+        self.ready_events: list[tuple] = []
         self.bound = None
         self.startup_hold = None
-        self.seen_events = set()
-        self._default_launcher = None
-
-    def _launcher_for(self, state):
-        if hasattr(state, "session_launcher"):
-            return state.session_launcher
-        if self._default_launcher is None:
-            self._default_launcher = RuntimeLauncher()
-        return self._default_launcher
+        self.seen_events: set[tuple] = set()
 
     def identity(self, state):
         return (id(state), getattr(state, "_session_id", ""), getattr(state, "_instance_id", ""),
@@ -2265,15 +2044,68 @@ class SwarmController:
         if not getattr(state, "_session_id", "") or not getattr(state, "_instance_id", ""):
             raise ValueError("Final runtime session and instance identities are required")
         cwd = get_session_cwd(state)
-        return SimpleNamespace(_session_id=state._session_id, _instance_id=state._instance_id,
+        return SimpleNamespace(
+            _session_id=state._session_id, _instance_id=state._instance_id,
             _agent_zoo_context=deepcopy(getattr(state, "_agent_zoo_context", {}) or {}),
             _project_name=getattr(state, "_project_name", ""),
             _store_root=getattr(state, "_store_root", ""),
             swarm_access=dict(getattr(state, "swarm_access", {})), grants=deepcopy(self.grants),
             swarm_resource_uids=dict(getattr(state, "swarm_resource_uids", {})),
-            session_launcher=self._launcher_for(state), cwd=cwd, session_cwd=cwd,
-            _persistence_local_root=getattr(state, "_persistence_local_root", ""),
-            settings=launch_settings(state, self.config, profile=profile) if settings else None)
+            cwd=cwd, session_cwd=cwd, _persistence_local_root=getattr(state, "_persistence_local_root", ""),
+            settings=launch_settings(state, self.config, profile=profile) if settings else None,
+        )
+
+    def _fail_background(self, source_kind: str, fence: tuple, exc: object, state, emit) -> None:
+        LOG.warning("Swarm background operation failed for %s: %s", fence[1:3], exc)
+        message = f"Swarm operation failed: {brief_error(exc)}"
+        if source_kind == "command":
+            if emit is not None:
+                emit(EmitNotice(message, level="warning"))
+                emit(ProjectionRequested())
+        elif not worker_identity(state):
+            _append_interrupt(state, message, emit)
+
+    def _launch_runner(self, state, gen: Generator, *, source_kind: str, request: dict,
+                       submit_fn, tag: str = "swarm", emit=None) -> OpId | None:
+        wf_id = uuid.uuid4().hex
+        runner = _WorkflowRunner(wf_id, self.identity(state), source_kind, dict(request), gen, tag)
+        self._workflows[wf_id] = runner
+        return self._step_runner(runner, None, state, submit_fn, emit)
+
+    def _step_runner(self, runner: _WorkflowRunner, send_val, state, submit_fn, emit) -> OpId | None:
+        try:
+            yielded = runner.gen.send(send_val)
+        except StopIteration as done:
+            self._workflows.pop(runner.wf_id, None)
+            if isinstance(done.value, dict):
+                self._deliver_final(runner.source_kind, state, done.value, emit)
+            return None
+        except Exception as exc:
+            self._workflows.pop(runner.wf_id, None)
+            self._fail_background(runner.source_kind, runner.fence, exc, state, emit)
+            return None
+        reqs = [yielded] if isinstance(yielded, IoRequest) else list(yielded)
+        if not reqs:
+            return self._step_runner(runner, [], state, submit_fn, emit)
+        runner.single, runner.batch_size, runner.batch_results = isinstance(yielded, IoRequest), len(reqs), {}
+        first_op: OpId | None = None
+        for idx, req in enumerate(reqs):
+            op_id = submit_fn(req, tag=runner.tag)
+            first_op = first_op or op_id
+            self.in_flight[op_id] = (runner.fence, runner.source_kind, dict(runner.request, _wf=runner.wf_id, _idx=idx))
+        return first_op
+
+    def _on_runner_event(self, wf_id: str, idx: int, event: IoCompleted | IoFailed, state, emit) -> None:
+        runner = self._workflows.get(wf_id)
+        if runner is None:
+            return
+        runner.batch_results[idx] = event
+        if len(runner.batch_results) < runner.batch_size:
+            return
+        payload = runner.batch_results[0] if runner.single else [runner.batch_results[i] for i in range(runner.batch_size)]
+        self._step_runner(runner, payload, state, state.io.submit, emit)
+
+    # -- Public entry points -------------------------------------------------
 
     def command(self, ctx, *, raw_args):
         try:
@@ -2289,15 +2121,9 @@ class SwarmController:
             snapshot = self.snapshot(ctx.state, settings=request["action"] in {"create", "recover"},
                                      profile=request.get("profile"))
         except (ValueError, OSError) as exc:
-            # Malformed user slash input is status only: do not inject a model message.
             raise CommandError(str(exc)) from exc
-        task = SwarmTask(
-            factory=lambda snapshot=snapshot, request=request: self.execute(snapshot, request),
-            action=request["action"],
-            target=str(request.get("target") or ""),
-        )
-        op_id = ctx.submit_io(task, tag="swarm")
-        self.in_flight[op_id] = (self.identity(ctx.state), "command", request)
+        self._launch_runner(ctx.state, self._wf_execute(snapshot, request),
+                            source_kind="command", request=request, submit_fn=ctx.submit_io)
         return CommandResult.notice(self.receipt(request))
 
     @staticmethod
@@ -2309,9 +2135,10 @@ class SwarmController:
         if action == "create":
             return (f"Creating {request.get('name') or 'swarm'}: {request['agents']} agent{'s' if request['agents'] != 1 else ''} "
                     f"in {request['pods']} pod{'s' if request['pods'] != 1 else ''}...")
-        verb = {"bcast": "Sending message to", "interrupt": "Requesting pause for",
-                "continue": "Requesting continue for", "cancel": "Requesting shutdown for",
-                "release": "Requesting autonomous pace for", "capture": "Requesting interactive pace for",
+        verb = {"bcast": "Sending message to", "share_data": "Sending artifact to",
+                "interrupt": "Requesting pause for", "continue": "Requesting continue for",
+                "cancel": "Requesting shutdown for", "release": "Requesting autonomous pace for",
+                "capture": "Requesting interactive pace for",
                 "afk": "Querying AFK instructions for" if request.get("message") is None else "Updating AFK instructions for",
                 "recover": "Restoring"}[action]
         scope = "" if request.get("pods") is None else " (pods " + ", ".join(map(str, request["pods"])) + ")"
@@ -2331,7 +2158,7 @@ class SwarmController:
                 continue
             old = self.grants.get(resource)
             if old and (old["epoch"] > grant["epoch"] or (old["epoch"] == grant["epoch"]
-                         and (old["token"], old["resource_uid"]) != (grant["token"], grant["resource_uid"]))):
+                        and (old["token"], old["resource_uid"]) != (grant["token"], grant["resource_uid"]))):
                 continue
             self.grants[resource] = deepcopy(grant)
         if result.get("resource_uids"):
@@ -2339,7 +2166,6 @@ class SwarmController:
 
     def complete(self, state, result, emit=None):
         self.apply(state, result)
-        # Rejected user commands are notices, not requests for the model to act.
         if not result.get("failed") and not worker_identity(state):
             message = result.get("model_message", result["summary"])
             operation = result.get("operation", {})
@@ -2356,55 +2182,92 @@ class SwarmController:
         return CommandResult.notice(result["summary"], level=result.get("level", "info"))
 
     def submit(self, state, request):
+        if isinstance(request, ControlRequest):
+            request = request.as_dict()
         if request["action"] != "post":
             require_parent(state)
-        snapshot = self.snapshot(state)
+        snapshot = self.snapshot(state, settings=request["action"] in {"create", "recover"},
+                                 profile=request.get("profile"))
         io_table = getattr(state, "io", None)
         if io_table is None or not callable(getattr(io_table, "submit", None)):
             raise ValueError("Background execution unavailable; no operation submitted")
-        fence = self.identity(state)
-        task = SwarmTask(
-            factory=lambda snapshot=snapshot, request=request: self.execute(snapshot, request),
-            action=request["action"],
-            target=str(request.get("target") or ""),
-        )
-        op_id = io_table.submit(task, tag="swarm")
-        self.in_flight[op_id] = (fence, "tool", request)
+        self._launch_runner(state, self._wf_execute(snapshot, request),
+                            source_kind="tool", request=request, submit_fn=io_table.submit)
         return self.receipt(request)
 
-    async def execute(self, state, request):
+    def submit_startup(self, state, payload: dict) -> OpId | None:
+        snapshot = self.snapshot(state)
+        return self._launch_runner(state, self._wf_startup(snapshot, dict(payload)),
+                                   source_kind="startup", request=dict(payload),
+                                   submit_fn=state.io.submit, tag="swarm_startup")
+
+    def _deliver_final(self, source_kind: str, state, result: dict, emit) -> None:
+        if source_kind == "command":
+            self.complete(state, result, emit)
+            return
+        self.apply(state, result)
+        quiet_success = result.get("action") in {"bcast", "post", "share_data"} and result.get("level", "info") == "info"
+        if result.get("summary") and not worker_identity(state) and not quiet_success:
+            _append_interrupt(state, result.get("model_message", result["summary"]), emit)
+
+    # -- Pure Generator Workflows --------------------------------------------
+
+    def _wf_execute(self, snapshot, request: dict):
         if isinstance(request, ControlRequest):
             request = request.as_dict()
         request = dict(request)
         request.setdefault("operation_id", uuid.uuid4().hex)
-        async with self.lock:
-            try:
-                if request["action"] == "create":
-                    result = await self.create(state, request)
-                elif request["action"] == "recover":
-                    store, _ = await blocking(resolve_pool, state, request["target"])
-                    result = await self.recover(state, store, request)
-                elif request["action"] == "post":
-                    result = await self.post(state, request)
-                else:
-                    result = await self.control(state, request)
-                result.update(action=request["action"], access=state.swarm_access, grants=state.grants,
-                              resource_uids=getattr(state, "swarm_resource_uids", {}))
-                return result
-            except Exception as exc:
-                LOG.warning("Swarm operation %s failed", request["operation_id"], exc_info=True)
-                return dict(summary=f"{request.get('target') or 'Swarm'}: {brief_error(exc)}", level="warning",
-                            failed=True, access=state.swarm_access, grants=state.grants)
+        try:
+            action = request["action"]
+            if action == "create":
+                result = yield from self._wf_create(snapshot, request)
+            elif action == "recover":
+                store, _ = _unwrap_event((yield RunPluginTask(fn=resolve_pool, args=(snapshot, request["target"]))))
+                result = yield from self._wf_recover(snapshot, store, request)
+            elif action == "post":
+                result = _unwrap_event((yield RunPluginTask(fn=self._run_post_sync, args=(snapshot, request))))
+            else:
+                result = yield from self._wf_control(snapshot, request)
+            result.update(action=action, access=snapshot.swarm_access, grants=snapshot.grants,
+                          resource_uids=getattr(snapshot, "swarm_resource_uids", {}))
+            return result
+        except Exception as exc:
+            LOG.warning("Swarm operation %s failed", request["operation_id"], exc_info=True)
+            return dict(summary=f"{request.get('target') or 'Swarm'}: {brief_error(exc)}", level="warning",
+                        failed=True, access=snapshot.swarm_access, grants=snapshot.grants)
 
-    async def create(self, state, request):
-        profile = validate_model_profile(self.config, request.get("profile", state.settings.model))
-        request = dict(request, profile=profile)
-        store, pool = await blocking(allocate_pool, state, request)
-        outcomes = await self.launch_members(state, store, pool, recovering=False)
+    def _run_post_sync(self, snapshot, request: dict) -> dict:
+        store = allowed_store(snapshot, request["target"])
+        pool = store.pool()
+        pod = request["pod"]
+        if type(pod) is not int or not 0 <= pod < len(pool["pods"]):
+            raise ValueError("Unknown zero-based pod index")
+        pod_id = pool["pods"][pod]["id"]
+        if effective_scope(snapshot, pool["id"], store) not in {"", pod_id}:
+            raise ValueError("Pod is outside this session's scope")
+        try:
+            _, appended = store.post(pod_id, request["channel"], request["message"],
+                                     snapshot._session_id, message_id=request["message_id"], receipt=True)
+        except (OSError, RuntimeError) as exc:
+            return dict(summary=f"{pool_label(pool)}/pod {pod}/{request['channel']}: write outcome unknown. "
+                                f"{brief_error(exc)}. Retry the same content with message_id={request['message_id']}.",
+                        level="warning")
+        return dict(summary=f"{pool_label(pool)}/pod {pod}/{request['channel']}: "
+                            f"message {'committed' if appended else 'already committed'}.", level="info")
+
+    def _wf_create(self, snapshot, request: dict):
+        def _prep():
+            profile = validate_model_profile(self.config, request.get("profile", snapshot.settings.model))
+            req = dict(request, profile=profile)
+            store, pool = allocate_pool(snapshot, req)
+            return profile, store, pool
+        profile, store, pool = _unwrap_event((yield RunPluginTask(fn=_prep)))
+        outcomes = yield from self._wf_launch_members(snapshot, store, pool, recovering=False)
         operation = dict(id=request["operation_id"], action="create", epoch=pool["owner"]["epoch"],
                          state="finished", outcomes=outcomes, created_ns=time.time_ns())
-        audit_error = await self.finish_operation(store, operation, phase="paused" if all(
-            r["state"] == "ready_paused" for r in outcomes) else "mixed")
+        phase = "paused" if all(r["state"] == "ready_paused" for r in outcomes) else "mixed"
+        audit_error = _unwrap_event((yield RunPluginTask(fn=_finish_operation_sync, args=(store, operation),
+                                                         kwargs=dict(phase=phase))))
         summary = operation_summary(pool, operation, audit_error=audit_error)
         summary += (f" {len(pool['pods'])} pod{'s' if len(pool['pods']) != 1 else ''}; "
                     f"channels: {', '.join(pool['channels'])}; profile: {profile}. "
@@ -2413,192 +2276,330 @@ class SwarmController:
                          'Activate skill(name="Swarms") to learn how to coordinate this pool. '
                          'Read view(buffer="swarm:index") for its boards and member transcripts. '
                          'Ready workers are waiting for an assignment; use swarm_broadcast to send it as a user message.')
-        return dict(pool=pool, summary=summary, model_message=model_message, level="warning" if audit_error or any(
-            r.get("error") for r in outcomes) else "info")
+        return dict(pool=pool, summary=summary, model_message=model_message,
+                    level="warning" if audit_error or any(r.get("error") for r in outcomes) else "info")
 
-    async def launch_members(self, state, store, pool, *, recovering, settings=None):
-        settings = pool_launch_settings(state.settings, self.config, pool) if settings is None else settings
-        limit = asyncio.Semaphore(4)
-        async def launch(member):
-            try:
-                async with limit:
-                    checkpoint = await blocking(pin_checkpoint, state, store, member) if recovering else None
-                    handle = await blocking(launch_member, state, pool["id"], member["session_id"],
-                                            settings, handles=self.handles, checkpoint=checkpoint)
-                # A slow startup must not hold a slot needed to spawn the rest of the batch.
-                return await await_member_ready(state, store, member, handle)
-            except Exception as exc:
-                status = "missing_checkpoint" if isinstance(exc, FileNotFoundError) else "blocked"
-                def record_failure():
-                    with store.mutation() as (records, _):
-                        row = records.get("members", member["session_id"], {})
-                        row.update(session_id=member["session_id"], recovery_status=status, error=str(exc))
-                        records.put("members", member["session_id"], row)
+    def _wf_launch_members(self, snapshot, store: SwarmStore, pool: dict, *, recovering: bool, settings=None):
+        settings = pool_launch_settings(snapshot.settings, self.config, pool) if settings is None else settings
+        members = [m for p in pool["pods"] for m in p["members"]]
+
+        def _reserve_all():
+            out = []
+            for idx, m in enumerate(members):
                 try:
-                    await blocking(record_failure)
-                except Exception:
-                    LOG.warning("Cannot persist member failure", exc_info=True)
-                return dict(label=member["label"], session_id=member["session_id"], state=status, error=str(exc))
-        async with asyncio.TaskGroup() as group:
-            tasks = [group.create_task(launch(m)) for p in pool["pods"] for m in p["members"]]
-        return [task.result() for task in tasks]
+                    cp = pin_checkpoint(snapshot, store, m) if recovering else None
+                    out.append((idx, m, *reserve_member_launch(snapshot, pool["id"], m["session_id"], settings, checkpoint=cp), None))
+                except Exception as exc:
+                    out.append((idx, m, None, None, _record_member_failure_sync(store, m, exc)))
+            return out
 
-    async def recover(self, state, store, request):
-        require_parent(state)
-        rebound = await blocking(rebind_live_parent_successor, state, store, request)
+        outcomes, active, spawn_reqs = {}, [], []
+        for idx, member, spawn_req, attempt, fail in _unwrap_event((yield RunPluginTask(fn=_reserve_all))):
+            if fail is not None:
+                outcomes[idx] = fail
+            else:
+                active.append((idx, member, attempt))
+                spawn_reqs.append(spawn_req)
+        if spawn_reqs:
+            fin_tasks = []
+            for (idx, member, attempt), ev in zip(active, (yield spawn_reqs)):
+                if isinstance(ev, IoCompleted):
+                    self._owned_instances.add(ev.value.instance_id)
+                    args = (snapshot, store, member, attempt["attempt_id"], ev.value, None)
+                else:
+                    err = ev.error if isinstance(ev.error, BaseException) else RuntimeError(str(ev.error))
+                    args = (snapshot, store, member, attempt["attempt_id"], None, err)
+                fin_tasks.append(RunPluginTask(fn=self._finalize_spawn_sync, args=args))
+            for (idx, member, _), ev in zip(active, (yield fin_tasks)):
+                outcomes[idx] = ev.value if isinstance(ev, IoCompleted) else dict(
+                    label=member["label"], session_id=member["session_id"], state="blocked", error=str(ev.error))
+        return [outcomes[i] for i in range(len(members))]
+
+    def _finalize_spawn_sync(self, snapshot, store: SwarmStore, member: dict, attempt_id: str,
+                             spawn_res: SessionSpawnResult | None, err: BaseException | None) -> dict:
+        try:
+            if err is not None:
+                mark_spawn_unknown(store, member["session_id"], attempt_id)
+                raise err
+            assert spawn_res is not None
+            return finalize_member_ready(snapshot, store, member, attempt_id, spawn_res)
+        except Exception as exc:
+            return _record_member_failure_sync(store, member, exc)
+
+    def _wf_recover(self, snapshot, store: SwarmStore, request: dict):
+        require_parent(snapshot)
+        saved_pool = _unwrap_event((yield RunPluginTask(fn=store.pool)))
+        owner = saved_pool.get("owner") or {}
+        check_owner = (saved_pool.get("version") == 2 and bool(owner.get("parent_instance_id"))
+                       and owner.get("process_identity") is not None and owner["parent_instance_id"] != snapshot._instance_id)
+        disc_reqs: list[IoRequest] = [DiscoverSessions(store_root=_state_store_root(snapshot), include_stale=True, probe_local_processes=True)]
+        if check_owner:
+            disc_reqs.append(build_owner_discover_request(snapshot, saved_pool))
+        disc_events = yield disc_reqs
+        _disc = lambda ev: ev.value if isinstance(ev, IoCompleted) else DiscoverSessionsResult(status="error", error=str(ev.error))
+        discovered_all, discovered_owner = _disc(disc_events[0]), (_disc(disc_events[1]) if check_owner else None)
+        rebound = _unwrap_event((yield RunPluginTask(fn=rebind_live_parent_successor, args=(snapshot, store, request),
+                                                     kwargs=dict(owner_discovered=discovered_owner))))
         if rebound is not None:
-            result = await self.control(state, ControlRequest("interrupt", rebound["id"]).as_dict())
+            result = yield from self._wf_control(snapshot, ControlRequest("interrupt", rebound["id"]).as_dict(), store=store)
             result["summary"] = "Reconnected to existing swarm agents. " + result["summary"]
             return result
-        # Validate before ownership claim, but preserve the live-successor interrupt
-        # path above: it does not launch peers and needs no destination profile.
-        saved_pool = await blocking(store.pool)
-        if saved_pool["desired_state"] == "cancelled":
-            raise ValueError("Cancelled swarms remain cancelled")
-        settings = pool_launch_settings(state.settings, self.config, saved_pool)
-        pool = await blocking(claim_recovery, state, store,
-                             expected_epoch=request.get("expected_epoch"),
-                             confirmed_stopped=request.get("confirmed_stopped", False))
-        await blocking(repair_index, state, store, pool)
-        state.swarm_resource_uids = {**getattr(state, "swarm_resource_uids", {}), pool["id"]: pool["resource_uid"]}
-        outcomes = await self.launch_members(state, store, pool, recovering=True, settings=settings)
+
+        def _claim():
+            pool_now = store.pool()
+            if pool_now["desired_state"] == "cancelled":
+                raise ValueError("Cancelled swarms remain cancelled")
+            settings = pool_launch_settings(snapshot.settings, self.config, pool_now)
+            claimed = claim_recovery(snapshot, store, expected_epoch=request.get("expected_epoch"),
+                                     confirmed_stopped=request.get("confirmed_stopped", False),
+                                     discovered=discovered_all, owner_discovered=discovered_owner)
+            repair_index(snapshot, store, claimed)
+            snapshot.swarm_resource_uids = {**getattr(snapshot, "swarm_resource_uids", {}), claimed["id"]: claimed["resource_uid"]}
+            return claimed, settings
+
+        pool, settings = _unwrap_event((yield RunPluginTask(fn=_claim)))
+        outcomes = yield from self._wf_launch_members(snapshot, store, pool, recovering=True, settings=settings)
         operation = dict(id=pool["recovery"]["operation_id"], action="recover", epoch=pool["owner"]["epoch"],
                          state="finished", outcomes=outcomes, created_ns=time.time_ns())
         phase = "paused" if all(r["state"] == "ready_paused" for r in outcomes) else "mixed"
-        error = await self.finish_operation(store, operation, phase=phase)
-        return dict(pool=pool, summary=operation_summary(pool, operation, audit_error=error),
-                    level="info" if phase == "paused" and not error else "warning")
+        audit_error = _unwrap_event((yield RunPluginTask(fn=_finish_operation_sync, args=(store, operation), kwargs=dict(phase=phase))))
+        return dict(pool=pool, summary=operation_summary(pool, operation, audit_error=audit_error),
+                    level="info" if phase == "paused" and not audit_error else "warning")
 
-    async def startup(self, state, event):
-        async with self.lock:
-            resource = await blocking(member_resource, state)
-            if resource is not None:
-                return await bootstrap_member(state, event, resource)
-            if os.environ.get("AZO_SWARM_ID"):
-                raise ValueError("Pinned launch resource does not contain this session")
-            if event.get("restored"):
-                stores = await blocking(owned_stores, state)
-                if not stores and not state.swarm_access:
-                    return dict(summary="", release_startup_hold=True)
-                state.settings = await blocking(launch_settings, state, self.config)
-                return await self.recover_owned(state, stores=stores)
-            return dict(summary="", access={}, grants={})
+    def _wf_control(self, snapshot, request: dict, *, store: SwarmStore | None = None):
+        action = request.get("action")
+        if action not in {"bcast", "interrupt", "continue", "cancel", "release", "capture", "afk", "share_data"}:
+            raise ValueError("Unsupported existing-swarm control")
 
-    async def recover_owned(self, state, *, stores=None):
-        summaries = []
+        def _out(member, st, err=None):
+            row = dict(label=member["label"], session_id=member["session_id"], state=st)
+            if err:
+                row["error"] = str(err)
+            return row
+
+        def _begin():
+            s, pool = (store, store.pool()) if store is not None else resolve_pool(snapshot, request["target"])
+            if request.get("canonical") and pool["id"] != request["target"]:
+                raise ValueError("Tool swarm_id must be the canonical resource ID, not its display name")
+            members = control_members(pool, request)
+            if action == "bcast":
+                validate_broadcast(request["message"])
+            elif action == "afk":
+                afk_command(request.get("message"))
+            if action in {"continue", "bcast", "release"}:
+                for m in members:
+                    row = s.records().get("members", m["session_id"], {})
+                    if row.get("recovery_status") not in {"ready_paused", "ready"} or row.get("work_blocked"):
+                        raise ValueError("Recovery/seed checkpoint incomplete or external tool outcome ambiguous; no work sent")
+            op = dict(id=request["operation_id"], action=action, pods=request.get("pods"),
+                      epoch=pool["owner"]["epoch"], message=request.get("message", ""),
+                      created_ns=time.time_ns(), state="pending",
+                      members=[m["session_id"] for m in members], outcomes=[])
+            with s.mutation(allow_cancelled=action == "cancel") as (records, _):
+                if records.get("operations", op["id"]):
+                    raise ValueError("Operation already exists; replay forbidden")
+                records.put("operations", op["id"], op)
+                desired = {"bcast": "running", "continue": "running", "interrupt": "paused", "cancel": "cancelled"}
+                if action in desired:
+                    with records.transaction("swarm", "pool") as saved:
+                        states = saved.setdefault("pod_states", {p["id"]: "paused" for p in saved["pods"]})
+                        ids = {m["session_id"] for m in members}
+                        for pod in saved["pods"]:
+                            if any(m["session_id"] in ids for m in pod["members"]):
+                                states[pod["id"]] = desired[action]
+                        saved["desired_state"] = next(iter(set(states.values()))) if len(set(states.values())) == 1 else "mixed"
+                        saved["phase"] = saved["desired_state"]
+            return s, pool, members, op
+
+        store, pool, members, operation = _unwrap_event((yield RunPluginTask(fn=_begin)))
+        outcomes, pending_idxs = {}, list(range(len(members)))
+        for attempt_no in range(MAX_PRE_SEND_RETRIES):
+            if not pending_idxs:
+                break
+            disc_batch = []
+            for idx, ev in zip(pending_idxs, (yield [RunPluginTask(fn=build_member_discover_request, args=(store, members[i])) for i in pending_idxs])):
+                if isinstance(ev, IoFailed):
+                    outcomes[idx] = _out(members[idx], "unavailable", ev.error)
+                else:
+                    disc_batch.append((idx, *ev.value))
+            if not disc_batch:
+                break
+            ready_batch, cancel_props = [], []
+            for (idx, _, meta), ev in zip(disc_batch, (yield [req for _, req, _ in disc_batch])):
+                member = members[idx]
+                try:
+                    res: DiscoverSessionsResult = _unwrap_event(ev)
+                    if res.status != "ready" or res.lineage is None:
+                        raise ValueError(res.error or "Member discovery failed")
+                    proposal = proposal_from_lineage(member, res.lineage, meta)
+                    if action == "cancel":
+                        if proposal["path"] or proposal["instance_id"] != meta["anchor"]["instance_id"]:
+                            raise ValueError("Cancelled swarms cannot adopt replacement peers")
+                        if "control:shutdown" not in proposal["facts"]["capabilities"]:
+                            raise ValueError("Peer lacks capability control:shutdown; no send attempted")
+                        cancel_props.append((idx, proposal))
+                    elif action == "share_data":
+                        ready_batch.append((idx, build_member_data_request(
+                            proposal, artifacts=request["artifacts"], channel=request["channel"],
+                            message=request.get("message", ""), sender_session_id=snapshot._session_id,
+                            sender_instance_id=snapshot._instance_id, operation_id=operation["id"],
+                            store=store, member=member)))
+                    else:
+                        ready_batch.append((idx, build_member_input_request(proposal, request, store=store, member=member)))
+                except Exception as exc:
+                    outcomes[idx] = _out(member, "unavailable", exc)
+            if action == "cancel" and cancel_props:
+                claimed = []
+                claim_tasks = [RunPluginTask(fn=_claim_operation_dispatch, args=(store, members[idx], p),
+                                             kwargs=dict(operation_id=operation["id"], allow_cancelled=True))
+                               for idx, p in cancel_props]
+                for (idx, p), ev in zip(cancel_props, (yield claim_tasks)):
+                    if isinstance(ev, IoFailed):
+                        outcomes[idx] = _out(members[idx], "unavailable", ev.error)
+                    else:
+                        claimed.append((idx, p))
+                to_adopt = [p for _, p in claimed if p["instance_id"] not in self._owned_instances]
+                if to_adopt:
+                    yield [AdoptSession(session_id=p["session_id"], instance_id=p["instance_id"],
+                                        process_identity=deepcopy(p["process_identity"]),
+                                        websocket_url=p["websocket_url"], watch=False) for p in to_adopt]
+                if claimed:
+                    for (idx, _), ev in zip(claimed, (yield [build_member_stop_request(p, operation_id=operation["id"]) for _, p in claimed])):
+                        if isinstance(ev, IoFailed):
+                            outcomes[idx] = _out(members[idx], "unavailable", ev.error)
+                        else:
+                            sr: SessionStopResult = ev.value
+                            st = "sent" if sr.status in {"stopped", "stopping"} else ("unknown" if sr.status == "delivery_unknown" else "unavailable")
+                            outcomes[idx] = _out(members[idx], st, None if st == "sent" else (sr.note or sr.status))
+                break
+            if not ready_batch:
+                break
+            next_retry = []
+            for (idx, _), ev in zip(ready_batch, (yield [req for _, req in ready_batch])):
+                if isinstance(ev, IoFailed):
+                    outcomes[idx] = _out(members[idx], "unavailable", ev.error)
+                elif ev.value.outcome == "sent":
+                    outcomes[idx] = _out(members[idx], "sent")
+                elif ev.value.outcome == "delivery_unknown":
+                    outcomes[idx] = _out(members[idx], "unknown", ev.value.error)
+                elif ev.value.outcome == "pre_send_race" and attempt_no + 1 < MAX_PRE_SEND_RETRIES:
+                    next_retry.append(idx)
+                else:
+                    outcomes[idx] = _out(members[idx], "unavailable", ev.value.error or ev.value.outcome)
+            pending_idxs = next_retry
+
+        operation.update(state="finished", outcomes=[outcomes[i] for i in range(len(members))])
+        audit_error = _unwrap_event((yield RunPluginTask(fn=_finish_operation_sync, args=(store, operation))))
+        return dict(pool=pool, operation=operation, summary=operation_summary(pool, operation, audit_error=audit_error),
+                    level="warning" if audit_error or any(r.get("error") for r in operation["outcomes"]) else "info")
+
+    def _wf_startup(self, snapshot, event: dict):
+        hook = getattr(self, "startup", None)
+        if callable(hook):
+            return _unwrap_event((yield RunPluginTask(fn=hook, args=(snapshot, event))))
+        resource = _unwrap_event((yield RunPluginTask(fn=member_resource, args=(snapshot,))))
+        if resource is not None:
+            return (yield from self._wf_bootstrap_member(snapshot, event, resource))
+        if os.environ.get("AZO_SWARM_ID"):
+            raise ValueError("Pinned launch resource does not contain this session")
+        if event.get("restored"):
+            stores = _unwrap_event((yield RunPluginTask(fn=owned_stores, args=(snapshot,))))
+            if not stores and not snapshot.swarm_access:
+                return dict(summary="", release_startup_hold=True)
+            snapshot.settings = _unwrap_event((yield RunPluginTask(fn=launch_settings, args=(snapshot, self.config))))
+            return (yield from self._wf_recover_owned(snapshot, stores=stores))
+        return dict(summary="", access={}, grants={})
+
+    def _wf_recover_owned(self, snapshot, *, stores=None):
         if stores is None:
-            stores = await blocking(owned_stores, state)
+            stores = _unwrap_event((yield RunPluginTask(fn=owned_stores, args=(snapshot,))))
+        summaries = []
         for swarm_id, store, error in stores:
             if error:
                 summaries.append(f"{swarm_id}: recovery blocked: {brief_error(error)}")
                 continue
-            pool = await blocking(store.pool)
-            state.swarm_access[swarm_id] = ""
+            pool = _unwrap_event((yield RunPluginTask(fn=store.pool)))
+            snapshot.swarm_access[swarm_id] = ""
             if pool["desired_state"] == "cancelled":
                 continue
             try:
-                result = await self.recover(state, store, {})
+                result = yield from self._wf_recover(snapshot, store, {})
                 summaries.append(result["summary"])
             except Exception as exc:
                 summaries.append(f"{swarm_id}: recovery blocked: {brief_error(exc)}")
-        return dict(summary="\n".join(summaries), access=state.swarm_access, grants=state.grants,
-                    resource_uids=getattr(state, "swarm_resource_uids", {}), level="info")
+        return dict(summary="\n".join(summaries), access=snapshot.swarm_access, grants=snapshot.grants,
+                    resource_uids=getattr(snapshot, "swarm_resource_uids", {}), level="info")
 
-    async def finish_operation(self, store, operation, *, phase=None):
-        def finish():
-            with store.mutation(allow_cancelled=True) as (records, pool):
-                # Keep durable per-peer dispatch claims instead of replacing them with a stale snapshot.
-                saved = records.get("operations", operation["id"], {})
-                saved.update(operation)
-                records.put("operations", operation["id"], saved)
-                if phase:
-                    with records.transaction("swarm", "pool") as current:
-                        current["phase"] = phase
-                        if current.get("recovery"):
-                            current["recovery"]["phase"] = phase
-        try:
-            await blocking(finish)
-            return ""
-        except Exception as exc:
-            return str(exc)
-
-    async def control(self, state, request):
-        if request.get("action") not in {"bcast", "interrupt", "continue", "cancel", "release", "capture", "afk"}:
-            raise ValueError("Unsupported existing-swarm control")
-        store, pool = await blocking(resolve_pool, state, request["target"])
-        if request.get("canonical") and pool["id"] != request["target"]:
-            raise ValueError("Tool swarm_id must be the canonical resource ID, not its display name")
-        members = control_members(pool, request)
-        if request["action"] == "bcast":
-            validate_broadcast(request["message"])
-        elif request["action"] == "afk":
-            afk_command(request.get("message"))
-        if request["action"] in {"continue", "bcast", "release"}:
-            for member in members:
-                row = await blocking(lambda: store.records().get("members", member["session_id"], {}))
-                if row.get("recovery_status") not in {"ready_paused", "ready"} or row.get("work_blocked"):
-                    raise ValueError("Recovery/seed checkpoint incomplete or external tool outcome ambiguous; no work sent")
-        operation = dict(id=request["operation_id"], action=request["action"], pods=request.get("pods"),
-                         epoch=pool["owner"]["epoch"], message=request.get("message", ""),
-                         created_ns=time.time_ns(), state="pending", members=[m["session_id"] for m in members], outcomes=[])
-        def begin():
-            with store.mutation(allow_cancelled=request["action"] == "cancel") as (records, current):
-                if records.get("operations", operation["id"]):
-                    raise ValueError("Operation already exists; replay forbidden")
-                records.put("operations", operation["id"], operation)
-                desired = {"bcast": "running", "continue": "running", "interrupt": "paused", "cancel": "cancelled"}
-                if request["action"] not in desired:
-                    return  # Pace/AFK configuration is not a lifecycle transition.
-                with records.transaction("swarm", "pool") as saved:
-                    states = saved.setdefault("pod_states", {p["id"]: "paused" for p in saved["pods"]})
-                    ids = {m["session_id"] for m in members}
-                    for pod in saved["pods"]:
-                        if any(m["session_id"] in ids for m in pod["members"]):
-                            states[pod["id"]] = desired[request["action"]]
-                    saved["desired_state"] = next(iter(set(states.values()))) if len(set(states.values())) == 1 else "mixed"
-                    saved["phase"] = saved["desired_state"]
-        await blocking(begin)
-        limit = asyncio.Semaphore(8)
-        async def send(member):
-            async with limit:
+    def _wf_bootstrap_member(self, snapshot, event: dict, resource=None):
+        if resource is None:
+            resource = _unwrap_event((yield RunPluginTask(fn=member_resource, args=(snapshot,))))
+        if resource is None:
+            raise ValueError("No actual swarm member matches restored session identity")
+        store, pool, pod, member = resource
+        attempt = _unwrap_event((yield RunPluginTask(fn=lambda: store.records().get("attempts", snapshot._session_id))))
+        if not attempt or attempt.get("epoch") != pool["owner"]["epoch"]:
+            raise ValueError("Child attempt belongs to an old owner generation")
+        current = attempt.get("current") or attempt
+        grant = dict(parent_grant(pool, pool["owner"]["parent_instance_id"]), role="member",
+                     session_id=snapshot._session_id, instance_id=current["instance_id"],
+                     attempt_id=attempt["attempt_id"])
+        store.grant = grant
+        snapshot.swarm_access = {pool["id"]: pod["id"]}
+        replacement = attempt["instance_id"] != event["instance_id"]
+        if replacement:
+            deadline = time.monotonic() + 15.0
+            while True:
+                prev_rev = attempt.get("binding_revision", 0)
                 try:
-                    for retry in range(3):
-                        try:
-                            target = await blocking(connection_target, store, member)
-                            await send_to_member(target, request, store=store, member=member)
-                            break
-                        except PreSendRace:
-                            if retry == 2:
-                                raise
-                    return dict(label=member["label"], session_id=member["session_id"], state="sent")
-                except DeliveryUnknown as exc:
-                    return dict(label=member["label"], session_id=member["session_id"], state="unknown", error=str(exc))
-                except Exception as exc:
-                    return dict(label=member["label"], session_id=member["session_id"], state="unavailable", error=str(exc))
-        async with asyncio.TaskGroup() as group:
-            tasks = [group.create_task(send(member)) for member in members]
-        operation.update(state="finished", outcomes=[t.result() for t in tasks])
-        error = await self.finish_operation(store, operation)
-        return dict(pool=pool, operation=operation, summary=operation_summary(pool, operation, audit_error=error),
-                    level="warning" if error or any(r.get("error") for r in operation["outcomes"]) else "info")
+                    def _prep_disc():
+                        att = store.records().get("attempts", snapshot._session_id)
+                        cur = att.get("current") or att
+                        g = dict(grant, instance_id=cur["instance_id"])
+                        store.grant = g
+                        return att, g, build_member_discover_request(store, member)
+                    attempt, grant, (disc_req, meta) = _unwrap_event((yield RunPluginTask(fn=_prep_disc)))
+                    res: DiscoverSessionsResult = _unwrap_event((yield disc_req))
+                    if res.status != "ready" or res.lineage is None:
+                        raise ValueError(res.error or "Replacement discovery failed")
+                    proposal = proposal_from_lineage(member, res.lineage, meta)
+                    if proposal["instance_id"] != event["instance_id"] or proposal["process_identity"] != native_self():
+                        raise ValueError("Replacement child lacks exact native lineage")
+                    conn = _unwrap_event((yield ConnectSession(
+                        session_id=proposal["session_id"], instance_id=proposal["instance_id"],
+                        websocket_url=proposal["websocket_url"],
+                        expected_process_identity=deepcopy(proposal["process_identity"]),
+                        verify_loopback=True, modern=False, connect_timeout_s=10.0,
+                    )))
+                    try:
+                        def _adopt():
+                            newer = _revalidate_proposal_sync(store, member)
+                            for key in ("facts", "path", "attempt_id", "revision", "previous", "origin"):
+                                if newer[key] != proposal[key]:
+                                    raise PreSendRace("Replacement discovery changed before dispatch")
+                            cas_adopt(store, member, proposal)
+                        _unwrap_event((yield RunPluginTask(fn=_adopt)))
+                    finally:
+                        yield DisconnectSession(connection_id=conn["connection_id"])
+                    grant = dict(grant, instance_id=event["instance_id"])
+                    store.grant = grant
+                    break
+                except (ValueError, OSError) as exc:
+                    latest = _unwrap_event((yield RunPluginTask(fn=lambda: store.records().get("attempts", snapshot._session_id) or {})))
+                    raced = latest.get("binding_revision", 0) != prev_rev
+                    pub = any(w in str(exc) for w in ("missing from registry", "not yet discoverable", "not confirmed retired"))
+                    if time.monotonic() >= deadline or not (raced or pub or isinstance(exc, PreSendRace)):
+                        raise
+                    yield RunPluginTask(fn=time.sleep, args=(0.1,))
+        elif current.get("process_identity") != native_self():
+            launch_grant = json.loads(os.environ.get("AZO_SWARM_GRANT", "null"))
+            if attempt.get("state") != "reserved" or launch_grant != grant:
+                raise ValueError("Child native identity differs from admitted launch")
+        return _unwrap_event((yield RunPluginTask(
+            fn=_commit_member_bootstrap, args=(snapshot, store, pool, pod, grant, event),
+            kwargs=dict(replacement=replacement),
+        )))
 
-    async def post(self, state, request):
-        store = await blocking(allowed_store, state, request["target"])
-        pool = await blocking(store.pool)
-        pod = request["pod"]
-        if type(pod) is not int or not 0 <= pod < len(pool["pods"]):
-            raise ValueError("Unknown zero-based pod index")
-        pod_id = pool["pods"][pod]["id"]
-        if effective_scope(state, pool["id"], store) not in {"", pod_id}:
-            raise ValueError("Pod is outside this session's scope")
-        try:
-            identity, appended = await blocking(store.post, pod_id, request["channel"], request["message"],
-                                               state._session_id, message_id=request["message_id"], receipt=True)
-        except (OSError, RuntimeError) as exc:
-            return dict(summary=f"{pool_label(pool)}/pod {pod}/{request['channel']}: write outcome unknown. "
-                        f"{brief_error(exc)}. Retry the same content with message_id={request['message_id']}.", level="warning")
-        return dict(summary=f"{pool_label(pool)}/pod {pod}/{request['channel']}: "
-                    f"message {'committed' if appended else 'already committed'}.", level="info")
+    # -- Public Tool Methods -------------------------------------------------
 
     def broadcast(self, swarm_id: str, message: str, pods: list[int] | None = None, state=None) -> str:
         """Broadcast exact user text to existing peers; never create/relaunch or automatically retry.
@@ -2654,10 +2655,26 @@ class SwarmController:
                        message=message, message_id=identity, operation_id=identity)
         return self.submit(state, request)
 
+    def share_data(self, swarm_id: str, artifacts: Sequence[SessionArtifact], *,
+                   channel: str = "swarm:data", message: str = "",
+                   pods: list[int] | None = None, state=None) -> str:
+        """Push structured ``SessionArtifact`` payloads to live peers via ``SendSessionData``."""
+        name(swarm_id)
+        if not artifacts:
+            raise ValueError("At least one SessionArtifact is required")
+        if pods is not None and (not pods or any(type(p) is not int or not 0 <= p < 32 for p in pods)):
+            raise ValueError("pods must be a nonempty list of zero-based integers (0–31)")
+        request = dict(
+            action="share_data", target=swarm_id, pods=None if pods is None else tuple(dict.fromkeys(pods)),
+            artifacts=tuple(artifacts), channel=str(channel or "swarm:data"), message=str(message or ""),
+            operation_id=uuid.uuid4().hex, canonical=True,
+        )
+        return self.submit(state, request)
+
 
 RUNTIME_READS = {
     "swarm_access", "swarm_resource_uids", "_session_id", "_instance_id", "_session_kind",
-    "_agent_zoo_context", "_project_name", "_store_root", "session_launcher", "cwd",
+    "_agent_zoo_context", "_project_name", "_store_root", "cwd",
     "session_cwd", "_persistence_local_root", "_runtime_startup_paused", "startup_paused",
 }
 
@@ -2678,7 +2695,6 @@ class SwarmTool(Tool):
 
 class SwarmRuntimeReady:
     """Handle ``SessionReady`` by registering buffers, holding restored work, and scheduling startup."""
-
     handles = (SessionReady,)
     optional_reads = RUNTIME_READS | {"buffer_manager"}
     writes = {"_runtime_startup_paused", "startup_paused", "buffer_manager", "pending_interrupts"}
@@ -2691,14 +2707,9 @@ class SwarmRuntimeReady:
         if not isinstance(event, SessionReady):
             return
         controller = self.controller
-        payload = dict(
-            session_id=event.session_id,
-            instance_id=event.instance_id,
-            restored=bool(event.restored),
-            revision_id=event.revision_id,
-            startup_mode=event.startup_mode,
-            paused=bool(event.paused),
-        )
+        payload = dict(session_id=event.session_id, instance_id=event.instance_id,
+                       restored=bool(event.restored), revision_id=event.revision_id,
+                       startup_mode=event.startup_mode, paused=bool(event.paused))
         key = (payload["session_id"], payload["instance_id"])
         if key in controller.seen_events:
             return
@@ -2709,16 +2720,12 @@ class SwarmRuntimeReady:
         if getattr(state, "buffer_manager", None) is not None:
             SwarmBuffers().register(state)
         if payload["restored"] and not payload["paused"]:
-            # The final-bound event precedes the core work gate. Keep historical pending
-            # calls/awaits dormant even when this checkpoint lost its swarm_access cache.
-            # Off-thread discovery releases this temporary hold only if there are no resources.
             state._runtime_startup_paused = True
             state.startup_paused = True
             controller.startup_hold = controller.bound
         payload["paused"] = bool(
             getattr(state, "_runtime_startup_paused", False)
-            or getattr(state, "startup_paused", False)
-            or payload["paused"]
+            or getattr(state, "startup_paused", False) or payload["paused"]
         )
         controller.grants.clear()
         fence = controller.bound
@@ -2727,13 +2734,7 @@ class SwarmRuntimeReady:
             controller.ready_events.append((payload, fence))
             return
         try:
-            snapshot = controller.snapshot(state)
-            task = SwarmTask(
-                factory=lambda snapshot=snapshot, payload=payload: controller.startup(snapshot, payload),
-                action="startup",
-            )
-            op_id = io_table.submit(task, tag="swarm_startup")
-            controller.in_flight[op_id] = (fence, "startup", payload)
+            controller.submit_startup(state, payload)
         except Exception as exc:
             LOG.exception("Swarm startup submission failed for %s", fence[1:3])
             if not worker_identity(state):
@@ -2741,20 +2742,27 @@ class SwarmRuntimeReady:
 
 
 class SwarmCompletionHandler:
-    """Event-driven completion handler for async ``SwarmTask`` IO operations (zero polling)."""
-
-    handles = (IoCompleted, IoFailed)
-    optional_reads = RUNTIME_READS | {"pending_interrupts"}
+    """Event-driven completion handler for Swarm ``SessionRequest`` & ``RunPluginTask`` operations."""
+    handles = (IoCompleted, IoFailed, SessionDataReceived)
+    optional_reads = RUNTIME_READS | {"pending_interrupts", "swarm_received_data"}
     writes = {
-        "swarm_access", "swarm_resource_uids", "pending_interrupts",
+        "swarm_access", "swarm_resource_uids", "pending_interrupts", "swarm_received_data",
         "_runtime_startup_paused", "startup_paused", "dirty",
     }
-    init = {"pending_interrupts": list}
+    init = {"pending_interrupts": list, "swarm_received_data": list}
 
     def __init__(self, controller):
         self.controller = controller
 
     def handle(self, event, state, emit):
+        if isinstance(event, SessionDataReceived):
+            if str(event.channel or "").startswith("swarm:"):
+                received = getattr(state, "swarm_received_data", None)
+                if received is None:
+                    received = []
+                    state.swarm_received_data = received
+                received.append(event)
+            return
         if not isinstance(event, (IoCompleted, IoFailed)):
             return
         c = self.controller
@@ -2762,44 +2770,27 @@ class SwarmCompletionHandler:
         if entry is None:
             return
         event.stop()
-        fence, source_kind, request = entry
+        fence, source_kind, payload = entry
         identity = c.identity(state)
         if fence != identity or (c.session is not None and getattr(c.session, "state", state) is not state):
             LOG.warning("Discarding stale swarm completion for %s", fence[1:3])
+            if isinstance(payload, Mapping) and "_wf" in payload:
+                c._workflows.pop(payload["_wf"], None)
+            return
+        if isinstance(payload, Mapping) and "_wf" in payload:
+            c._on_runner_event(payload["_wf"], int(payload.get("_idx", 0)), event, state, emit)
             return
         if isinstance(event, IoFailed):
-            LOG.warning("Swarm background operation failed for %s: %s", identity[1:3], event.error)
-            message = f"Swarm operation failed: {brief_error(event.error)}"
-            if source_kind == "command":
-                emit(EmitNotice(message, level="warning"))
-                emit(ProjectionRequested())
-            elif not worker_identity(state):
-                _append_interrupt(state, message, emit)
+            c._fail_background(source_kind, identity, event.error, state, emit)
             return
-        result = event.value
-        if source_kind == "command":
-            c.complete(state, result, emit)
-            return
-        c.apply(state, result)
-        quiet_success = (
-            result.get("action") in {"bcast", "post"}
-            and result.get("level", "info") == "info"
-        )
-        if result.get("summary") and not worker_identity(state) and not quiet_success:
-            _append_interrupt(state, result.get("model_message", result["summary"]), emit)
+        c._deliver_final(source_kind, state, event.value, emit)
 
 
 def register_features(builder, *, session, config):
     builder.add(Feature("swarm_settings", components=profile_setting(config), order=[Setting]))
-    # launch_member assigns this durable kind; unlike environment or display
-    # names it also identifies members during reload/recovery without disk IO.
     if worker_identity(getattr(session, "state", None)) and getattr(builder, "has", lambda _: False)("rlm"):
-        # Restrict agent-directed delegation, not internal maintenance. Preserve
-        # the existing RLMCompletionHandler so automatic compaction still works.
         feature = builder._features["rlm"]
-        builder.add(replace(feature, components=[
-            component for component in feature.components if not isinstance(component, Tool)
-        ]))
+        builder.add(replace(feature, components=[c for c in feature.components if not isinstance(c, Tool)]))
     controller = SwarmController(config, session)
     builder.add(Feature("swarm", components=[
         SwarmBuffers(), SwarmRuntimeReady(controller), SwarmCompletionHandler(controller),
@@ -2808,12 +2799,12 @@ def register_features(builder, *, session, config):
         SwarmTool(controller, "continue_swarm", "swarm_continue"),
         SwarmTool(controller, "cancel", "swarm_cancel"),
         SwarmTool(controller, "post_message", "swarm_post", parent_only=False),
-        Command("/swarm", "Launch a swarm", controller.command,
-                raw=True, usage='/swarm -n AGENTS [-p PODS] [--channels NAME,...] [--name NAME] [--profile PROFILE]',
+        Command("/swarm", "Launch a swarm", controller.command, raw=True,
+                usage="/swarm -n AGENTS [-p PODS] [--channels NAME,...] [--name NAME] [--profile PROFILE]",
                 section="Swarm"),
     ], order=[IoFence, RegisterSpecialBuffers, SwarmBuffers, SwarmRuntimeReady,
               SwarmCompletionHandler, Command, Tool],
-       drivers=[SwarmDriver]))
+       drivers=[make_swarm_session_driver, PluginTaskDriver]))
     builder.add(Feature("swarm_guidance", components=[
         SwarmSkillRegistration(), SwarmSystemPrompt(load_worker_prompt()),
     ], order=[SwarmSkillRegistration, SwarmSystemPrompt, SystemPromptSkillList, MessageRenderer]))

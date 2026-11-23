@@ -12,17 +12,22 @@ import uuid
 
 import pytest
 from agent_utils import Entry, Pipeline, Session
+from agent_utils.core.events import IoCompleted, IoFailed
 from agent_utils.core.io import IoTable
 from agent_utils.storage.repository import SessionRepository
+import agent_zoo.drivers.sessions as sessions_mod
+from agent_zoo.events import DiscoverSessionsResult, SessionSpawnResult
 from agent_zoo.host.launch import RuntimeSettings
 from tmux_pilot.process_identity import HostIdentity, ProcessIdentity
 import swarm
+from conftest import run_driver_op, run_swarm_workflow
 
 
 @pytest.fixture
 def runtime(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_ZOO_STATE_ROOT", str(tmp_path / "state"))
     monkeypatch.setenv("AGENT_ZOO_LOCAL_STATE_ROOT", str(tmp_path / "local"))
+    (tmp_path / "registry").mkdir(parents=True, exist_ok=True)
     for key in ("AZO_SWARM_ID", "AZO_SWARM_POD_ID", "AZO_SWARM_GRANT"):
         monkeypatch.delenv(key, raising=False)
     host = HostIdentity("host-a", "boot-a", "namespace-a", "a")
@@ -31,6 +36,9 @@ def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(swarm, "native_self", lambda: identity.to_dict())
     monkeypatch.setattr(swarm, "capture_process_identity", lambda pid: identity if pid == 100 else None)
     monkeypatch.setattr(swarm, "list_live_sessions", lambda *a, **k: [])
+    monkeypatch.setattr(sessions_mod, "local_host_identity", lambda: host)
+    monkeypatch.setattr(sessions_mod, "capture_process_identity", lambda pid: identity if pid == 100 else None)
+    monkeypatch.setattr(sessions_mod, "list_live_sessions", lambda *a, **k: [])
     settings = RuntimeSettings(project="test", model="offline", workdir=str(tmp_path),
         state_root=str(tmp_path / "state"), store_root=str(tmp_path / "registry"),
         local_state_root=str(tmp_path / "local"))
@@ -194,8 +202,15 @@ def test_paused_resume_same_sid_new_iid_and_destination_settings(runtime, monkey
     ref = swarm.pin_checkpoint(r.state, r.store, member)
     launcher = r.state.session_launcher
     launcher.prepare.side_effect = lambda request, **kwargs: SimpleNamespace(request=request, ready_file="/lost/ready")
-    launcher.start.return_value = SimpleNamespace(process=SimpleNamespace(pid=100), stdout_path="new.out", stderr_path="new.err")
-    swarm.launch_member(r.state, "sw0", member["session_id"], r.state.settings, handles={}, checkpoint=ref)
+    launcher.start.return_value = SimpleNamespace(
+        process=SimpleNamespace(pid=100, poll=lambda: None, terminate=lambda: None, kill=lambda: None, wait=lambda timeout=None: 0),
+        ready_file="/lost/ready", stdout_path="new.out", stderr_path="new.err",
+    )
+    spawn_req, _ = swarm.reserve_member_launch(r.state, "sw0", member["session_id"], r.state.settings, checkpoint=ref)
+    spawn_req.wait_ready = False
+    driver = swarm.make_swarm_session_driver(launcher=launcher)
+    ev = run_driver_op(driver, spawn_req)
+    assert isinstance(ev, IoCompleted)
     request = launcher.prepare.call_args.args[0]
     assert request.startup_mode == "paused" and request.first_user_message == ""
     assert request.target.session_id == saved.session_id and request.target.instance_id != saved.instance_id
@@ -210,11 +225,14 @@ def test_uncertain_start_retained_and_cannot_retry(runtime):
     launcher.prepare.side_effect = lambda request, **kwargs: SimpleNamespace(request=request, ready_file="missing")
     launcher.start.side_effect = OSError("spawn acknowledgement lost")
     member = r.members[0]
-    with pytest.raises(OSError):
-        swarm.launch_member(r.state, "sw0", member["session_id"], r.state.settings, handles={})
+    spawn_req, attempt = swarm.reserve_member_launch(r.state, "sw0", member["session_id"], r.state.settings)
+    driver = swarm.make_swarm_session_driver(launcher=launcher)
+    ev = run_driver_op(driver, spawn_req)
+    assert isinstance(ev, IoFailed) and isinstance(ev.error, OSError)
+    swarm.mark_spawn_unknown(r.store, member["session_id"], attempt["attempt_id"])
     assert r.store.records().get("attempts", member["session_id"])["state"] == "unknown"
     with pytest.raises(ValueError, match="reconciliation"):
-        swarm.launch_member(r.state, "sw0", member["session_id"], r.state.settings, handles={})
+        swarm.reserve_member_launch(r.state, "sw0", member["session_id"], r.state.settings)
     assert launcher.start.call_count == 1
 
 
@@ -223,15 +241,29 @@ def test_partial_recovery_does_not_replay_or_continue(runtime, monkeypatch):
     saved = seed(r, r.members[0])
     monkeypatch.setattr(swarm, "process_evidence", lambda _: "dead")
     launches = []
-    def launch(state, swarm_id, sid, settings, *, handles, checkpoint):
+
+    def reserve_spy(state, swarm_id, sid, settings, *, checkpoint=None):
         launches.append((sid, checkpoint))
-        return object()
-    async def ready(state, store, member, handle):
-        return dict(label=member["label"], session_id=member["session_id"], state="ready_paused")
-    monkeypatch.setattr(swarm, "launch_member", launch)
-    monkeypatch.setattr(swarm, "await_member_ready", ready)
+        req, att = real_reserve(state, swarm_id, sid, settings, checkpoint=checkpoint)
+        req.wait_ready = False
+        return req, att
+
+    real_reserve = swarm.reserve_member_launch
+    monkeypatch.setattr(swarm, "reserve_member_launch", reserve_spy)
+    monkeypatch.setattr(
+        swarm, "finalize_member_ready",
+        lambda state, store, member, attempt_id, res, **kw: dict(
+            label=member["label"], session_id=member["session_id"], state="ready_paused",
+        ),
+    )
+    launcher = r.state.session_launcher
+    launcher.prepare.side_effect = lambda request, **kwargs: SimpleNamespace(request=request, ready_file="/offline/ready")
+    launcher.start.return_value = SimpleNamespace(
+        process=SimpleNamespace(pid=100, poll=lambda: None, terminate=lambda: None, kill=lambda: None, wait=lambda timeout=None: 0),
+        ready_file="/offline/ready", stdout_path="out", stderr_path="err",
+    )
     controller = swarm.SwarmController({})
-    result = asyncio.run(controller.recover(r.state, r.store, {}))
+    result = run_swarm_workflow(controller, r.state, controller._wf_recover(r.state, r.store, {}))
     assert launches == [(saved.session_id, swarm.CheckpointRef(saved.session_id, saved.commit_id))]
     assert "1 missing checkpoint" in result["summary"] and "1 of 2 agents restored (paused)" in result["summary"]
     assert r.store.pool()["phase"] == "mixed"
@@ -294,14 +326,18 @@ def test_child_bootstrap_proves_shared_seed_before_parent_readiness(runtime, mon
     monkeypatch.setattr(swarm, "capture_process_identity", lambda pid: child_identity)
     event = dict(session_id=child._session_id, instance_id=child._instance_id, restored=False,
                  startup_mode="paused", paused=True, revision_id=saved.commit_id)
-    result = asyncio.run(swarm.bootstrap_member(child, event))
+    controller = swarm.SwarmController({})
+    result = run_swarm_workflow(controller, child, controller._wf_bootstrap_member(child, event))
     assert result["access"] == {"sw0": "pod-1"}
     ready = dict(format_version=1, session_id=child._session_id, instance_id=child._instance_id,
                  pid=200, process_identity=child_identity.to_dict(), websocket_url="ws://127.0.0.1:12000/session",
                  startup_mode="paused", paused=True, revision_id=saved.commit_id)
-    handle = SimpleNamespace(ref=SimpleNamespace(instance_id=child._instance_id), process=SimpleNamespace(pid=200),
-                             poll=lambda: SimpleNamespace(status="ready", ready=ready))
-    outcome = asyncio.run(swarm.await_member_ready(r.state, r.store, member, handle))
+    spawn_res = SessionSpawnResult(
+        session_id=child._session_id, instance_id=child._instance_id, pid=200,
+        process_identity=child_identity.to_dict(), ready=ready,
+        websocket_url=ready["websocket_url"], revision_id=saved.commit_id,
+    )
+    outcome = swarm.finalize_member_ready(r.state, r.store, member, attempt["attempt_id"], spawn_res)
     assert outcome["state"] == "ready_paused"
     assert r.store.records().get("members", child._session_id)["shared_checkpoint"]["revision_id"] == saved.commit_id
     assert r.store.records().get("attempts", child._session_id)["ready"] == ready
@@ -316,10 +352,13 @@ def test_transport_ready_without_plugin_admission_is_not_recoverable(runtime, mo
     ready = dict(format_version=1, session_id=member["session_id"], instance_id=attempt["instance_id"],
                  pid=200, process_identity=identity.to_dict(), websocket_url="ws://127.0.0.1:12000/session",
                  startup_mode="paused", paused=True, revision_id=saved.commit_id)
-    handle = SimpleNamespace(ref=SimpleNamespace(instance_id=attempt["instance_id"]), process=SimpleNamespace(pid=200),
-                             poll=lambda: SimpleNamespace(status="ready", ready=ready))
+    spawn_res = SessionSpawnResult(
+        session_id=member["session_id"], instance_id=attempt["instance_id"], pid=200,
+        process_identity=identity.to_dict(), ready=ready,
+        websocket_url=ready["websocket_url"], revision_id=saved.commit_id,
+    )
     with pytest.raises(TimeoutError, match="Agent startup timed out"):
-        asyncio.run(swarm.await_member_ready(r.state, r.store, member, handle, timeout=0))
+        swarm.finalize_member_ready(r.state, r.store, member, attempt["attempt_id"], spawn_res, timeout=0)
     assert r.store.records().get("members", member["session_id"])["recovery_status"] == "pending"
 
 
@@ -327,15 +366,15 @@ def test_interrupted_takeover_reuses_confirmation_only_for_same_attempt(runtime,
     r = runtime
     old = reserve(r, r.members[0], state="unknown")
     monkeypatch.setattr(swarm, "process_evidence", lambda _: "unknown")
-    swarm.claim_recovery(r.state, r.store, expected_epoch=1, confirmed_stopped=True)
-    # No new process/attempt was admitted: this is still the explicitly stopped old slot.
+    empty = DiscoverSessionsResult(status="ready", rows=())
+    swarm.claim_recovery(r.state, r.store, expected_epoch=1, confirmed_stopped=True, discovered=empty)
     same = r.store.records().get("attempts", r.members[0]["session_id"])
-    assert swarm.reconcile_attempt(r.state, same, r.store.pool()) == "confirmed_stopped"
-    swarm.claim_recovery(r.state, r.store)
+    assert swarm.classify_attempt_from_discovery(r.state, same, r.store.pool(), empty) == "confirmed_stopped"
+    swarm.claim_recovery(r.state, r.store, discovered=empty)
     new = reserve(r, r.members[0], state="unknown")
     assert new["attempt_id"] != old["attempt_id"]
-    assert swarm.reconcile_attempt(r.state, new, r.store.pool()) == "unknown"
-    swarm.claim_recovery(r.state, r.store)
+    assert swarm.classify_attempt_from_discovery(r.state, new, r.store.pool(), empty) == "unknown"
+    swarm.claim_recovery(r.state, r.store, discovered=empty)
     assert r.store.records().get("members", r.members[0]["session_id"])["recovery_status"] == "ambiguous"
 
 
@@ -370,12 +409,15 @@ def test_crosshost_confirmed_recovery_uses_destination_not_origin_argv(runtime, 
     destination_host = HostIdentity("host-b", "boot-b", "namespace-b", "b")
     destination_parent = ProcessIdentity("host-b", "boot-b", "namespace-b", 500, "destination-parent")
     destination_child = ProcessIdentity("host-b", "boot-b", "namespace-b", 501, "destination-child")
+    from agent_zoo.cli.wsctl import AzoWs
     monkeypatch.setattr(swarm, "local_host_identity", lambda: destination_host)
     monkeypatch.setattr(swarm, "native_self", lambda: destination_parent.to_dict())
     monkeypatch.setattr(swarm, "observe_process", lambda identity: SimpleNamespace(
         state=swarm.ObservationState.UNKNOWN if identity.host_id == "host-a" else swarm.ObservationState.ALIVE))
     monkeypatch.setattr(swarm, "capture_process_identity", lambda pid: destination_child if pid == 501 else destination_parent)
-    monkeypatch.setattr(swarm.AzoWs, "attach", Mock(side_effect=AssertionError("never contact source loopback")))
+    monkeypatch.setattr(sessions_mod, "local_host_identity", lambda: destination_host)
+    monkeypatch.setattr(sessions_mod, "capture_process_identity", lambda pid: destination_child if pid == 501 else destination_parent)
+    monkeypatch.setattr(AzoWs, "attach", Mock(side_effect=AssertionError("never contact source loopback")))
     r.state._instance_id = "parent-on-b"
     r.state.grants = {}
     destination_workdir = r.tmp / "destination-work"; destination_workdir.mkdir()
@@ -389,8 +431,14 @@ def test_crosshost_confirmed_recovery_uses_destination_not_origin_argv(runtime, 
     ref = swarm.pin_checkpoint(r.state, r.store, member)
     launcher = r.state.session_launcher
     launcher.prepare.side_effect = lambda request, **kwargs: SimpleNamespace(request=request, ready_file="destination-ready")
-    launcher.start.return_value = SimpleNamespace(process=SimpleNamespace(pid=501), stdout_path="destination.out", stderr_path="destination.err")
-    swarm.launch_member(r.state, "sw0", member["session_id"], r.state.settings, handles={}, checkpoint=ref)
+    launcher.start.return_value = SimpleNamespace(
+        process=SimpleNamespace(pid=501, poll=lambda: None, terminate=lambda: None, kill=lambda: None, wait=lambda timeout=None: 0),
+        ready_file="destination-ready", stdout_path="destination.out", stderr_path="destination.err",
+    )
+    spawn_req, _ = swarm.reserve_member_launch(r.state, "sw0", member["session_id"], r.state.settings, checkpoint=ref)
+    spawn_req.wait_ready = False
+    driver = swarm.make_swarm_session_driver(launcher=launcher)
+    assert isinstance(run_driver_op(driver, spawn_req), IoCompleted)
     launched = launcher.prepare.call_args.args[0]
     assert launched.settings.workdir == str(destination_workdir)
     assert launched.settings.store_root == str(r.tmp / "destination-registry")
@@ -399,7 +447,7 @@ def test_crosshost_confirmed_recovery_uses_destination_not_origin_argv(runtime, 
     assert launched.source.checkpoint.revision_id == saved.commit_id and launched.startup_mode == "paused"
     assert r.store.records().get("attempt_history", original["attempt_id"])["request"] == source_request
     assert r.store.pool()["owner"]["host"]["host_id"] == "host-b"
-    swarm.AzoWs.attach.assert_not_called()
+    AzoWs.attach.assert_not_called()
 
 
 def test_watermark_cannot_advance_to_unrelated_shared_branch(runtime):

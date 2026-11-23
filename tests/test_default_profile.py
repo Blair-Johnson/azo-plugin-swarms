@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 from agent_zoo.features.commands import CommandError
 import swarm
+from conftest import drain_first_request
 from test_profiles import PROFILE, config, launches
 from test_recovery import runtime
 
@@ -33,7 +34,7 @@ def test_default_precedence_and_persistence(runtime, config, launches, settings_
     controller = swarm.SwarmController(config)
     controller.command(ctx, raw_args="-n2" + (f" --profile {explicit}" if explicit else ""))
     settings_file.write_text('{"default_profile":"other"}')
-    result = asyncio.run(ctx.submit_io.call_args.args[0].factory())
+    result = drain_first_request(controller, runtime.state, ctx.submit_io.call_args.args[0])
     assert result["level"] == "info", result["summary"]
     assert result["pool"]["model_profile"] == expected
     assert swarm.store_for(runtime.state, result["pool"]["id"]).pool()["model_profile"] == expected
@@ -173,8 +174,9 @@ def test_saved_global_fallback_ignores_session_overrides(runtime, config, launch
     registry, ctx = settings_registry(config)
     assert settings_request(registry, ctx)["settings"][0]["value"] == expected
     launch_ctx = SimpleNamespace(state=runtime.state, submit_io=Mock(return_value="op_1"))
-    swarm.SwarmController(config).command(launch_ctx, raw_args="-n1")
-    result = asyncio.run(launch_ctx.submit_io.call_args.args[0].factory())
+    ctrl = swarm.SwarmController(config)
+    ctrl.command(launch_ctx, raw_args="-n1")
+    result = drain_first_request(ctrl, runtime.state, launch_ctx.submit_io.call_args.args[0])
     assert result["pool"]["model_profile"] == expected
     assert launches.prepare.call_args.args[0].settings.model == expected
     assert config["llm"]["default"] == PROFILE

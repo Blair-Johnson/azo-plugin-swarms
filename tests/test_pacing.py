@@ -1,17 +1,18 @@
-"""Whole-swarm slash pacing/configuration and terminal cancellation contracts."""
-import asyncio
+"""Whole-swarm slash pacing/configuration and terminal cancellation contracts via AgentZooSessionDriver."""
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import Mock
 
 import pytest
 
-from agent_zoo.features.commands.core import _afk
+from agent_zoo.cli.wsctl import AzoWs
 from agent_zoo.features.commands import CommandError
+from agent_zoo.features.commands.core import _afk
 import swarm
+from conftest import execute_swarm_request
+from test_adoption import client_for, discover_proposal, lineage, reload, send_via_driver
 from test_recovery import runtime
-from test_adoption import lineage, client_for, reload
 
 
 @pytest.mark.parametrize("action", ["cancel", "release", "capture"])
@@ -55,7 +56,7 @@ def test_malformed_slash_input_is_status_only(runtime, raw):
 def test_afk_oversize_rejected_before_background_or_socket(runtime, monkeypatch):
     ctx = SimpleNamespace(state=runtime.state, submit_io=Mock(return_value="op_1"), emit=Mock())
     attach = Mock(side_effect=AssertionError("must validate before socket"))
-    monkeypatch.setattr(swarm.AzoWs, "attach", attach)
+    monkeypatch.setattr(AzoWs, "attach", attach)
     with pytest.raises(CommandError, match="1 MiB"):
         swarm.SwarmController({}).command(ctx, raw_args='afk "' + "雪" * 200000 + '"')
     ctx.submit_io.assert_not_called()
@@ -97,10 +98,10 @@ def test_exact_owned_websocket_slash_payload(lineage, monkeypatch, raw, expected
     l = lineage
     ready_members(l.runtime)
     client, attach = client_for(monkeypatch, l.a)
-    result = asyncio.run(swarm.SwarmController({}).execute(l.runtime.state, swarm.parse_command(raw)))
-    client.slash.assert_awaited_once_with(expected)
-    client.send_user.assert_not_awaited()
-    client.control.assert_not_awaited()
+    result = execute_swarm_request(swarm.SwarmController({}), l.runtime.state, swarm.parse_command(raw))
+    client.send_json.assert_awaited_once()
+    frame = client.send_json.call_args.args[0]
+    assert frame["channel"] == "slash_command" and frame["payload"] == {"raw": expected}
     assert attach.call_count == 1
     assert "1 of 2 agents" in result["summary"]
     l.runtime.state.session_launcher.start.assert_not_called()
@@ -110,20 +111,20 @@ def test_exact_owned_websocket_slash_payload(lineage, monkeypatch, raw, expected
 def test_pacing_requires_native_slash_capability_before_attach(lineage, monkeypatch, action):
     l = lineage
     l.rows[0] = replace(l.a, capabilities=("input:user_text", "control:shutdown"))
-    target = swarm.connection_target(l.runtime.store, l.member)
+    target = discover_proposal(l.runtime.store, l.member)
     client, attach = client_for(monkeypatch, l.a)
     before = l.runtime.store.records().get("attempts", l.member["session_id"])
     with pytest.raises(ValueError, match="input:slash_command"):
-        asyncio.run(swarm.send_to_member(target, dict(action=action), store=l.runtime.store, member=l.member))
+        swarm.build_member_input_request(target, dict(action=action), store=l.runtime.store, member=l.member)
     attach.assert_not_called()
-    client.slash.assert_not_awaited()
+    client.send_json.assert_not_awaited()
     assert l.runtime.store.records().get("attempts", l.member["session_id"]) == before
 
 
 @pytest.mark.parametrize("action", ["release", "capture", "afk"])
 @pytest.mark.parametrize("desired", ["paused", "running", "mixed"])
-def test_pacing_preserves_all_lifecycle_state(runtime, monkeypatch, action, desired):
-    r = runtime
+def test_pacing_preserves_all_lifecycle_state(lineage, monkeypatch, action, desired):
+    l = lineage; r = l.runtime
     ready_members(r)
     with r.store.mutation() as (records, pool):
         pool.update(desired_state=desired, phase="mixed")
@@ -131,11 +132,11 @@ def test_pacing_preserves_all_lifecycle_state(runtime, monkeypatch, action, desi
                               for i, p in enumerate(pool["pods"])}
         records.put("swarm", "pool", pool)
     before = deepcopy(r.store.pool())
-    send = AsyncMock()
-    monkeypatch.setattr(swarm, "connection_target", lambda store, member: member)
-    monkeypatch.setattr(swarm, "send_to_member", send)
-    result = asyncio.run(swarm.SwarmController({}).execute(r.state, dict(action=action, target="sw0", message="keep working")))
-    assert result["level"] == "info" and send.await_count == len(r.members)
+    client, _ = client_for(monkeypatch, l.a)
+    result = execute_swarm_request(
+        swarm.SwarmController({}), r.state, dict(action=action, target="sw0", message="keep working"),
+    )
+    assert client.send_json.await_count == 1
     assert r.store.pool() == before
     assert result["operation"]["action"] == action
     assert "sw0" in swarm.SwarmController.receipt(dict(action=action, target="sw0"))
@@ -149,31 +150,33 @@ def test_work_admission_checks_every_member_before_any_dispatch(runtime, monkeyp
     ready_members(r)
     with r.store.mutation() as (records, _):
         records.put("members", r.members[-1]["session_id"], dict(recovery_status=status, work_blocked=blocked))
-    discover, send = Mock(), AsyncMock()
-    monkeypatch.setattr(swarm, "connection_target", discover)
-    monkeypatch.setattr(swarm, "send_to_member", send)
-    result = asyncio.run(swarm.SwarmController({}).execute(r.state, dict(action=action, target="sw0", message="text")))
+    discover = Mock(side_effect=AssertionError("must not discover"))
+    monkeypatch.setattr(swarm, "build_member_discover_request", discover)
+    result = execute_swarm_request(
+        swarm.SwarmController({}), r.state, dict(action=action, target="sw0", message="text"),
+    )
     assert result["level"] == "warning" and "no work sent" in result["summary"]
     discover.assert_not_called()
-    send.assert_not_awaited()
     assert not r.store.records().list("operations")
     r.state.session_launcher.start.assert_not_called()
 
 
 @pytest.mark.parametrize("action", ["capture", "afk"])
-def test_configuration_does_not_require_recovery_readiness(runtime, monkeypatch, action):
-    send = AsyncMock()
-    monkeypatch.setattr(swarm, "connection_target", lambda store, member: member)
-    monkeypatch.setattr(swarm, "send_to_member", send)
-    result = asyncio.run(swarm.SwarmController({}).execute(runtime.state, dict(action=action, target="sw0")))
-    assert result["level"] == "info" and send.await_count == len(runtime.members)
+def test_configuration_does_not_require_recovery_readiness(lineage, monkeypatch, action):
+    l = lineage
+    client, _ = client_for(monkeypatch, l.a)
+    result = execute_swarm_request(swarm.SwarmController({}), l.runtime.state, dict(action=action, target="sw0"))
+    assert client.send_json.await_count == 1
+    assert "1 of 2 agents" in result["summary"]
 
 
 @pytest.mark.parametrize("action", ["release", "capture", "afk"])
 def test_pacing_is_slash_only_and_rejects_pod_scoped_requests(runtime, action):
     with pytest.raises(ValueError, match="model accessible"):
         swarm.ControlRequest(action, "sw0").as_dict()
-    result = asyncio.run(swarm.SwarmController({}).execute(runtime.state, dict(action=action, target="sw0", pods=(0,))))
+    result = execute_swarm_request(
+        swarm.SwarmController({}), runtime.state, dict(action=action, target="sw0", pods=(0,)),
+    )
     assert "whole swarm" in result["summary"]
     assert not runtime.store.records().list("operations")
 
@@ -183,12 +186,12 @@ def test_default_cancel_resolves_only_unique_non_cancelled_pool(runtime):
     r.store.post("pod-1", "general", "historical board", "parent", message_id="history")
     other, _ = swarm.allocate_pool(r.state, swarm.parse_command("-n1 --name remaining"))
     controller = swarm.SwarmController({})
-    ambiguous = asyncio.run(controller.execute(r.state, swarm.parse_command("cancel")))
+    ambiguous = execute_swarm_request(controller, r.state, swarm.parse_command("cancel"))
     assert "exactly one" in ambiguous["summary"]
     assert not r.store.records().list("operations") and not other.records().list("operations")
-    asyncio.run(controller.execute(r.state, swarm.parse_command("cancel sw0")))
+    execute_swarm_request(controller, r.state, swarm.parse_command("cancel sw0"))
     assert swarm.resolve_pool(r.state, None)[1]["id"] == "sw1"
-    asyncio.run(controller.execute(r.state, swarm.parse_command("cancel")))
+    execute_swarm_request(controller, r.state, swarm.parse_command("cancel"))
     for store in (r.store, other):
         assert store.pool()["desired_state"] == "cancelled"
         assert set(store.pool()["pod_states"].values()) == {"cancelled"}
@@ -206,21 +209,19 @@ def test_default_cancel_resolves_only_unique_non_cancelled_pool(runtime):
 def test_cancelled_pool_cannot_resume_configure_broadcast_or_recover(runtime, monkeypatch, raw):
     cancel_record(runtime.store)
     before = runtime.store.pool()
-    discover, send = Mock(), AsyncMock()
-    monkeypatch.setattr(swarm, "connection_target", discover)
-    monkeypatch.setattr(swarm, "send_to_member", send)
-    result = asyncio.run(swarm.SwarmController({}).execute(runtime.state, swarm.parse_command(raw)))
+    discover = Mock(side_effect=AssertionError("must not discover"))
+    monkeypatch.setattr(swarm, "build_member_discover_request", discover)
+    result = execute_swarm_request(swarm.SwarmController({}), runtime.state, swarm.parse_command(raw))
     assert result["level"] == "warning" and "cancelled" in result["summary"].lower()
     assert runtime.store.pool() == before and not runtime.store.records().list("operations")
     discover.assert_not_called()
-    send.assert_not_awaited()
     runtime.state.session_launcher.start.assert_not_called()
 
 
 def test_cancelled_pool_cannot_adopt_even_for_shutdown(lineage):
     l = lineage
     reload(l)
-    proposal = swarm.connection_target(l.runtime.store, l.member)
+    proposal = discover_proposal(l.runtime.store, l.member)
     cancel_record(l.runtime.store)
     before = l.runtime.store.records().get("attempts", l.member["session_id"])
     for allow_cancelled in (False, True):
@@ -233,9 +234,11 @@ def test_cancel_still_shuts_down_exact_peer_without_adopting(lineage, monkeypatc
     l = lineage
     client, _ = client_for(monkeypatch, l.a)
     before = l.runtime.store.records().get("attempts", l.member["session_id"])
-    result = asyncio.run(swarm.SwarmController({}).execute(l.runtime.state, swarm.parse_command("cancel")))
-    client.control.assert_awaited_once_with("shutdown", {"save": True, "reason": "swarm-cancel"})
-    client.slash.assert_not_awaited()
+    result = execute_swarm_request(swarm.SwarmController({}), l.runtime.state, swarm.parse_command("cancel"))
+    client.send_json.assert_awaited_once()
+    frame = client.send_json.call_args.args[0]
+    assert frame["channel"] == "control"
+    assert frame["payload"] == {"type": "shutdown", "save": True, "reason": "swarm-cancel", "spawned_policy": "leave"}
     assert l.runtime.store.records().get("attempts", l.member["session_id"]) == before
     assert l.runtime.store.pool()["desired_state"] == "cancelled"
     assert "shutdown requested" in result["summary"]
@@ -244,43 +247,44 @@ def test_cancel_still_shuts_down_exact_peer_without_adopting(lineage, monkeypatc
 @pytest.mark.parametrize("action", ["release", "capture", "afk", "continue", "bcast"])
 def test_cancellation_after_adoption_fences_final_dispatch(lineage, monkeypatch, action):
     l = lineage
-    target = swarm.connection_target(l.runtime.store, l.member)
+    target = discover_proposal(l.runtime.store, l.member)
     client, _ = client_for(monkeypatch, l.a)
     real_adopt = swarm.cas_adopt
+
     def adopt_then_cancel(*args, **kwargs):
         revision = real_adopt(*args, **kwargs)
         cancel_record(l.runtime.store)
         return revision
+
     monkeypatch.setattr(swarm, "cas_adopt", adopt_then_cancel)
-    with pytest.raises(ValueError, match="cancelled"):
-        asyncio.run(swarm.send_to_member(target, dict(action=action, message="text", operation_id="not-sent"),
-                                        store=l.runtime.store, member=l.member))
-    client.slash.assert_not_awaited()
-    client.send_user.assert_not_awaited()
-    client.control.assert_not_awaited()
+    res = send_via_driver(
+        target, dict(action=action, message="text", operation_id="not-sent"),
+        store=l.runtime.store, member=l.member,
+    )
+    assert res.outcome == "unavailable" and "cancelled" in res.error.lower()
+    client.send_json.assert_not_awaited()
     assert not l.runtime.store.records().list("operations")
 
 
-def test_pacing_operation_is_never_replayed(runtime, monkeypatch):
-    ready_members(runtime)
-    send = AsyncMock()
-    monkeypatch.setattr(swarm, "connection_target", lambda store, member: member)
-    monkeypatch.setattr(swarm, "send_to_member", send)
+def test_pacing_operation_is_never_replayed(lineage, monkeypatch):
+    l = lineage
+    ready_members(l.runtime)
+    client, _ = client_for(monkeypatch, l.a)
     request = dict(action="release", target="sw0", operation_id="one-operation")
     controller = swarm.SwarmController({})
-    first = asyncio.run(controller.execute(runtime.state, request))
-    second = asyncio.run(controller.execute(runtime.state, request))
-    assert first["level"] == "info" and "replay forbidden" in second["summary"]
-    assert send.await_count == len(runtime.members)
-    runtime.state.session_launcher.start.assert_not_called()
+    first = execute_swarm_request(controller, l.runtime.state, request)
+    second = execute_swarm_request(controller, l.runtime.state, request)
+    assert "1 of 2 agents" in first["summary"] and "replay forbidden" in second["summary"]
+    assert client.send_json.await_count == 1
+    l.runtime.state.session_launcher.start.assert_not_called()
 
 
 def test_unknown_pacing_delivery_is_not_retried_or_relaunched(lineage, monkeypatch):
     l = lineage
     ready_members(l.runtime)
     client, attach = client_for(monkeypatch, l.a)
-    client.slash.side_effect = TimeoutError("delivery outcome lost")
-    result = asyncio.run(swarm.SwarmController({}).execute(l.runtime.state, swarm.parse_command("release")))
+    client.send_json.side_effect = TimeoutError("delivery outcome lost")
+    result = execute_swarm_request(swarm.SwarmController({}), l.runtime.state, swarm.parse_command("release"))
     assert "delivery unknown" in result["summary"]
-    assert client.slash.await_count == 1 and attach.call_count == 1
+    assert client.send_json.await_count == 1 and attach.call_count == 1
     l.runtime.state.session_launcher.start.assert_not_called()

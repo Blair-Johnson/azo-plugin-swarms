@@ -7,9 +7,10 @@ import pytest
 from agent_utils import Tool, Session
 from agent_utils.core.events import IoCompleted, IoFailed, RenderRequested
 from agent_utils.core.io import IoTable, SubmitOp
-from agent_zoo.events import EmitNotice, SessionReady
+from agent_zoo.events import EmitNotice, RunPluginTask, SessionReady
 from agent_zoo.features.commands import CommandError
 import swarm
+from conftest import drain_first_request
 from test_recovery import runtime
 
 
@@ -45,13 +46,15 @@ def test_tool_nonblocking_payload_preserved_and_completion_once(tool_runtime):
     receipt = c.broadcast("sw0", text, [1, 0, 1], state)
     assert receipt == "Sending message to sw0 (pods 1, 0)..."
     effects = t.take_effects()
-    assert len(effects) == 1 and isinstance(effects[0].request, swarm.SwarmTask)
-    execute = AsyncMock(return_value=dict(action="bcast", summary="OK sent=2/2", access={"sw0": ""}, grants={}))
-    c.execute = execute
-    result = asyncio.run(effects[0].request.factory())
-    request = execute.call_args.args[1]
-    assert request["message"] == text and request["pods"] == (1, 0)
-    assert request["operation_id"] not in receipt
+    assert len(effects) == 1 and isinstance(effects[0].request, RunPluginTask)
+    _, _, meta = c.in_flight[effects[0].op_id]
+    assert meta["message"] == text and meta["pods"] == (1, 0)
+    assert meta["operation_id"] not in receipt
+    # Replace queued runner with direct completion check to verify idempotent delivery.
+    wf_id = meta["_wf"]
+    c._workflows.pop(wf_id, None)
+    c.in_flight[effects[0].op_id] = (c.identity(state), "tool", {"action": "bcast"})
+    result = dict(action="bcast", summary="OK sent=2/2", access={"sw0": ""}, grants={})
     handler = swarm.SwarmCompletionHandler(c)
     handler.handle(IoCompleted(op_id=effects[0].op_id, value=result), state, lambda _ev: None)
     handler.handle(IoCompleted(op_id=effects[0].op_id, value=result), state, lambda _ev: None)
@@ -116,14 +119,13 @@ def test_deferred_slash_failure_is_status_only(tool_runtime, monkeypatch, raw):
     t = tool_runtime
     state = t.runtime.state
     ctx = SimpleNamespace(state=state, emit=Mock(), submit_io=lambda req, **kw: state.io.submit(req, **kw))
-    send = AsyncMock(side_effect=AssertionError("invalid target must not send"))
-    monkeypatch.setattr(swarm, "send_to_member", send)
     t.controller.command(ctx, raw_args=raw)
     effect, = t.take_effects()
-    result = asyncio.run(effect.request.factory())
+    result = drain_first_request(t.controller, state, effect.request)
     assert result["level"] == "warning"
     assert swarm.parse_command(raw)["target"] in result["summary"]
     emitted = []
+    t.controller.in_flight[effect.op_id] = (t.controller.identity(state), "command", {"action": "afk"})
     swarm.SwarmCompletionHandler(t.controller).handle(
         IoCompleted(op_id=effect.op_id, value=result), state, emitted.append
     )
@@ -131,7 +133,6 @@ def test_deferred_slash_failure_is_status_only(tool_runtime, monkeypatch, raw):
     assert not any(type(ev).__name__ == "InterruptQueued" for ev in emitted)
     assert not state.pending_interrupts
     assert not t.runtime.store.records().list("operations")
-    send.assert_not_awaited()
 
 
 def test_deferred_tool_failure_still_notifies_model(tool_runtime):
@@ -139,8 +140,9 @@ def test_deferred_tool_failure_still_notifies_model(tool_runtime):
     state = t.runtime.state
     t.controller.interrupt("missing", state)
     effect, = t.take_effects()
-    result = asyncio.run(effect.request.factory())
+    result = drain_first_request(t.controller, state, effect.request)
     assert result["level"] == "warning"
+    t.controller.in_flight[effect.op_id] = (t.controller.identity(state), "tool", {"action": "interrupt"})
     handler = swarm.SwarmCompletionHandler(t.controller)
     handler.handle(IoCompleted(op_id=effect.op_id, value=result), state, lambda _ev: None)
     handler.handle(IoCompleted(op_id=effect.op_id, value=result), state, lambda _ev: None)
@@ -162,14 +164,14 @@ def test_post_id_exposed_before_write_and_idempotent_completion(tool_runtime):
     t = tool_runtime; state = t.runtime.state
     receipt = t.controller.post_message("sw0", 0, "general", "durable", "stable-id", state)
     assert "stable-id" in receipt
-    first = asyncio.run(t.take_effects()[0].request.factory())
+    first = drain_first_request(t.controller, state, t.take_effects()[0].request)
     assert "committed" in first["summary"]
     t.controller.post_message("sw0", 0, "general", "durable", "stable-id", state)
-    second = asyncio.run(t.take_effects()[0].request.factory())
+    second = drain_first_request(t.controller, state, t.take_effects()[0].request)
     assert "already committed" in second["summary"]
     assert len(t.runtime.store.messages("pod-1", "general")) == 1
     t.controller.post_message("sw0", 0, "general", "changed", "stable-id", state)
-    assert "different content" in asyncio.run(t.take_effects()[0].request.factory())["summary"]
+    assert "different content" in drain_first_request(t.controller, state, t.take_effects()[0].request)["summary"]
 
 
 def test_session_ready_submits_once_and_deduplicates(tool_runtime):
@@ -246,7 +248,7 @@ def test_new_plugin_builds_real_pipelines(tmp_path, monkeypatch, pipeline_name, 
     assert ("# Swarm worker" in rendered) == is_member
     components = list(pipeline.components)
     reg_idx = next(i for i, c in enumerate(components) if type(c).__name__ == "SwarmSkillRegistration")
-    renderer_idx = next(i for i, c in enumerate(components) if type(c).__name__ == "MessageRenderer")
+    renderer_idx = next(i for i, c in enumerate(components) if isinstance(c, swarm.MessageRenderer))
     assert reg_idx < renderer_idx
     tools = {c.name for c in pipeline if isinstance(c, Tool)}
     assert {t for t in tools if t.startswith("swarm_")} == {

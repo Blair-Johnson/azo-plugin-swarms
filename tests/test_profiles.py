@@ -9,8 +9,10 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from agent_zoo.features.commands import CommandError
+from agent_zoo.host.launch import Resume
 
 import swarm
+from conftest import drain_first_request, run_swarm_workflow
 from test_recovery import runtime, reserve, seed
 
 
@@ -36,13 +38,27 @@ def launches(runtime, monkeypatch):
     launcher = runtime.state.session_launcher
     launcher.prepare.side_effect = lambda request, **kwargs: SimpleNamespace(
         request=request, ready_file="/offline/ready")
-    launcher.start.return_value = SimpleNamespace(
-        process=SimpleNamespace(pid=100), stdout_path="offline.out", stderr_path="offline.err")
 
-    async def ready(state, store, member, handle):
-        return dict(label=member["label"], session_id=member["session_id"], state="ready_paused")
+    def _start(plan):
+        req = plan.request
+        ready = dict(
+            format_version=1, session_id=req.target.session_id, instance_id=req.target.instance_id,
+            pid=100, process_identity=runtime.identity.to_dict(),
+            websocket_url="ws://127.0.0.1:12000/session", startup_mode="paused", paused=True, revision_id="seed",
+        )
+        return SimpleNamespace(
+            process=SimpleNamespace(pid=100, poll=lambda: None, terminate=lambda: None, kill=lambda: None, wait=lambda timeout=None: 0),
+            ready_file="/offline/ready", stdout_path="offline.out", stderr_path="offline.err",
+            poll=lambda: SimpleNamespace(status="ready", ready=ready),
+        )
 
-    monkeypatch.setattr(swarm, "await_member_ready", ready)
+    launcher.start.side_effect = _start
+    monkeypatch.setattr(
+        swarm, "finalize_member_ready",
+        lambda state, store, member, attempt_id, res, **kw: dict(
+            label=member["label"], session_id=member["session_id"], state="ready_paused",
+        ),
+    )
     return launcher
 
 
@@ -108,7 +124,7 @@ def test_creation_routes_and_saves_profile_without_parent_mutation(runtime, conf
     ctx = SimpleNamespace(state=runtime.state, emit=Mock(), submit_io=Mock(return_value="op_1"))
     controller.command(ctx, raw_args="-n2 -p2" + (f" --profile={PROFILE}" if explicit else ""))
     ctx.submit_io.assert_called_once()
-    result = asyncio.run(ctx.submit_io.call_args.args[0].factory())
+    result = drain_first_request(controller, runtime.state, ctx.submit_io.call_args.args[0])
     assert result["level"] == "info", result["summary"]
     selected = PROFILE if explicit else "offline"
     assert result["pool"]["model_profile"] == selected
@@ -141,7 +157,7 @@ def test_queued_default_selection_is_pinned(runtime, config, launches):
     ctx = SimpleNamespace(state=runtime.state, submit_io=Mock(return_value="op_1"))
     controller.command(ctx, raw_args="-n1")
     config["llm"]["default"] = "other"
-    result = asyncio.run(ctx.submit_io.call_args.args[0].factory())
+    result = drain_first_request(controller, runtime.state, ctx.submit_io.call_args.args[0])
     assert result["pool"]["model_profile"] == "offline"
     assert launches.prepare.call_args.args[0].settings.model == "offline"
     assert config["llm"]["default"] == "other"
@@ -154,7 +170,7 @@ def test_create_revalidates_before_allocation(runtime, config, monkeypatch):
     config["llm"]["models"][PROFILE]["enabled"] = False
     forbidden = Mock(side_effect=AssertionError("must not allocate"))
     monkeypatch.setattr(swarm, "allocate_pool", forbidden)
-    result = asyncio.run(ctx.submit_io.call_args.args[0].factory())
+    result = drain_first_request(controller, runtime.state, ctx.submit_io.call_args.args[0])
     assert result["level"] == "warning" and "disabled" in result["summary"]
     forbidden.assert_not_called()
 
@@ -175,12 +191,13 @@ def test_recovery_uses_saved_selection_over_destination_default(runtime, config,
     runtime.state.settings = original_settings
     before_config = deepcopy(config)
     monkeypatch.setattr(swarm, "process_evidence", lambda _: "dead")
-    result = asyncio.run(swarm.SwarmController(config).recover(runtime.state, runtime.store, {}))
+    ctrl = swarm.SwarmController(config)
+    result = run_swarm_workflow(ctrl, runtime.state, ctrl._wf_recover(runtime.state, runtime.store, {}))
     assert result["level"] == "info", result["summary"]
     requests = [call.args[0] for call in launches.prepare.call_args_list]
     assert len(requests) == 2
     assert all(request.settings == replace(original_settings, model=profile) for request in requests)
-    assert all(isinstance(request.source, swarm.Resume) for request in requests)
+    assert all(isinstance(request.source, Resume) for request in requests)
     assert runtime.state.settings is original_settings
     assert runtime.store.pool()["model_profile"] == profile
     assert config == before_config
@@ -198,7 +215,8 @@ def test_recover_owned_keeps_each_pool_selection_and_legacy_default(runtime, con
                 seed(runtime, member)
     original_settings = runtime.state.settings
     monkeypatch.setattr(swarm, "process_evidence", lambda _: "dead")
-    result = asyncio.run(swarm.SwarmController(config).recover_owned(
+    ctrl = swarm.SwarmController(config)
+    result = run_swarm_workflow(ctrl, runtime.state, ctrl._wf_recover_owned(
         runtime.state, stores=[(store.pool()["id"], store, None) for store in stores]))
     assert "blocked" not in result["summary"], result["summary"]
     selected = {call.args[0].kind: call.args[0].settings.model for call in launches.prepare.call_args_list}
@@ -222,9 +240,10 @@ def test_missing_or_disabled_destination_fails_before_ownership_claim(runtime, c
     before, grants = runtime.store.pool(), deepcopy(runtime.state.grants)
     claim = Mock(side_effect=AssertionError("must not claim ownership"))
     monkeypatch.setattr(swarm, "claim_recovery", claim)
+    ctrl = swarm.SwarmController(config)
     with pytest.raises(ValueError, match="Unknown swarm model profile|disabled"):
-        asyncio.run(swarm.SwarmController(config).recover(runtime.state, runtime.store,
-                    dict(expected_epoch=1, confirmed_stopped=True)))
+        run_swarm_workflow(ctrl, runtime.state, ctrl._wf_recover(
+            runtime.state, runtime.store, dict(expected_epoch=1, confirmed_stopped=True)))
     claim.assert_not_called()
     assert runtime.store.pool() == before
     assert runtime.state.grants == grants
@@ -243,13 +262,20 @@ def test_missing_destination_profile_does_not_block_live_successor_interrupt(run
     before = runtime.store.pool()
     runtime.state._instance_id = "successor"
     runtime.state.grants = {}
-    monkeypatch.setattr(swarm, "owner_replaced", lambda state, pool: True)
+    monkeypatch.setattr(swarm, "owner_replaced_from_discovery", lambda state, discovered: True)
     monkeypatch.setattr(swarm, "process_evidence", lambda _: "alive")
     controller = swarm.SwarmController({})
-    controller.control = AsyncMock(return_value=dict(summary="pause requested", level="info"))
-    result = asyncio.run(controller.recover(runtime.state, runtime.store, {}))
+    control_calls = []
+
+    def fake_control(st, req, *, store=None):
+        control_calls.append(req)
+        return dict(summary="pause requested", level="info")
+        yield  # pragma: no cover
+
+    controller._wf_control = fake_control
+    result = run_swarm_workflow(controller, runtime.state, controller._wf_recover(runtime.state, runtime.store, {}))
     assert "pause requested" in result["summary"]
-    assert controller.control.call_args.args[1]["action"] == "interrupt"
+    assert control_calls[0]["action"] == "interrupt"
     after = runtime.store.pool()
     assert after["owner"]["epoch"] == before["owner"]["epoch"]
     assert after["owner"]["token"] == before["owner"]["token"]

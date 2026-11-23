@@ -21,7 +21,7 @@ def parse_only(tmp_path, monkeypatch):
         calls.append((args, kwargs))
         raise AssertionError("parse_command must not perform runtime/storage operations")
 
-    for attribute in ("store_for", "allowed_store", "launch_member", "SwarmStore", "RecordStore"):
+    for attribute in ("store_for", "allowed_store", "reserve_member_launch", "SwarmStore", "RecordStore"):
         monkeypatch.setattr(swarm, attribute, forbidden)
     monkeypatch.setattr(subprocess, "Popen", forbidden)
     monkeypatch.setattr(sqlite3, "connect", forbidden)

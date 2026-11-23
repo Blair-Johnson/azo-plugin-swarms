@@ -10,6 +10,7 @@ from agent_utils.core.events import BeforeLLM, RunToolCall
 from agent_utils.features.buffers import BufferManager
 from agent_utils.storage.repository import SessionRepository
 from agent_utils.storage.serialization import capture_session_document
+from agent_zoo.drivers.plugin_task import PluginTaskDriver
 from agent_zoo.events import SessionReady
 from agent_zoo.features.special_buffers import special_buffers_feature
 from agent_zoo.features.turn import turn_orchestration_feature
@@ -94,7 +95,7 @@ def host_runtime(r, monkeypatch, *, sid, iid, checkpoint=None):
                     WorkCounter,
                     swarm.InterruptDelivery,
                 ],
-                drivers=[swarm.SwarmDriver],
+                drivers=[swarm.make_swarm_session_driver, PluginTaskDriver],
             )
         )
         .build()
@@ -146,8 +147,11 @@ def host_runtime(r, monkeypatch, *, sid, iid, checkpoint=None):
         )
         revision_id = commit.commit_id
 
-    driver = swarm.SwarmDriver()
-    rt = Runtime(session, drivers=[driver])
+    driver = swarm.make_swarm_session_driver(
+        launcher=r.state.session_launcher,
+        store_root=str(r.tmp / "registry"),
+    )
+    rt = Runtime(session, drivers=[driver, PluginTaskDriver()])
     rt.start()
     rt.post(
         SessionReady(

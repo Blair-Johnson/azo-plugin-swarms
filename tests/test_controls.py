@@ -1,20 +1,19 @@
-"""Controller regression coverage under v2 ownership and typed requests."""
-import asyncio
-from copy import deepcopy
-import threading
+"""Controller regression coverage under v2 ownership, typed requests, and AgentZooSessionDriver."""
 from types import SimpleNamespace
 from unittest.mock import Mock
 import pytest
-from agent_zoo.features.commands import Command, CommandRegistry, CommandError
+from agent_zoo.events import RunPluginTask
+from agent_zoo.features.commands import Command, CommandError, CommandRegistry
 import swarm
+from conftest import execute_swarm_request
+from test_adoption import client_for, lineage
 from test_recovery import runtime
-from test_adoption import lineage, client_for
 
 
 def test_registration_exposes_one_raw_user_command_without_work(monkeypatch):
     features = []
     forbidden = Mock(side_effect=AssertionError("registration must not do work"))
-    for attribute in ("allocate_pool", "resolve_pool", "launch_member", "store_for"):
+    for attribute in ("allocate_pool", "resolve_pool", "reserve_member_launch", "store_for"):
         monkeypatch.setattr(swarm, attribute, forbidden)
     swarm.register_features(SimpleNamespace(add=features.append), session=SimpleNamespace(), config={})
     commands = [c for f in features for c in f.components if isinstance(c, Command)]
@@ -22,7 +21,7 @@ def test_registration_exposes_one_raw_user_command_without_work(monkeypatch):
     assert command.path == "/swarm" and command.raw and not command.args
     assert not command.cancels_lifecycle
     raw = '  bcast sw0 -p 0 "  first\n\t\u96ea last  "  '
-    assert CommandRegistry(commands).parse("/swarm"+raw).arguments == {"raw_args": raw}
+    assert CommandRegistry(commands).parse("/swarm" + raw).arguments == {"raw_args": raw}
     forbidden.assert_not_called()
 
 
@@ -44,15 +43,17 @@ def test_valid_slash_control_uses_detached_shared_request(runtime):
     c.command(ctx, raw_args='bcast sw0 -p 0 "  first\nlast  "')
     assert ctx.submit_io.call_count == 1
     task = ctx.submit_io.call_args.args[0]
-    assert isinstance(task, swarm.SwarmTask)
-    from unittest.mock import AsyncMock
-    c.execute = AsyncMock(return_value={})
+    assert isinstance(task, RunPluginTask)
+    _, _, meta = c.in_flight["op_1"]
+    assert meta["message"] == "  first\nlast  " and meta["pods"] == (0,)
+    assert meta["operation_id"]
+    # Mutating live state after command() does not affect the detached snapshot captured in the workflow.
+    with r.store.mutation() as (records, _):
+        for member in r.members:
+            records.put("members", member["session_id"], dict(recovery_status="ready_paused"))
     r.state._agent_zoo_context["project_name"] = "changed"
-    asyncio.run(task.factory())
-    snapshot, request = c.execute.call_args.args
-    assert snapshot is not r.state and snapshot._agent_zoo_context["project_name"] == "test"
-    assert request["message"] == "  first\nlast  " and request["pods"] == (0,)
-    assert request["operation_id"]
+    store, pool, members, op = task.fn()
+    assert pool["id"] == "sw0" and len(members) == 1 and op["pods"] == (0,)
 
 
 def test_allocation_unique_names_stable_ids_and_balanced_topology(runtime):
@@ -73,7 +74,7 @@ def test_forged_saved_parent_binding_does_not_authorize_controls(runtime, actor)
     state = SimpleNamespace(**vars(r.state))
     state._session_id = r.members[0]["session_id"] if actor == "peer" else actor
     state.swarm_access = {"sw0": ""}
-    result = asyncio.run(swarm.SwarmController({}).execute(state, swarm.ControlRequest("interrupt", "sw0")))
+    result = execute_swarm_request(swarm.SwarmController({}), state, swarm.ControlRequest("interrupt", "sw0"))
     assert result["summary"].startswith("sw0:") and result["level"] == "warning"
     assert r.store.records().list("operations") == []
 
@@ -81,9 +82,8 @@ def test_forged_saved_parent_binding_does_not_authorize_controls(runtime, actor)
 def test_same_session_new_instance_cannot_reuse_grant(runtime):
     r = runtime
     state = SimpleNamespace(**vars(r.state)); state._instance_id = "foreign-copy"
-    # A grant is pinned to the actor runtime, not just the store epoch/token.
     state.grants = {"sw0": dict(r.store.grant, instance_id=state._instance_id)}
-    result = asyncio.run(swarm.SwarmController({}).execute(state, swarm.ControlRequest("interrupt", "sw0")))
+    result = execute_swarm_request(swarm.SwarmController({}), state, swarm.ControlRequest("interrupt", "sw0"))
     assert "Stale owner instance" in result["summary"]
     assert not r.store.records().list("operations")
 
@@ -96,17 +96,19 @@ def test_all_controls_report_partial_outcomes_and_durable_opid(lineage, monkeypa
             records.put("members", member["session_id"], dict(recovery_status="ready_paused"))
     client, _ = client_for(monkeypatch, l.a)
     request = swarm.ControlRequest(action, "sw0", message="text")
-    result = asyncio.run(swarm.SwarmController({}).execute(r.state, request))
+    result = execute_swarm_request(swarm.SwarmController({}), r.state, request)
     assert "1 of 2 agents" in result["summary"] and "1 unavailable" in result["summary"]
     operation = r.store.records().get("operations", request.operation_id)
     assert operation["epoch"] == 1 and len(operation["outcomes"]) == 2
+    client.send_json.assert_awaited_once()
+    frame = client.send_json.call_args.args[0]
     if action == "bcast":
-        client.send_user.assert_awaited_once()
+        assert frame["channel"] == "user_text" and frame["payload"] == {"text": "text"}
     elif action == "cancel":
-        client.control.assert_awaited_once()
+        assert frame["channel"] == "control" and frame["payload"]["type"] == "shutdown"
         assert r.store.pool()["desired_state"] == "cancelled" and "shutdown requested" in result["summary"]
     else:
-        client.slash.assert_awaited_once_with("/"+action)
+        assert frame["channel"] == "slash_command" and frame["payload"] == {"raw": "/" + action}
 
 
 def test_cancelled_pool_stays_terminal_and_not_default(runtime):
@@ -115,33 +117,18 @@ def test_cancelled_pool_stays_terminal_and_not_default(runtime):
         pool.update(desired_state="cancelled", phase="cancelled"); records.put("swarm", "pool", pool)
     with pytest.raises(ValueError):
         swarm.resolve_pool(r.state, None)
-    result = asyncio.run(swarm.SwarmController({}).execute(r.state, swarm.ControlRequest("continue", "sw0")))
+    result = execute_swarm_request(swarm.SwarmController({}), r.state, swarm.ControlRequest("continue", "sw0"))
     assert "cancelled" in result["summary"] and not r.store.records().list("operations")
 
 
 def test_control_preflight_refuses_incomplete_recovery(runtime):
     r = runtime
-    result = asyncio.run(swarm.SwarmController({}).execute(r.state, swarm.ControlRequest("continue", "sw0")))
+    result = execute_swarm_request(swarm.SwarmController({}), r.state, swarm.ControlRequest("continue", "sw0"))
     assert "incomplete" in result["summary"] and "no work sent" in result["summary"]
     assert not r.store.records().list("operations")
 
 
-def test_blocking_waits_for_thread_cleanup_when_cancelled():
-    async def scenario():
-        started, release, cleaned = threading.Event(), threading.Event(), threading.Event()
-        def work():
-            started.set()
-            try:
-                assert release.wait(5)
-            finally:
-                cleaned.set()
-        task = asyncio.create_task(swarm.blocking(work))
-        while not started.is_set():
-            await asyncio.sleep(.001)
-        task.cancel(); await asyncio.sleep(.01)
-        assert not task.done() and not cleaned.is_set()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, 2)
-        assert cleaned.is_set()
-    asyncio.run(scenario())
+def test_swarm_lock_fence_registered_on_session_driver():
+    driver = swarm.make_swarm_session_driver()
+    assert swarm.SWARM_LOCK_FENCE_NAME in driver._lock_fences
+    assert isinstance(driver._lock_fences[swarm.SWARM_LOCK_FENCE_NAME], swarm.SwarmLockFenceAdapter)

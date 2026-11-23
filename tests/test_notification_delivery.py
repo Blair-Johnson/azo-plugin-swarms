@@ -7,9 +7,11 @@ import pytest
 from agent_utils import Entry, PipelineBuilder, Session, core_feature, interrupts_feature
 from agent_utils.core.events import IoCompleted
 from agent_utils.core.io import IoTable
+from agent_zoo.events import RunPluginTask
 from agent_zoo.features.projection.transcript import entry_to_items
 from agent_zoo.llm.providers.openai_responses import _extract_system, _messages_to_responses_input
 import swarm
+from conftest import run_swarm_workflow
 
 
 @pytest.mark.parametrize("action", ["create", "bcast", "interrupt", "continue", "cancel"])
@@ -48,7 +50,7 @@ def test_parent_completion_reaches_model_as_system_generated_user(action):
     if action == "bcast":
         result.update(pool={"id": "sw1"}, operation=dict(
             action="bcast", message=text, outcomes=[{"label": "sw1p0a0"}]))
-    op_id = session.state.io.submit(swarm.SwarmTask(factory=lambda: None, action=action), tag="swarm")
+    op_id = session.state.io.submit(RunPluginTask(fn=lambda: None), tag="swarm")
     controller.in_flight[op_id] = (controller.identity(session.state), "command", {"action": action})
     session.step(IoCompleted(op_id=op_id, value=result))
     session.render()
@@ -82,8 +84,15 @@ def test_repeated_restore_skips_cancelled_pool_but_preserves_other_notices(other
                                 _instance_id=instance, swarm_access={}, grants={},
                                 pending_interrupts=[], io=IoTable())
         controller = swarm.SwarmController({})
-        controller.recover = AsyncMock(return_value=dict(summary="sw1: 2 agents restored (paused)."))
-        result = asyncio.run(controller.recover_owned(state, stores=stores))
+        recover_calls = []
+
+        def fake_recover(st, store, req):
+            recover_calls.append((st, store, req))
+            return dict(summary="sw1: 2 agents restored (paused).")
+            yield  # pragma: no cover
+
+        controller._wf_recover = fake_recover
+        result = run_swarm_workflow(controller, state, controller._wf_recover_owned(state, stores=stores))
         controller.in_flight["op_restore"] = (controller.identity(state), "startup", {})
         swarm.SwarmCompletionHandler(controller).handle(
             IoCompleted(op_id="op_restore", value=result), state, lambda _ev: None
@@ -91,11 +100,11 @@ def test_repeated_restore_skips_cancelled_pool_but_preserves_other_notices(other
         assert not any("sw0" in notice for notice in state.pending_interrupts)
         assert state.swarm_access["sw0"] == ""  # Retain inspection access.
         if other == "active":
-            controller.recover.assert_awaited_once_with(state, active, {})
+            assert recover_calls == [(state, active, {})]
             assert state.pending_interrupts == ["sw1: 2 agents restored (paused)."]
         elif other == "error":
-            controller.recover.assert_not_awaited()
+            assert not recover_calls
             assert "sw1: recovery blocked: missing journal" in state.pending_interrupts[0]
         else:
-            controller.recover.assert_not_awaited()
+            assert not recover_calls
             assert result["summary"] == "" and state.pending_interrupts == []

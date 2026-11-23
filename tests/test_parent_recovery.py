@@ -7,6 +7,7 @@ import pytest
 from agent_utils.features.buffers import BufferManager
 from agent_zoo.events import SessionReady
 import swarm
+from conftest import run_swarm_workflow
 from test_recovery import runtime, reserve
 
 
@@ -70,22 +71,23 @@ def test_proven_parent_successor_reattaches_children_without_epoch_rotation(runt
     child_store = swarm.SwarmStore(r.store.durable, r.store.cache, grant=child_grant)
     r.state._instance_id = "proven-successor"
     r.state.grants = {}
-    monkeypatch.setattr(swarm, "owner_replaced", lambda state, pool: True)
+    monkeypatch.setattr(swarm, "owner_replaced_from_discovery", lambda state, discovered: True)
     monkeypatch.setattr(swarm, "process_evidence", lambda _: "alive")
     controller = swarm.SwarmController({})
     calls = []
 
-    async def no_launch(*args, **kwargs):
+    def no_launch(*args, **kwargs):
         pytest.fail("Verified parent replacement must not relaunch live children")
 
-    async def interrupt(state, request):
+    def interrupt(state, request, *, store=None):
         calls.append(deepcopy(request))
         assert request["action"] == "interrupt" and request["target"] == before["id"]
         return dict(summary="sent=2; pause requested", level="info")
+        yield  # pragma: no cover
 
-    monkeypatch.setattr(controller, "launch_members", no_launch)
-    monkeypatch.setattr(controller, "control", interrupt)
-    result = asyncio.run(controller.recover(r.state, r.store, {}))
+    monkeypatch.setattr(controller, "_wf_launch_members", no_launch)
+    monkeypatch.setattr(controller, "_wf_control", interrupt)
+    result = run_swarm_workflow(controller, r.state, controller._wf_recover(r.state, r.store, {}))
     after = r.store.pool()
     assert calls and "pause requested" in result["summary"]
     assert after["owner"]["epoch"] == before["owner"]["epoch"]

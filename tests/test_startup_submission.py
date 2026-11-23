@@ -1,4 +1,4 @@
-"""Startup submission across the real SwarmDriver background loop boundary; no providers."""
+"""Startup submission across the real AgentZooSessionDriver + PluginTaskDriver boundary; no providers."""
 import logging
 import threading
 import time
@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 from agent_utils import Feature, PipelineBuilder, Runtime, Session, core_feature, interrupts_feature
 from agent_utils.core.events import BeforeLLM, IoCompleted
+from agent_zoo.drivers.plugin_task import PluginTaskDriver
 from agent_zoo.events import SessionReady
 
 import swarm
@@ -48,7 +49,7 @@ def startup_runtime(tmp_path, monkeypatch):
                     swarm.SwarmCompletionHandler,
                     swarm.InterruptDelivery,
                 ],
-                drivers=[swarm.SwarmDriver],
+                drivers=[swarm.make_swarm_session_driver, PluginTaskDriver],
             )
         )
         .build()
@@ -64,17 +65,17 @@ def startup_runtime(tmp_path, monkeypatch):
     state.swarm_access = {}
     state.swarm_resource_uids = {}
 
-    driver = swarm.SwarmDriver()
-    runtime = Runtime(session, drivers=[driver])
+    driver = swarm.make_swarm_session_driver()
+    runtime = Runtime(session, drivers=[driver, PluginTaskDriver()])
     threads = []
     result = dict(summary="startup completed once", access={"sw0": ""}, grants={})
 
-    async def startup(snapshot, event):
+    def startup(snapshot, event):
         threads.append(threading.get_ident())
         return result
 
     factory = Mock(side_effect=startup)
-    monkeypatch.setattr(controller, "startup", factory)
+    monkeypatch.setattr(controller, "startup", factory, raising=False)
     apply = Mock(wraps=controller.apply)
     monkeypatch.setattr(controller, "apply", apply)
     event = SessionReady(
@@ -158,7 +159,7 @@ def test_real_background_future_failure_is_logged_not_retried(startup_runtime, c
     r = startup_runtime
     caplog.set_level(logging.WARNING, logger="swarm")
 
-    async def fail(snapshot, event):
+    def fail(snapshot, event):
         raise RuntimeError("startup future failed")
 
     r.factory.side_effect = fail
