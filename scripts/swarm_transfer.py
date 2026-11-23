@@ -28,9 +28,9 @@ import time
 import uuid
 import zipfile
 
-from agent_zoo import projects
-from agent_zoo.session_archive import export_sessions, import_sessions
-from agent_zoo.live_session_registry import list_live_sessions
+from agent_zoo.storage import projects
+from agent_zoo.storage.archive import export_sessions, import_sessions
+from agent_zoo.host.registry import list_live_sessions
 from tmux_pilot.atomic_publication import rename_exclusive
 from tmux_pilot.fs_store import RecordStore, file_lock
 from tmux_pilot.process_identity import ObservationState, ProcessIdentity, observe_process

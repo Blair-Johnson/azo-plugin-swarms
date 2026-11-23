@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from agent_zoo.runtime.commands import CommandError
+from agent_zoo.features.commands import CommandError
 import swarm
 from test_profiles import PROFILE, config, launches
 from test_recovery import runtime
@@ -29,11 +29,11 @@ def settings_file():
 def test_default_precedence_and_persistence(runtime, config, launches, settings_file, settings, explicit, expected):
     settings_file.write_text(json.dumps(settings))
     original = deepcopy(config)
-    ctx = SimpleNamespace(state=runtime.state, defer=Mock())
+    ctx = SimpleNamespace(state=runtime.state, submit_io=Mock(return_value="op_1"))
     controller = swarm.SwarmController(config)
     controller.command(ctx, raw_args="-n2" + (f" --profile {explicit}" if explicit else ""))
     settings_file.write_text('{"default_profile":"other"}')
-    result = asyncio.run(ctx.defer.call_args.args[0]())
+    result = asyncio.run(ctx.submit_io.call_args.args[0].factory())
     assert result["level"] == "info", result["summary"]
     assert result["pool"]["model_profile"] == expected
     assert swarm.store_for(runtime.state, result["pool"]["id"]).pool()["model_profile"] == expected
@@ -46,11 +46,11 @@ def test_default_precedence_and_persistence(runtime, config, launches, settings_
     '{"default_profile":[]}'])
 def test_invalid_json_config_is_status_only(runtime, config, settings_file, text):
     settings_file.write_text(text)
-    ctx = SimpleNamespace(state=runtime.state, defer=Mock(), session=SimpleNamespace(inject=Mock()))
+    ctx = SimpleNamespace(state=runtime.state, submit_io=Mock(return_value="op_1"), emit=Mock())
     with pytest.raises(CommandError, match="swarm config|default_profile|Swarm config"):
         swarm.SwarmController(config).command(ctx, raw_args="-n2")
-    ctx.defer.assert_not_called()
-    ctx.session.inject.assert_not_called()
+    ctx.submit_io.assert_not_called()
+    ctx.emit.assert_not_called()
     runtime.state.session_launcher.prepare.assert_not_called()
 
 
@@ -59,10 +59,10 @@ def test_unknown_or_disabled_default_rejected_before_defer(runtime, config, sett
     settings_file.write_text(json.dumps({"default_profile": PROFILE if disabled else "missing"}))
     if disabled:
         config["llm"]["models"][PROFILE]["enabled"] = False
-    ctx = SimpleNamespace(state=runtime.state, defer=Mock())
+    ctx = SimpleNamespace(state=runtime.state, submit_io=Mock(return_value="op_1"))
     with pytest.raises(CommandError, match="enabled saved model profile|disabled"):
         swarm.SwarmController(config).command(ctx, raw_args="-n1")
-    ctx.defer.assert_not_called()
+    ctx.submit_io.assert_not_called()
 
 
 @pytest.mark.parametrize("raw", [f"-n1 --profile {PROFILE}", "cancel", "interrupt sw0", "continue sw0",
@@ -70,9 +70,9 @@ def test_unknown_or_disabled_default_rejected_before_defer(runtime, config, sett
 def test_explicit_profile_and_lifecycle_skip_config(runtime, config, monkeypatch, raw):
     reader = Mock(side_effect=AssertionError("Unexpected default-config read"))
     monkeypatch.setattr(swarm, "load_default_profile", reader)
-    ctx = SimpleNamespace(state=runtime.state, defer=Mock())
+    ctx = SimpleNamespace(state=runtime.state, submit_io=Mock(return_value="op_1"))
     swarm.SwarmController(config).command(ctx, raw_args=raw)
-    ctx.defer.assert_called_once()
+    ctx.submit_io.assert_called_once()
     reader.assert_not_called()
 
 
@@ -112,17 +112,16 @@ def test_unreadable_installed_config_does_not_silently_fall_back(settings_file, 
 
 def settings_registry(config):
     from agent_utils import PipelineBuilder, Session
-    from agent_utils.builder import flatten
-    from agent_zoo.runtime.settings import Setting, SettingsContext, SettingsRegistry
+    from agent_zoo.features.settings import Setting, SettingsContext, SettingsRegistry
 
     session = Session()
     features = []
     swarm.register_features(SimpleNamespace(add=features.append), session=session, config=config)
     feature = next(feature for feature in features if feature.name == "swarm_settings")
-    session.pipeline = PipelineBuilder(session).add(feature).build()
+    session.pipeline = PipelineBuilder().add(feature).build()
     session.ensure_initialized()
-    registry = SettingsRegistry([item for item in flatten(session.pipeline) if isinstance(item, Setting)])
-    return registry, SettingsContext(session)
+    registry = SettingsRegistry([item for item in session.pipeline if isinstance(item, Setting)])
+    return registry, SettingsContext(state=session.state, emit=lambda _ev: None, config=config)
 
 
 def settings_request(registry, ctx, value=None):
@@ -155,7 +154,7 @@ def test_setting_persists_without_mutating_session_or_existing_pool(runtime, con
     # A new session/pipeline sees the persisted choice, not its own active model.
     config["llm"]["default"] = "offline"
     fresh_registry, fresh_ctx = settings_registry(config)
-    assert fresh_ctx.session is not ctx.session
+    assert fresh_ctx.state is not ctx.state
     assert settings_request(fresh_registry, fresh_ctx)["settings"][0]["value"] == "other"
 
 
@@ -173,9 +172,9 @@ def test_saved_global_fallback_ignores_session_overrides(runtime, config, launch
         config["_runtime_launch"]["config_path"] = str(swarm.CONFIG_PATH)
     registry, ctx = settings_registry(config)
     assert settings_request(registry, ctx)["settings"][0]["value"] == expected
-    launch_ctx = SimpleNamespace(state=runtime.state, defer=Mock())
+    launch_ctx = SimpleNamespace(state=runtime.state, submit_io=Mock(return_value="op_1"))
     swarm.SwarmController(config).command(launch_ctx, raw_args="-n1")
-    result = asyncio.run(launch_ctx.defer.call_args.args[0]())
+    result = asyncio.run(launch_ctx.submit_io.call_args.args[0].factory())
     assert result["pool"]["model_profile"] == expected
     assert launches.prepare.call_args.args[0].settings.model == expected
     assert config["llm"]["default"] == PROFILE
@@ -226,7 +225,7 @@ def test_disabled_profiles_and_cli_only_profiles_are_not_choices(config):
     config["llm"]["models"]["transient-only"] = {"enabled": True}
     registry, ctx = settings_registry(config)
     assert settings_request(registry, ctx)["settings"][0]["choices"] == ["offline"]
-    from agent_zoo.runtime.settings import SettingError
+    from agent_zoo.features.settings import SettingError
     with pytest.raises(SettingError, match="enabled saved"):
         swarm.save_default_profile(config, PROFILE)
     assert not swarm.swarm_config_path().exists()

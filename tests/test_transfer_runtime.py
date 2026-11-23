@@ -3,7 +3,7 @@ from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
-from agent_zoo import projects
+from agent_zoo.storage import projects
 from tmux_pilot.fs_store import RecordStore
 
 import swarm

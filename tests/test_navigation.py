@@ -5,8 +5,8 @@ import json
 import uuid
 
 import pytest
-from agent_utils.files.buffer_manager import BufferManager
-from agent_utils.session_repository import SessionRepository
+from agent_utils.features.buffers import BufferManager
+from agent_utils.storage.repository import SessionRepository
 import swarm
 from test_recovery import runtime, seed
 
@@ -14,7 +14,7 @@ from test_recovery import runtime, seed
 @pytest.fixture
 def navigation(runtime):
     runtime.state.buffer_manager = BufferManager()
-    swarm.SwarmBuffers()(runtime.state)
+    swarm.SwarmBuffers().register(runtime.state)
     return runtime
 
 

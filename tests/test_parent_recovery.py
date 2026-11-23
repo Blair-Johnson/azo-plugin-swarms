@@ -4,16 +4,22 @@ from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
-from agent_utils.files.buffer_manager import BufferManager
+from agent_utils.features.buffers import BufferManager
+from agent_zoo.events import SessionReady
 import swarm
 from test_recovery import runtime, reserve
 
 
 def notify(state, controller):
-    event = SimpleNamespace(payload=dict(session_id=state._session_id,
-        instance_id=state._instance_id, restored=True, revision_id="saved",
-        startup_mode="normal", paused=False))
-    swarm.SwarmRuntimeReady(controller).handle_harness_event(event, state)
+    event = SessionReady(
+        session_id=state._session_id,
+        instance_id=state._instance_id,
+        restored=True,
+        revision_id="saved",
+        startup_mode="normal",
+        paused=False,
+    )
+    swarm.SwarmRuntimeReady(controller).handle(event, state, lambda _ev: None)
     return event
 
 
@@ -25,13 +31,15 @@ def test_parent_pauses_before_first_restored_work_pass(runtime, saved_access):
     if not saved_access:
         state.swarm_access = {}
     state._runtime_startup_paused = False
+    state.startup_paused = False
     state.buffer_manager = BufferManager()
     controller = swarm.SwarmController({})
     notify(state, controller)
-    assert state._runtime_startup_paused is True
+    assert state._runtime_startup_paused is True and state.startup_paused is True
     assert state.buffer_manager.special_buffer_namespaces() == ["swarm:"]
-    assert len(controller.ready_events) == 1
-    assert controller.ready_events[0][0]["paused"] is True
+    assert len(controller.in_flight) == 1
+    _, source_kind, payload = next(iter(controller.in_flight.values()))
+    assert source_kind == "startup" and payload["paused"] is True
     state.session_launcher.start.assert_not_called()
 
 
@@ -42,12 +50,13 @@ def test_unrelated_restored_session_hold_can_be_released(runtime):
     state.swarm_access = {}
     state.grants = {}
     state._runtime_startup_paused = False
+    state.startup_paused = False
     state.buffer_manager = BufferManager()
     controller = swarm.SwarmController({})
     notify(state, controller)
-    assert state._runtime_startup_paused is True
+    assert state._runtime_startup_paused is True and state.startup_paused is True
     controller.apply(state, {"release_startup_hold": True})
-    assert state._runtime_startup_paused is False
+    assert state._runtime_startup_paused is False and state.startup_paused is False
 
 
 def test_proven_parent_successor_reattaches_children_without_epoch_rotation(runtime, monkeypatch):

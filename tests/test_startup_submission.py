@@ -1,4 +1,4 @@
-"""Startup submission across the real websocket thread boundary; no providers."""
+"""Startup submission across the real SwarmDriver background loop boundary; no providers."""
 import logging
 import threading
 import time
@@ -6,36 +6,66 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from agent_utils import Session
-from agent_zoo.session_io import SessionIO
-from agent_zoo.session_websocket import SessionWebSocketServer
+from agent_utils import Feature, PipelineBuilder, Runtime, Session, core_feature, interrupts_feature
+from agent_utils.core.events import BeforeLLM, IoCompleted
+from agent_zoo.events import SessionReady
 
 import swarm
 
 
-@pytest.fixture
-def startup_runtime(tmp_path, monkeypatch):
-    session = Session(system_prompt="offline startup submission")
-    controller = swarm.SwarmController({}, session)
-    work = []
+class _NoModelWork:
+    handles = (BeforeLLM,)
 
-    def model_work(state):
-        work.append("model/tool pipeline")
+    def __init__(self, work):
+        self.work = work
+
+    def handle(self, event, state, emit):
+        self.work.append("model/tool pipeline")
         raise AssertionError("paused startup must not run model/tool work")
 
-    session.pipeline = [model_work, swarm.SwarmCompletionCheck(controller)]
+
+@pytest.fixture
+def startup_runtime(tmp_path, monkeypatch):
+    session = Session(system_prompt="offline startup submission", cwd=str(tmp_path))
+    controller = swarm.SwarmController({}, session)
+    work = []
+    pipeline = (
+        PipelineBuilder()
+        .add(core_feature())
+        .add(interrupts_feature())
+        .add(
+            Feature(
+                "swarm_startup_test",
+                components=[
+                    _NoModelWork(work),
+                    swarm.SwarmRuntimeReady(controller),
+                    swarm.SwarmCompletionHandler(controller),
+                ],
+                order=[
+                    swarm.IoFence,
+                    _NoModelWork,
+                    swarm.SwarmRuntimeReady,
+                    swarm.SwarmCompletionHandler,
+                    swarm.InterruptDelivery,
+                ],
+                drivers=[swarm.SwarmDriver],
+            )
+        )
+        .build()
+    )
+    session.pipeline = pipeline
     session.ensure_initialized()
     state = session.state
     state._session_id = "startup-session"
     state._instance_id = "startup-instance"
     state._runtime_startup_paused = True
-    state.session_cwd = str(tmp_path)
+    state.startup_paused = True
     state._agent_zoo_context = {}
     state.swarm_access = {}
     state.swarm_resource_uids = {}
-    server = SessionWebSocketServer(SessionIO(session_id=state._session_id),
-                                    instance_id=state._instance_id)
-    state._session_websocket_server = server
+
+    driver = swarm.SwarmDriver()
+    runtime = Runtime(session, drivers=[driver])
     threads = []
     result = dict(summary="startup completed once", access={"sw0": ""}, grants={})
 
@@ -47,104 +77,78 @@ def startup_runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(controller, "startup", factory)
     apply = Mock(wraps=controller.apply)
     monkeypatch.setattr(controller, "apply", apply)
-    event = SimpleNamespace(kind="runtime.session_ready", payload=dict(
-        session_id=state._session_id, instance_id=state._instance_id,
-        restored=False, paused=True, startup_mode="paused", revision_id="seed"))
-    swarm.SwarmRuntimeReady(controller).handle_harness_event(event, state)
+    event = SessionReady(
+        session_id=state._session_id,
+        instance_id=state._instance_id,
+        restored=False,
+        paused=True,
+        startup_mode="paused",
+        revision_id="seed",
+    )
     entries = list(state.entries)
 
-    def poll():
-        assert session.poll_interrupts(deliver=False) is False
-        assert state._runtime_startup_paused is True
-        assert state.entries == entries
-        assert work == []
+    def drain_until(predicate, *, timeout_s=5.0):
+        deadline = time.monotonic() + timeout_s
+        while not predicate():
+            runtime.step_once(timeout=0.02)
+            assert state._runtime_startup_paused is True
+            assert state.entries == entries
+            assert work == []
+            assert time.monotonic() < deadline, "background startup did not finish"
 
-    runtime = SimpleNamespace(session=session, state=state, controller=controller,
-                              server=server, factory=factory, apply=apply, poll=poll,
-                              threads=threads, result=result, event=event)
+    ctx = SimpleNamespace(
+        session=session,
+        state=state,
+        controller=controller,
+        driver=driver,
+        runtime=runtime,
+        factory=factory,
+        apply=apply,
+        drain_until=drain_until,
+        threads=threads,
+        result=result,
+        event=event,
+    )
     try:
-        yield runtime
+        yield ctx
     finally:
-        assert server.stop_background(timeout_s=5)
+        runtime.close()
 
 
-def poll_until(runtime, predicate):
-    deadline = time.monotonic() + 5
-    while not predicate():
-        runtime.poll()
-        assert time.monotonic() < deadline, "background startup did not finish"
-        time.sleep(0.005)
-
-
-def test_real_server_retains_ready_event_until_started(startup_runtime, monkeypatch, caplog):
+def test_real_driver_runs_startup_off_thread_and_applies_once(startup_runtime):
     r = startup_runtime
-    caplog.set_level(logging.WARNING, logger="swarm")
-    submit = Mock(wraps=r.server.submit_background)
-    monkeypatch.setattr(r.server, "submit_background", submit)
-    queued = list(r.controller.ready_events)
-    assert len(queued) == 1
-    for _ in range(3):
-        r.poll()
-        assert r.controller.ready_events == queued
-        assert not r.controller.pending
-        assert not r.state.pending_interrupts
-        r.factory.assert_not_called()
-        r.apply.assert_not_called()
-    assert submit.call_count == 3  # Actual server rejection, never a mocked error.
-    assert not caplog.records
-
-    assert r.server.start_background(timeout_s=5).startswith("ws://127.0.0.1:")
-    r.poll()
-    poll_until(r, lambda: r.apply.call_count == 1)
+    r.runtime.start()
+    r.runtime.post(r.event)
+    r.drain_until(lambda: r.apply.call_count == 1)
     r.factory.assert_called_once()
-    snapshot, event = r.factory.call_args.args
+    snapshot, payload = r.factory.call_args.args
     assert snapshot is not r.state
     assert (snapshot._session_id, snapshot._instance_id) == ("startup-session", "startup-instance")
-    assert event == queued[0][0]
+    assert payload["revision_id"] == "seed" and payload["paused"] is True
     assert r.threads and r.threads[0] != threading.get_ident()
     r.apply.assert_called_once_with(r.state, r.result)
     assert r.state.swarm_access == {"sw0": ""}
+    # Completion is retained in pending_interrupts while startup-paused, not delivered into entries.
     assert r.state.pending_interrupts == ["startup completed once"]
-    assert not r.controller.ready_events and not r.controller.pending
-    for _ in range(3):
-        r.poll()
-    assert submit.call_count == 4
+    assert not r.controller.in_flight
+    # Duplicate SessionReady is ignored.
+    r.runtime.post(r.event)
+    r.runtime.step_once(timeout=0.05)
     r.factory.assert_called_once()
     r.apply.assert_called_once()
-    assert r.state.pending_interrupts == ["startup completed once"]
-
-
-@pytest.mark.parametrize("message", [
-    "unrelated runtime failure",
-    "session websocket background server is not running or is stopping: other failure",
-])
-def test_non_readiness_runtime_error_is_logged_not_retried(startup_runtime, monkeypatch, caplog, message):
-    r = startup_runtime
-    submit = Mock(side_effect=RuntimeError(message))
-    monkeypatch.setattr(r.server, "submit_background", submit)
-    for _ in range(3):
-        r.poll()
-    submit.assert_called_once()
-    r.factory.assert_not_called()
-    r.apply.assert_not_called()
-    assert not r.controller.ready_events and not r.controller.pending
-    assert r.state.pending_interrupts == [f"Swarm startup failed: {message}"]
-    records = [record for record in caplog.records if "Swarm startup submission failed" in record.message]
-    assert len(records) == 1 and records[0].exc_info
 
 
 def test_snapshot_failure_is_logged_not_retried(startup_runtime, monkeypatch, caplog):
     r = startup_runtime
+    caplog.set_level(logging.ERROR, logger="swarm")
     snapshot = Mock(side_effect=ValueError("snapshot unavailable"))
-    submit = Mock(wraps=r.server.submit_background)
     monkeypatch.setattr(r.controller, "snapshot", snapshot)
-    monkeypatch.setattr(r.server, "submit_background", submit)
-    for _ in range(3):
-        r.poll()
+    r.runtime.start()
+    r.runtime.post(r.event)
+    r.runtime.step_once(timeout=1.0)
     snapshot.assert_called_once_with(r.state)
-    submit.assert_not_called()
     r.factory.assert_not_called()
-    assert not r.controller.ready_events and not r.controller.pending
+    assert not r.controller.in_flight
     assert r.state.pending_interrupts == ["Swarm startup failed: snapshot unavailable"]
     records = [record for record in caplog.records if "Swarm startup submission failed" in record.message]
     assert len(records) == 1 and records[0].exc_info
@@ -152,37 +156,35 @@ def test_snapshot_failure_is_logged_not_retried(startup_runtime, monkeypatch, ca
 
 def test_real_background_future_failure_is_logged_not_retried(startup_runtime, caplog):
     r = startup_runtime
+    caplog.set_level(logging.WARNING, logger="swarm")
 
     async def fail(snapshot, event):
         raise RuntimeError("startup future failed")
 
     r.factory.side_effect = fail
-    r.server.start_background(timeout_s=5)
-    r.poll()
-    poll_until(r, lambda: bool(r.state.pending_interrupts))
-    for _ in range(3):
-        r.poll()
+    r.runtime.start()
+    r.runtime.post(r.event)
+    r.drain_until(lambda: bool(r.state.pending_interrupts))
     r.factory.assert_called_once()
     r.apply.assert_not_called()
-    assert not r.controller.ready_events and not r.controller.pending
-    assert r.state.pending_interrupts == [
-        "Swarm operation failed: startup future failed"]
+    assert not r.controller.in_flight
+    assert r.state.pending_interrupts == ["Swarm operation failed: startup future failed"]
     records = [record for record in caplog.records if "Swarm background operation failed" in record.message]
-    assert len(records) == 1 and records[0].exc_info
+    assert len(records) == 1
 
 
-def test_stale_ready_event_is_logged_without_submission(startup_runtime, monkeypatch, caplog):
+def test_stale_completion_is_logged_and_discarded(startup_runtime, caplog):
     r = startup_runtime
-    submit = Mock(wraps=r.server.submit_background)
-    monkeypatch.setattr(r.server, "submit_background", submit)
+    caplog.set_level(logging.WARNING, logger="swarm")
+    r.runtime.start()
+    r.runtime.post(r.event)
+    # Process SessionReady, then mutate _instance_id before IoCompleted arrives.
+    assert r.runtime.step_once(timeout=1.0)
+    assert len(r.controller.in_flight) == 1
     r.state._instance_id = "replacement-instance"
-    for _ in range(3):
-        r.poll()
-    submit.assert_not_called()
-    r.factory.assert_not_called()
+    r.drain_until(lambda: not r.controller.in_flight)
     r.apply.assert_not_called()
-    assert not r.controller.ready_events and not r.controller.pending
     assert not r.state.pending_interrupts
-    records = [record for record in caplog.records if "Discarding stale swarm startup event" in record.message]
+    records = [record for record in caplog.records if "Discarding stale swarm completion" in record.message]
     assert len(records) == 1
     assert records[0].levelno == logging.WARNING

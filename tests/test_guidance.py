@@ -1,12 +1,13 @@
 """Role guidance and skill visibility without live workers or provider calls."""
-from concurrent.futures import Future
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 from agent_utils import Entry, State
-from agent_utils.skills import SkillRegistry
+from agent_utils.core.events import IoCompleted, IoFailed, RenderRequested
+from agent_utils.core.io import IoTable
+from agent_utils.features.skills import SkillRefreshHandler, SkillRefreshRequested, SkillRegistry
+from agent_zoo.events import SessionReady
 import swarm
 
 
@@ -19,8 +20,8 @@ def state_for(kind="sw0p2a3", content="Base"):
 
 
 def render(component, state):
-    component(state)
-    component(state)
+    component.handle(RenderRequested(), state, lambda _ev: None)
+    component.handle(RenderRequested(), state, lambda _ev: None)
     state.entries[0].finalize_render_channels()
     return state.entries[0].render(state)[0]["content"]
 
@@ -78,15 +79,14 @@ def test_skill_catalog_is_role_scoped_and_does_no_repeat_io(kind, monkeypatch):
     state = state_for(kind)
     state.skill_registry = SkillRegistry([])
     component = swarm.SwarmSkillRegistration()
-    component(state)
+    component.handle(RenderRequested(), state, lambda _ev: None)
     assert bool(state.skill_registry.get("Swarms")) == (kind != "sw0p0a0")
     forbidden = Mock(side_effect=AssertionError("repeated discovery"))
-    monkeypatch.setattr(state.skill_registry, "refresh", forbidden)
     monkeypatch.setattr(Path, "is_file", forbidden)
     monkeypatch.setattr(Path, "resolve", forbidden)
+    monkeypatch.setattr(Path, "read_text", forbidden)
     for _ in range(4):
-        component(state)
-        state.skill_registry.prompt_catalog()
+        component.handle(RenderRequested(), state, lambda _ev: None)
         state.skill_registry.list_skills()
     forbidden.assert_not_called()
 
@@ -94,12 +94,12 @@ def test_skill_catalog_is_role_scoped_and_does_no_repeat_io(kind, monkeypatch):
 def test_restored_worker_catalog_excludes_parent_skill_after_refresh():
     state = state_for("default")
     state.skill_registry = SkillRegistry([])
-    swarm.SwarmSkillRegistration()(state)
+    swarm.SwarmSkillRegistration().handle(RenderRequested(), state, lambda _ev: None)
     assert state.skill_registry.get("Swarms")
     state._session_kind = "sw0p0a0"
-    swarm.SwarmSkillRegistration()(state)
-    state.skill_registry.refresh()
+    swarm.SwarmSkillRegistration().handle(RenderRequested(), state, lambda _ev: None)
     assert state.skill_registry.get("Swarms") is None
+    assert not any(src.kind == "azo-plugin-swarms" for src in state.skill_registry.sources)
 
 
 @pytest.mark.parametrize("failure", [False, True])
@@ -108,15 +108,15 @@ def test_worker_completion_is_silent_but_applies_results(failure, caplog):
     state._session_id, state._instance_id = "worker", "instance"
     state.pending_interrupts = ["Unrelated user notification"]
     controller = swarm.SwarmController({})
-    future = Future()
-    if failure:
-        future.set_exception(RuntimeError("Worker startup failed"))
-    else:
-        future.set_result(dict(summary="agent 9 paused", access={"sw0": "pod-3"}))
-    controller.pending.append((future, controller.identity(state)))
-    swarm.SwarmCompletionCheck(controller)(state)
+    controller.in_flight["op_1"] = (controller.identity(state), "startup", {})
+    event = (
+        IoFailed(op_id="op_1", error=RuntimeError("Worker startup failed"))
+        if failure
+        else IoCompleted(op_id="op_1", value=dict(summary="agent 9 paused", access={"sw0": "pod-3"}))
+    )
+    swarm.SwarmCompletionHandler(controller).handle(event, state, lambda _ev: None)
     assert state.pending_interrupts == ["Unrelated user notification"]
-    assert not controller.pending
+    assert not controller.in_flight
     if failure:
         assert "Worker startup failed" in caplog.text
     else:
@@ -127,37 +127,45 @@ def test_worker_startup_submission_failure_is_logged_without_interrupt(caplog):
     state = state_for()
     state._session_id, state._instance_id = "worker", "instance"
     state.pending_interrupts = []
-    state._session_websocket_server = SimpleNamespace(submit_background=Mock(side_effect=ValueError("no loop")))
+    state.io = IoTable()
+    state.io.submit = Mock(side_effect=ValueError("no loop"))
     controller = swarm.SwarmController({})
-    controller.ready_events.append(({}, controller.identity(state)))
-    swarm.SwarmCompletionCheck(controller)(state)
-    assert not state.pending_interrupts and not controller.ready_events
+    event = SessionReady(session_id="worker", instance_id="instance", restored=False, paused=True)
+    swarm.SwarmRuntimeReady(controller).handle(event, state, lambda _ev: None)
+    assert not state.pending_interrupts and not controller.in_flight
     assert "no loop" in caplog.text
 
 
 def test_parent_notice_has_exact_user_broadcast_and_receivers():
     message = '  First line\n"quoted" \\ final\n  '
-    ctx = SimpleNamespace(state=state_for("default"), session=SimpleNamespace(inject=Mock()))
+    state = state_for("default")
+    state.pending_interrupts = []
+    emitted = []
     result = dict(summary="sw0: message sent to 2 agents — pods 0, 2.", pool={"id": "sw0"},
                   operation=dict(action="bcast", message=message,
                                  outcomes=[{"label": "sw0p0a0"}, {"label": "sw0p2a0"}]))
-    swarm.SwarmController({}).complete(ctx, result)
-    notice = ctx.session.inject.call_args.args[0]
+    swarm.SwarmController({}).complete(state, result, emitted.append)
+    notice = state.pending_interrupts[0]
     assert "The user broadcast" in notice and "sw0p0a0, sw0p2a0" in notice
     assert "pods 0, 2" in notice and notice.endswith(message)
     assert "do not resend" in notice
+    assert any(type(ev).__name__ == "InterruptQueued" for ev in emitted)
 
 
 def test_parent_launch_message_separate_from_short_status():
     state = state_for("default")
-    ctx = SimpleNamespace(state=state, session=SimpleNamespace(inject=Mock()))
+    state.pending_interrupts = []
+    emitted = []
     result = dict(summary="sw0: 16 agents ready (paused).", model_message="The user launched swarm sw0. Read the Swarms skill.")
-    swarm.SwarmController({}).complete(ctx, result)
-    ctx.session.inject.assert_called_once_with(result["model_message"], role="user", system_generated=True)
-    ctx.state._session_kind = "sw0p0a0"
-    ctx.session.inject.reset_mock()
-    swarm.SwarmController({}).complete(ctx, result)
-    ctx.session.inject.assert_not_called()
+    swarm.SwarmController({}).complete(state, result, emitted.append)
+    assert state.pending_interrupts == [result["model_message"]]
+    assert any(type(ev).__name__ == "InterruptQueued" for ev in emitted)
+    state._session_kind = "sw0p0a0"
+    state.pending_interrupts = []
+    emitted.clear()
+    swarm.SwarmController({}).complete(state, result, emitted.append)
+    assert state.pending_interrupts == []
+    assert not any(type(ev).__name__ == "InterruptQueued" for ev in emitted)
 
 
 def test_installed_skill_copy_path_and_explicit_refresh(tmp_path, monkeypatch):
@@ -168,15 +176,21 @@ def test_installed_skill_copy_path_and_explicit_refresh(tmp_path, monkeypatch):
     state = state_for("default")
     state.skill_registry = SkillRegistry([])
     component = swarm.SwarmSkillRegistration()
-    component(state)
+    component.handle(RenderRequested(), state, lambda _ev: None)
     assert state.skill_registry.get("Swarms").description == "Initial description"
     path.write_text('---\nname: Swarms\ndescription: Changed description\n---\nNew body.\n')
-    component(state)
+    component.handle(RenderRequested(), state, lambda _ev: None)
     assert state.skill_registry.get("Swarms").description == "Initial description"
-    state.skill_registry.refresh()
+    # Explicit SkillRefreshRequested refreshes from disk via IoCompleted.
+    refresher = SkillRefreshHandler(state.skill_registry)
+    refresher.handle(SkillRefreshRequested(), state, lambda _ev: None)
+    glob_effect, = state.io.take_outbox()
+    refresher.handle(IoCompleted(op_id=glob_effect.op_id, value=[str(path)]), state, lambda _ev: None)
+    read_effect, = state.io.take_outbox()
+    refresher.handle(IoCompleted(op_id=read_effect.op_id, value=path.read_text()), state, lambda _ev: None)
     assert state.skill_registry.get("Swarms").description == "Changed description"
     state.skill_registry = SkillRegistry([])
-    component(state)
+    component.handle(RenderRequested(), state, lambda _ev: None)
     assert state.skill_registry.get("Swarms").description == "Changed description"
 
 
@@ -197,10 +211,11 @@ def test_model_broadcast_completion_is_not_a_user_assignment_notification():
     state._session_id, state._instance_id = "parent", "instance"
     state.pending_interrupts = []
     controller = swarm.SwarmController({})
-    future = Future()
-    future.set_result(dict(action="bcast", summary="sw0: message sent to 1 agent.", pool={"id": "sw0"},
-                           operation=dict(action="bcast", message="agent-generated work",
-                                          outcomes=[{"label": "sw0p0a0"}])))
-    controller.pending.append((future, controller.identity(state)))
-    swarm.SwarmCompletionCheck(controller)(state)
+    result = dict(action="bcast", summary="sw0: message sent to 1 agent.", pool={"id": "sw0"},
+                  operation=dict(action="bcast", message="agent-generated work",
+                                 outcomes=[{"label": "sw0p0a0"}]))
+    controller.in_flight["op_1"] = (controller.identity(state), "tool", {"action": "bcast"})
+    swarm.SwarmCompletionHandler(controller).handle(
+        IoCompleted(op_id="op_1", value=result), state, lambda _ev: None
+    )
     assert state.pending_interrupts == []

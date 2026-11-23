@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from agent_zoo.runtime.commands import CommandError
+from agent_zoo.features.commands import CommandError
 
 import swarm
 from test_recovery import runtime, reserve, seed
@@ -91,11 +91,11 @@ def test_invalid_profile_is_status_only_before_defer(runtime, config, monkeypatc
     before = deepcopy(config)
     forbidden = Mock(side_effect=AssertionError("must not allocate"))
     monkeypatch.setattr(swarm, "allocate_pool", forbidden)
-    ctx = SimpleNamespace(state=runtime.state, session=SimpleNamespace(inject=Mock()), defer=Mock())
+    ctx = SimpleNamespace(state=runtime.state, emit=Mock(), submit_io=Mock(return_value="op_1"))
     with pytest.raises(CommandError, match="Unknown swarm model profile|disabled"):
         swarm.SwarmController(config).command(ctx, raw_args=f"-n2 --profile {PROFILE}")
-    ctx.defer.assert_not_called()
-    ctx.session.inject.assert_not_called()
+    ctx.submit_io.assert_not_called()
+    ctx.emit.assert_not_called()
     forbidden.assert_not_called()
     runtime.state.session_launcher.prepare.assert_not_called()
     assert config == before
@@ -105,10 +105,10 @@ def test_invalid_profile_is_status_only_before_defer(runtime, config, monkeypatc
 def test_creation_routes_and_saves_profile_without_parent_mutation(runtime, config, launches, explicit):
     original_config, original_settings = deepcopy(config), runtime.state.settings
     controller = swarm.SwarmController(config)
-    ctx = SimpleNamespace(state=runtime.state, session=SimpleNamespace(inject=Mock()), defer=Mock())
+    ctx = SimpleNamespace(state=runtime.state, emit=Mock(), submit_io=Mock(return_value="op_1"))
     controller.command(ctx, raw_args="-n2 -p2" + (f" --profile={PROFILE}" if explicit else ""))
-    ctx.defer.assert_called_once()
-    result = asyncio.run(ctx.defer.call_args.args[0]())
+    ctx.submit_io.assert_called_once()
+    result = asyncio.run(ctx.submit_io.call_args.args[0].factory())
     assert result["level"] == "info", result["summary"]
     selected = PROFILE if explicit else "offline"
     assert result["pool"]["model_profile"] == selected
@@ -126,7 +126,7 @@ def test_creation_routes_and_saves_profile_without_parent_mutation(runtime, conf
     assert all(row["request"]["settings"]["model"] == selected for row in store.records().list("attempts"))
     assert config == original_config
     assert runtime.state.settings is original_settings
-    ctx.session.inject.assert_not_called()
+    ctx.emit.assert_not_called()
 
 
 def test_explicit_profile_does_not_require_parent_default(runtime, config):
@@ -138,10 +138,10 @@ def test_explicit_profile_does_not_require_parent_default(runtime, config):
 
 def test_queued_default_selection_is_pinned(runtime, config, launches):
     controller = swarm.SwarmController(config)
-    ctx = SimpleNamespace(state=runtime.state, defer=Mock())
+    ctx = SimpleNamespace(state=runtime.state, submit_io=Mock(return_value="op_1"))
     controller.command(ctx, raw_args="-n1")
     config["llm"]["default"] = "other"
-    result = asyncio.run(ctx.defer.call_args.args[0]())
+    result = asyncio.run(ctx.submit_io.call_args.args[0].factory())
     assert result["pool"]["model_profile"] == "offline"
     assert launches.prepare.call_args.args[0].settings.model == "offline"
     assert config["llm"]["default"] == "other"
@@ -149,12 +149,12 @@ def test_queued_default_selection_is_pinned(runtime, config, launches):
 
 def test_create_revalidates_before_allocation(runtime, config, monkeypatch):
     controller = swarm.SwarmController(config)
-    ctx = SimpleNamespace(state=runtime.state, defer=Mock())
+    ctx = SimpleNamespace(state=runtime.state, submit_io=Mock(return_value="op_1"))
     controller.command(ctx, raw_args=f"-n1 --profile {PROFILE}")
     config["llm"]["models"][PROFILE]["enabled"] = False
     forbidden = Mock(side_effect=AssertionError("must not allocate"))
     monkeypatch.setattr(swarm, "allocate_pool", forbidden)
-    result = asyncio.run(ctx.defer.call_args.args[0]())
+    result = asyncio.run(ctx.submit_io.call_args.args[0].factory())
     assert result["level"] == "warning" and "disabled" in result["summary"]
     forbidden.assert_not_called()
 

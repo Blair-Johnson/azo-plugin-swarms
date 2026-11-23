@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from concurrent.futures import Future as ConcurrentFuture
 from contextlib import closing, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -16,35 +18,200 @@ import re
 import sqlite3
 import stat
 import tempfile
+import threading
 import time
 import uuid
 
 from yaml import YAMLError
 
-from agents.llm import enabled_llm_models, require_model_enabled
-from agent_utils import Feature, Tool, MODEL_RENDER_CHANNEL
-from agent_utils.components import (
-    ToolDispatchStart, InterruptCheck, InterruptDelivery, HarnessEventHandler,
-    RenderTransformRegistrar, MessageRenderer,
+from agent_utils.core.events import Event, IoCompleted, IoFailed, RenderRequested, TurnSettled
+from agent_utils.core.io import IoRequest, OpId
+from agent_utils.core.pipeline import EmitFn, Feature
+from agent_utils.core.state import MODEL_RENDER_CHANNEL, State
+from agent_utils.core.tool import Tool
+from agent_utils.features.buffers import BufferManager, ReadonlyBufferView
+from agent_utils.features.core import IoFence, MessageRenderer, RenderTransformRegistrar
+from agent_utils.features.interrupts import InterruptDelivery, InterruptQueued
+from agent_utils.features.skills import SkillSource
+from agent_utils.runtime.driver import Driver
+from agent_utils.storage.repository import SessionRepository
+from agent_zoo.cli.wsctl import AzoWs
+from agent_zoo.config.loader import CONFIG_PATH, load_layered_config
+from agent_zoo.events import EmitNotice, ProjectionRequested, SessionReady
+from agent_zoo.features.commands import Command, CommandError, CommandResult
+from agent_zoo.features.settings import Setting, SettingError
+from agent_zoo.features.special_buffers import RegisterSpecialBuffers
+from agent_zoo.features.system_prompt import SystemPromptSkillList
+from agent_zoo.host.launch import (
+    CheckpointRef, Fresh, InstanceRef, Resume, RuntimeLaunch, RuntimeLauncher, RuntimeSettings,
 )
-from agents.system_prompt import SystemPromptSkillList
-from agent_utils.session_repository import SessionRepository
-from agent_utils.skills import SkillSource
-from agent_utils.files.buffer_manager import ReadonlyBufferView
-from agent_utils.session_cwd import get_session_cwd
-from agent_zoo.runtime.commands import Command, CommandError, CommandResult
-from agent_zoo.runtime.settings import Setting, SettingError
-from agent_zoo.config_loader import CONFIG_PATH, load_layered_config
-from agent_zoo.wsctl import AzoWs
-from agent_zoo.projects import resolve_state_root
-from agent_zoo.session_store import resolve_local_root
-from agent_zoo.runtime_launch import (
-    CheckpointRef, Fresh, InstanceRef, Resume, RuntimeLaunch, RuntimeSettings,
-)
-from agent_zoo.tools.special_buffers import RegisterSpecialBuffers
+from agent_zoo.host.registry import list_live_sessions
+from agent_zoo.llm.catalog import enabled_llm_models, require_model_enabled
+from agent_zoo.storage.projects import resolve_state_root
+from agent_zoo.storage.store import resolve_local_root
 from tmux_pilot.fs_store import RecordStore, file_lock
-from agent_zoo.live_session_registry import list_live_sessions
-from tmux_pilot.process_identity import local_host_identity, capture_process_identity, ProcessIdentity, observe_process, ObservationState
+from tmux_pilot.process_identity import (
+    local_host_identity, capture_process_identity, ProcessIdentity, observe_process, ObservationState,
+)
+
+
+def get_session_cwd(state) -> str:
+    """Resolve active session working directory from ``State.cwd`` or legacy attrs."""
+    cwd = str(
+        getattr(state, "cwd", "")
+        or getattr(state, "session_cwd", "")
+        or getattr(state, "terminal_cwd", "")
+        or ""
+    ).strip()
+    return cwd or os.getcwd()
+
+
+def _state_project_name(state) -> str:
+    context = dict(getattr(state, "_agent_zoo_context", {}) or {})
+    return str(context.get("project_name") or getattr(state, "_project_name", "") or "")
+
+
+def _state_store_root(state) -> str:
+    context = dict(getattr(state, "_agent_zoo_context", {}) or {})
+    return str(context.get("project_store_root") or getattr(state, "_store_root", "") or "")
+
+
+def _append_interrupt(state, message: str, emit: EmitFn | None = None) -> None:
+    pending = getattr(state, "pending_interrupts", None)
+    if pending is None:
+        pending = []
+        state.pending_interrupts = pending
+    pending.append(message)
+    paused = bool(
+        getattr(state, "_runtime_startup_paused", False)
+        or getattr(state, "startup_paused", False)
+    )
+    if emit is not None and not paused:
+        emit(InterruptQueued(source="swarm"))
+
+
+@dataclass
+class SwarmTask(IoRequest):
+    """Async swarm background operation executed by ``SwarmDriver``."""
+
+    factory: Callable[[], Awaitable[object]]
+    action: str = ""
+    target: str = ""
+
+
+class SwarmDriver(Driver):
+    """Single-loop background asyncio driver for nonblocking swarm IO operations."""
+
+    request_types = (SwarmTask,)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._futures: dict[OpId, ConcurrentFuture] = {}
+        self._cancelled: set[OpId] = set()
+        self._closed = False
+
+    def _ensure_loop_locked(self) -> asyncio.AbstractEventLoop:
+        if self._loop is not None and self._thread is not None and self._thread.is_alive():
+            return self._loop
+        started = threading.Event()
+        holder: dict[str, asyncio.AbstractEventLoop] = {}
+
+        def _run_loop() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            holder["loop"] = loop
+            started.set()
+            try:
+                loop.run_forever()
+            finally:
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.close()
+
+        thread = threading.Thread(target=_run_loop, name="azo-swarm-driver", daemon=True)
+        thread.start()
+        started.wait()
+        self._loop = holder["loop"]
+        self._thread = thread
+        return self._loop
+
+    def start(self, emit) -> None:
+        super().start(emit)
+        with self._lock:
+            self._closed = False
+            self._ensure_loop_locked()
+
+    def submit(self, op_id: OpId, req: IoRequest) -> None:
+        if not isinstance(req, SwarmTask):
+            raise TypeError(f"SwarmDriver expected SwarmTask, got {type(req).__name__}")
+        with self._lock:
+            if self._closed or op_id in self._cancelled:
+                return
+            loop = self._ensure_loop_locked()
+
+            async def _invoke():
+                if self._is_fenced(op_id):
+                    raise asyncio.CancelledError
+                return await req.factory()
+
+            fut = asyncio.run_coroutine_threadsafe(_invoke(), loop)
+            self._futures[op_id] = fut
+
+        def _done(completed: ConcurrentFuture) -> None:
+            with self._lock:
+                self._futures.pop(op_id, None)
+                fenced = self._closed or op_id in self._cancelled
+                self._cancelled.discard(op_id)
+            if completed.cancelled():
+                return
+            exc = completed.exception()
+            if fenced:
+                return
+            if exc is not None:
+                self._safe_emit(IoFailed(op_id=op_id, error=exc))
+            else:
+                self._safe_emit(IoCompleted(op_id=op_id, value=completed.result()))
+
+        fut.add_done_callback(_done)
+
+    def cancel(self, op_id: OpId) -> None:
+        with self._lock:
+            self._cancelled.add(op_id)
+            fut = self._futures.get(op_id)
+        if fut is not None:
+            fut.cancel()
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            futures = list(self._futures.values())
+            self._cancelled.update(self._futures.keys())
+            self._futures.clear()
+            loop = self._loop
+            thread = self._thread
+            self._loop = None
+            self._thread = None
+        for fut in futures:
+            fut.cancel()
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except RuntimeError:
+                pass
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
+        with self._lock:
+            self._cancelled.clear()
+
+    def _is_fenced(self, op_id: OpId) -> bool:
+        with self._lock:
+            return self._closed or op_id in self._cancelled
 
 LOG = logging.getLogger(__name__)
 NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\Z")
@@ -175,6 +342,7 @@ def load_worker_prompt():
 
 class SwarmSkillRegistration(RenderTransformRegistrar):
     """Bind the bundled coordinator skill once to each live/restored registry."""
+    handles = (SessionReady, RenderRequested)
     optional_reads = {"skill_registry", "_session_kind"}
     writes = {"skill_registry"}
 
@@ -182,29 +350,49 @@ class SwarmSkillRegistration(RenderTransformRegistrar):
         self.registry = None
         self.worker = None
 
-    def __call__(self, state):
+    def sync(self, state):
         registry = getattr(state, "skill_registry", None)
         worker = bool(worker_identity(state))
-        if registry is None or (registry is self.registry and worker == self.worker):
+        if registry is None or (
+            registry is self.registry
+            and worker == self.worker
+            and (not worker or registry.get("Swarms") is None)
+        ):
             return state
         if worker:
             # A restored worker may carry an old parent catalog; don't advertise
             # coordinator instructions through either list_skills or skill.
-            existing = registry.get("Swarms")
-            if existing is not None:
-                registry.add_exclusions(existing.root)
+            registry._file_skills = [s for s in registry._file_skills if s.name.lower() != "swarms"]
+            registry._dynamic_skills = {
+                k: v for k, v in registry._dynamic_skills.items() if k.lower() != "swarms"
+            }
+            registry._sources = [s for s in registry._sources if s.kind != "azo-plugin-swarms"]
+            registry._rebuild()
         else:
             relative = Path("skills/swarm/SKILL.md")
             installed = Path(resolve_state_root()) / "plugin-configs" / "azo-plugin-swarms" / relative
             package = installed if installed.is_file() else Path(__file__).resolve().parent.parent / relative
-            registry.add_sources(SkillSource(package, kind="azo-plugin-swarms", scope="bundled",
-                                             precedence=-5000, native=True, always_list=True))
+            source = SkillSource(
+                str(package.parent), kind="azo-plugin-swarms", scope="bundled",
+                precedence=-5000, native=True, always_list=True,
+            )
+            registry.add_sources([source])
+            try:
+                text = package.read_text(encoding="utf-8")
+                registry.register_skill_text(str(package), text, source=source)
+            except (OSError, UnicodeError, ValueError):
+                LOG.warning("Cannot read swarm skill at %s", package, exc_info=True)
         self.registry, self.worker = registry, worker
         return state
+
+    def handle(self, event, state, emit):
+        del event, emit
+        self.sync(state)
 
 
 class SwarmSystemPrompt(RenderTransformRegistrar):
     """Reapply role guidance to the current system entry after reload/compaction."""
+    handles = (RenderRequested,)
     reads = {"entries"}
     optional_reads = {"_session_kind", "swarm_access"}
     transform_name = "swarm role guidance"
@@ -212,13 +400,15 @@ class SwarmSystemPrompt(RenderTransformRegistrar):
     def __init__(self, worker_prompt):
         self.worker_prompt = worker_prompt
 
-    def __call__(self, state):
+    def handle(self, event, state, emit):
+        del emit
+        if isinstance(event, RenderRequested) and event.channels is not None and MODEL_RENDER_CHANNEL not in event.channels:
+            return
         if not state.entries:
-            return state
+            return
         entry = state.entries[0]
         if self.transform_name not in entry.render_transform_names(MODEL_RENDER_CHANNEL, pending=True):
             entry.append_render_transform(MODEL_RENDER_CHANNEL, self.transform, name=self.transform_name)
-        return state
 
     def transform(self, messages, state):
         if not messages or messages[0].get("role") != "system":
@@ -670,8 +860,7 @@ def initial_access():
 
 
 def project_directory(state):
-    context = dict(getattr(state, "_agent_zoo_context", {}) or {})
-    project = str(context.get("project_name") or "default")
+    project = _state_project_name(state) or "default"
     if project in {".", ".."} or Path(project).name != project or "\\" in project:
         raise ValueError("Project must be a single path component")
     return Path(resolve_state_root()) / "projects" / project
@@ -918,14 +1107,19 @@ def _swarm_content_text(value):
 
 
 class SwarmBuffers:
+    handles = (SessionReady, RenderRequested, TurnSettled)
     reads = {"buffer_manager"}
     writes = {"buffer_manager"}
-    optional_reads = {"swarm_access", "swarm_resource_uids", "_agent_zoo_context", "_session_id"}
+    optional_reads = {"swarm_access", "swarm_resource_uids", "_agent_zoo_context", "_project_name", "_session_id"}
     init = {"swarm_access": initial_access, "swarm_resource_uids": dict}
 
-    def __call__(self, state):
+    def register(self, state):
         state.buffer_manager.register_special_buffer_namespace("swarm:", self.render, replace=True)
         return state
+
+    def handle(self, event, state, emit):
+        del event, emit
+        self.register(state)
 
     @staticmethod
     def index_lines(state, swarm_id, *, collapse_cancelled=False):
@@ -1027,7 +1221,7 @@ def launch_member(state, swarm_id: str, member_id: str, settings: RuntimeSetting
         raise ValueError("Child settings must select the same durable swarm")
     if checkpoint is not None and checkpoint.session_id != member_id:
         raise ValueError("Checkpoint must belong to the member session")
-    launcher = getattr(state, "session_launcher", None)
+    launcher = state.session_launcher if hasattr(state, "session_launcher") else RuntimeLauncher()
     if launcher is None:
         raise ValueError("Runtime launch service is unavailable")
     member = next(m for m in store.pod(pod_id)["members"] if m["session_id"] == member_id)
@@ -1153,7 +1347,7 @@ def owned_stores(state):
 def owner_replaced(state, pool):
     """An exec reload can retire an owner IID while its native process remains alive."""
     old = pool["owner"]["parent_instance_id"]
-    root = state._agent_zoo_context.get("project_store_root")
+    root = _state_store_root(state)
     rows = list_live_sessions(root, include_stale=True)
     by_id = {r.instance_id: r for r in rows}
     a = by_id.get(old)
@@ -1173,7 +1367,7 @@ def owner_replaced(state, pool):
             return False
         b = successors[0]
         if (b.session_id != state._session_id
-                or (b.metadata or {}).get("project_name") != state._agent_zoo_context.get("project_name")):
+                or (b.metadata or {}).get("project_name") != _state_project_name(state)):
             return False
         lineage_edge(a, b)
         a = b
@@ -1197,14 +1391,15 @@ def reconcile_attempt(state, attempt, pool=None):
         attested = attested or any(old.get("attempt_id") == attempt["attempt_id"]
                                   and old.get("session_id") == attempt["session_id"]
                                   for old in evidence.get("subjects", []))
-    root = state._agent_zoo_context.get("project_store_root")
+    root = _state_store_root(state)
+    project_name = _state_project_name(state)
     try:
         rows = list_live_sessions(root, include_stale=True)
     except Exception:
         return "confirmed_stopped" if attested else "unknown"
     for row in rows:
         if (row.session_id == attempt["session_id"]
-                and (row.metadata or {}).get("project_name") == state._agent_zoo_context.get("project_name")
+                and (row.metadata or {}).get("project_name") == project_name
                 and (row.metadata or {}).get("parent_session_id") == state._session_id
                 and process_evidence(row.process_identity.to_dict() if row.process_identity else None) == "alive"):
             return "alive"
@@ -1245,7 +1440,7 @@ def reconcile_attempt(state, attempt, pool=None):
         if process_evidence(successor.process_identity.to_dict() if successor.process_identity else None) == "alive":
             return "alive"
         if (successor.session_id != attempt["session_id"]
-                or (successor.metadata or {}).get("project_name") != state._agent_zoo_context.get("project_name")
+                or (successor.metadata or {}).get("project_name") != project_name
                 or (successor.metadata or {}).get("parent_session_id") != state._session_id):
             return "unknown"
         try:
@@ -1307,7 +1502,7 @@ def require_completed_transfer(state, store, pool):
     ids = {pool["owner_session_id"]} | {m["session_id"] for p in pool["pods"] for m in p["members"]}
     if (not marker or marker.get("phase") != "completed"
             or marker.get("operation_id") != transfer["operation_id"]
-            or marker.get("project") != state._agent_zoo_context.get("project_name")
+            or marker.get("project") != _state_project_name(state)
             or Path(marker.get("target", "")).resolve() != store.durable.resolve()
             or (marker.get("session_result") or {}).get("checkpoint_revisions") != transfer["checkpoint_revisions"]
             or (marker.get("session_result") or {}).get("id_map") != {sid: sid for sid in ids}):
@@ -1939,17 +2134,18 @@ def pool_launch_settings(settings, config, pool):
 
 
 def launch_settings(state, config, *, profile=None):
-    context = dict(getattr(state, "_agent_zoo_context", {}) or {})
     provenance = config.get("_runtime_launch", {}) or {}
     model = (validate_model_profile(config, profile) if profile is not None
              else str((config.get("llm", {}) or {}).get("default") or ""))
-    if not model or not context.get("project_name") or not context.get("project_store_root"):
+    project_name = _state_project_name(state)
+    store_root = _state_store_root(state)
+    if not model or not project_name or not store_root:
         raise ValueError("Current model, project, and coordination store are required to launch a swarm")
-    if getattr(state, "session_launcher", None) is None:
+    if hasattr(state, "session_launcher") and getattr(state, "session_launcher", None) is None:
         raise ValueError("Runtime launch service is unavailable")
     return RuntimeSettings(
-        project=context["project_name"], workdir=get_session_cwd(state),
-        state_root=str(resolve_state_root()), store_root=context["project_store_root"],
+        project=project_name, workdir=get_session_cwd(state),
+        state_root=str(resolve_state_root()), store_root=store_root,
         local_state_root=str(getattr(state, "_persistence_local_root", "") or resolve_local_root(config)),
         config_path=str(provenance.get("config_path") or ""),
         config_sets=tuple(provenance.get("config_sets") or ()), model=model,
@@ -2042,15 +2238,24 @@ def operation_summary(pool, operation, *, audit_error=""):
 
 
 class SwarmController:
-    """Runtime-only grants, futures and handles; saved access is never a capability."""
+    """Runtime-only grants, in-flight IO ops and handles; saved access is never a capability."""
     def __init__(self, config, session=None):
         self.config, self.session = config, session
         self.handles, self.grants = {}, {}
         self.lock = asyncio.Lock()
-        self.pending, self.ready_events = [], []
+        self.in_flight = {}
+        self.ready_events = []
         self.bound = None
         self.startup_hold = None
         self.seen_events = set()
+        self._default_launcher = None
+
+    def _launcher_for(self, state):
+        if hasattr(state, "session_launcher"):
+            return state.session_launcher
+        if self._default_launcher is None:
+            self._default_launcher = RuntimeLauncher()
+        return self._default_launcher
 
     def identity(self, state):
         return (id(state), getattr(state, "_session_id", ""), getattr(state, "_instance_id", ""),
@@ -2059,11 +2264,14 @@ class SwarmController:
     def snapshot(self, state, *, settings=False, profile=None):
         if not getattr(state, "_session_id", "") or not getattr(state, "_instance_id", ""):
             raise ValueError("Final runtime session and instance identities are required")
+        cwd = get_session_cwd(state)
         return SimpleNamespace(_session_id=state._session_id, _instance_id=state._instance_id,
             _agent_zoo_context=deepcopy(getattr(state, "_agent_zoo_context", {}) or {}),
+            _project_name=getattr(state, "_project_name", ""),
+            _store_root=getattr(state, "_store_root", ""),
             swarm_access=dict(getattr(state, "swarm_access", {})), grants=deepcopy(self.grants),
             swarm_resource_uids=dict(getattr(state, "swarm_resource_uids", {})),
-            session_launcher=getattr(state, "session_launcher", None), session_cwd=get_session_cwd(state),
+            session_launcher=self._launcher_for(state), cwd=cwd, session_cwd=cwd,
             _persistence_local_root=getattr(state, "_persistence_local_root", ""),
             settings=launch_settings(state, self.config, profile=profile) if settings else None)
 
@@ -2083,7 +2291,13 @@ class SwarmController:
         except (ValueError, OSError) as exc:
             # Malformed user slash input is status only: do not inject a model message.
             raise CommandError(str(exc)) from exc
-        ctx.defer(lambda: self.execute(snapshot, request), then=self.complete)
+        task = SwarmTask(
+            factory=lambda snapshot=snapshot, request=request: self.execute(snapshot, request),
+            action=request["action"],
+            target=str(request.get("target") or ""),
+        )
+        op_id = ctx.submit_io(task, tag="swarm")
+        self.in_flight[op_id] = (self.identity(ctx.state), "command", request)
         return CommandResult.notice(self.receipt(request))
 
     @staticmethod
@@ -2109,6 +2323,7 @@ class SwarmController:
                 **getattr(state, "swarm_access", {}), **result["access"]}
         if result.get("release_startup_hold") and self.startup_hold == self.identity(state):
             state._runtime_startup_paused = False
+            state.startup_paused = False
             self.startup_hold = None
         for resource, grant in result.get("grants", {}).items():
             if (grant.get("session_id") != getattr(state, "_session_id", "")
@@ -2122,10 +2337,10 @@ class SwarmController:
         if result.get("resource_uids"):
             state.swarm_resource_uids = {**getattr(state, "swarm_resource_uids", {}), **result["resource_uids"]}
 
-    def complete(self, ctx, result):
-        self.apply(ctx.state, result)
+    def complete(self, state, result, emit=None):
+        self.apply(state, result)
         # Rejected user commands are notices, not requests for the model to act.
-        if not result.get("failed") and not worker_identity(ctx.state):
+        if not result.get("failed") and not worker_identity(state):
             message = result.get("model_message", result["summary"])
             operation = result.get("operation", {})
             if operation.get("action") == "bcast":
@@ -2134,23 +2349,27 @@ class SwarmController:
                 message = (f"The user broadcast to {pool_label(pool)}; target workers: {receivers}. "
                            f"{result['summary']}\nUser message (already submitted; do not resend):\n"
                            + operation["message"])
-            ctx.session.inject(message, role="user", system_generated=True)
+            _append_interrupt(state, message, emit)
+        if emit is not None:
+            emit(EmitNotice(result["summary"], level=result.get("level", "info")))
+            emit(ProjectionRequested())
         return CommandResult.notice(result["summary"], level=result.get("level", "info"))
 
     def submit(self, state, request):
         if request["action"] != "post":
             require_parent(state)
         snapshot = self.snapshot(state)
-        server = getattr(state, "_session_websocket_server", None)
-        if server is None or not callable(getattr(server, "submit_background", None)):
+        io_table = getattr(state, "io", None)
+        if io_table is None or not callable(getattr(io_table, "submit", None)):
             raise ValueError("Background execution unavailable; no operation submitted")
         fence = self.identity(state)
-        future = server.submit_background(lambda: self.execute(snapshot, request))
-        if future.done():
-            result = future.result()
-            self.apply(state, result)
-            return result["summary"]
-        self.pending.append((future, fence))
+        task = SwarmTask(
+            factory=lambda snapshot=snapshot, request=request: self.execute(snapshot, request),
+            action=request["action"],
+            target=str(request.get("target") or ""),
+        )
+        op_id = io_table.submit(task, tag="swarm")
+        self.in_flight[op_id] = (fence, "tool", request)
         return self.receipt(request)
 
     async def execute(self, state, request):
@@ -2436,16 +2655,19 @@ class SwarmController:
         return self.submit(state, request)
 
 
-RUNTIME_READS = {"swarm_access", "swarm_resource_uids", "_session_id", "_instance_id", "_session_kind", "_agent_zoo_context",
-                 "_session_websocket_server", "session_launcher", "session_cwd", "_persistence_local_root",
-                 "_runtime_startup_paused"}
+RUNTIME_READS = {
+    "swarm_access", "swarm_resource_uids", "_session_id", "_instance_id", "_session_kind",
+    "_agent_zoo_context", "_project_name", "_store_root", "session_launcher", "cwd",
+    "session_cwd", "_persistence_local_root", "_runtime_startup_paused", "startup_paused",
+}
 
 
 class SwarmTool(Tool):
     optional_reads = RUNTIME_READS
-    writes = {"swarm_access", "swarm_resource_uids", "_runtime_startup_paused"}
+    writes = {"swarm_access", "swarm_resource_uids", "_runtime_startup_paused", "startup_paused"}
 
     def __init__(self, controller, method, tool_name, *, parent_only=True):
+        self.controller = controller
         self.parent_only = parent_only
         super().__init__(getattr(controller, method), name=tool_name, group="Swarm")
 
@@ -2454,18 +2676,30 @@ class SwarmTool(Tool):
         return bool(access) and (not self.parent_only or not any(access.values()))
 
 
-class SwarmRuntimeReady(HarnessEventHandler):
-    event_kinds = {"runtime.session_ready"}
+class SwarmRuntimeReady:
+    """Handle ``SessionReady`` by registering buffers, holding restored work, and scheduling startup."""
+
+    handles = (SessionReady,)
     optional_reads = RUNTIME_READS | {"buffer_manager"}
-    writes = {"_runtime_startup_paused", "buffer_manager"}
+    writes = {"_runtime_startup_paused", "startup_paused", "buffer_manager", "pending_interrupts"}
+    init = {"pending_interrupts": list}
 
     def __init__(self, controller):
         self.controller = controller
 
-    def handle_harness_event(self, event, state):
+    def handle(self, event, state, emit):
+        if not isinstance(event, SessionReady):
+            return
         controller = self.controller
-        payload = dict(event.payload)
-        key = (payload.get("session_id"), payload.get("instance_id"))
+        payload = dict(
+            session_id=event.session_id,
+            instance_id=event.instance_id,
+            restored=bool(event.restored),
+            revision_id=event.revision_id,
+            startup_mode=event.startup_mode,
+            paused=bool(event.paused),
+        )
+        key = (payload["session_id"], payload["instance_id"])
         if key in controller.seen_events:
             return
         if key != (getattr(state, "_session_id", ""), getattr(state, "_instance_id", "")):
@@ -2473,93 +2707,102 @@ class SwarmRuntimeReady(HarnessEventHandler):
         controller.seen_events.add(key)
         controller.bound = controller.identity(state)
         if getattr(state, "buffer_manager", None) is not None:
-            SwarmBuffers()(state)  # paused startup skips ordinary pipeline components
-        if payload.get("restored") and not payload.get("paused"):
+            SwarmBuffers().register(state)
+        if payload["restored"] and not payload["paused"]:
             # The final-bound event precedes the core work gate. Keep historical pending
             # calls/awaits dormant even when this checkpoint lost its swarm_access cache.
             # Off-thread discovery releases this temporary hold only if there are no resources.
             state._runtime_startup_paused = True
+            state.startup_paused = True
             controller.startup_hold = controller.bound
-        payload["paused"] = bool(getattr(state, "_runtime_startup_paused", payload.get("paused", False)))
+        payload["paused"] = bool(
+            getattr(state, "_runtime_startup_paused", False)
+            or getattr(state, "startup_paused", False)
+            or payload["paused"]
+        )
         controller.grants.clear()
-        controller.ready_events.append((payload, controller.bound))
+        fence = controller.bound
+        io_table = getattr(state, "io", None)
+        if io_table is None:
+            controller.ready_events.append((payload, fence))
+            return
+        try:
+            snapshot = controller.snapshot(state)
+            task = SwarmTask(
+                factory=lambda snapshot=snapshot, payload=payload: controller.startup(snapshot, payload),
+                action="startup",
+            )
+            op_id = io_table.submit(task, tag="swarm_startup")
+            controller.in_flight[op_id] = (fence, "startup", payload)
+        except Exception as exc:
+            LOG.exception("Swarm startup submission failed for %s", fence[1:3])
+            if not worker_identity(state):
+                _append_interrupt(state, f"Swarm startup failed: {brief_error(exc)}", emit)
 
 
-class SwarmCompletionCheck(InterruptCheck):
-    check_name = "swarm_completion"
-    cooldown = 0
+class SwarmCompletionHandler:
+    """Event-driven completion handler for async ``SwarmTask`` IO operations (zero polling)."""
+
+    handles = (IoCompleted, IoFailed)
     optional_reads = RUNTIME_READS | {"pending_interrupts"}
-    writes = {"swarm_access", "swarm_resource_uids", "pending_interrupts", "_runtime_startup_paused"}
+    writes = {
+        "swarm_access", "swarm_resource_uids", "pending_interrupts",
+        "_runtime_startup_paused", "startup_paused", "dirty",
+    }
     init = {"pending_interrupts": list}
 
     def __init__(self, controller):
         self.controller = controller
 
-    def __call__(self, state):
+    def handle(self, event, state, emit):
+        if not isinstance(event, (IoCompleted, IoFailed)):
+            return
         c = self.controller
+        entry = c.in_flight.pop(event.op_id, None)
+        if entry is None:
+            return
+        event.stop()
+        fence, source_kind, request = entry
         identity = c.identity(state)
-        server = getattr(state, "_session_websocket_server", None)
-        if server is not None:
-            for event, fence in list(c.ready_events):
-                if fence != identity:
-                    c.ready_events.remove((event, fence))
-                    LOG.warning("Discarding stale swarm startup event for %s", fence[1:3])
-                    continue
-                try:
-                    snapshot = c.snapshot(state)
-                    factory = lambda snapshot=snapshot, event=event: c.startup(snapshot, event)
-                    try:
-                        future = server.submit_background(factory)
-                    except RuntimeError as exc:
-                        if str(exc) == "session websocket background server is not running or is stopping":
-                            # The core binds this service before starting its IO thread.
-                            # Rejected submission did not invoke the factory; retain the event.
-                            continue
-                        raise
-                    c.ready_events.remove((event, fence))
-                    c.pending.append((future, fence))
-                except Exception as exc:
-                    c.ready_events.remove((event, fence))
-                    LOG.exception("Swarm startup submission failed for %s", identity[1:3])
-                    if not worker_identity(state):
-                        state.pending_interrupts.append(f"Swarm startup failed: {brief_error(exc)}")
-        for future, fence in list(c.pending):
-            if not future.done():
-                continue
-            c.pending.remove((future, fence))
-            if fence != identity or (c.session is not None and getattr(c.session, "state", state) is not state):
-                # Observe the error but never apply a stale callback to a replaced runtime.
-                if not future.cancelled():
-                    future.exception()
-                continue
-            try:
-                result = future.result()
-                c.apply(state, result)
-                quiet_success = (result.get("action") in {"bcast", "post"}
-                                 and result.get("level", "info") == "info")
-                if result.get("summary") and not worker_identity(state) and not quiet_success:
-                    state.pending_interrupts.append(result.get("model_message", result["summary"]))
-            except Exception as exc:
-                LOG.exception("Swarm background operation failed for %s", identity[1:3])
-                if not worker_identity(state):
-                    state.pending_interrupts.append(f"Swarm operation failed: {brief_error(exc)}")
-        return state
+        if fence != identity or (c.session is not None and getattr(c.session, "state", state) is not state):
+            LOG.warning("Discarding stale swarm completion for %s", fence[1:3])
+            return
+        if isinstance(event, IoFailed):
+            LOG.warning("Swarm background operation failed for %s: %s", identity[1:3], event.error)
+            message = f"Swarm operation failed: {brief_error(event.error)}"
+            if source_kind == "command":
+                emit(EmitNotice(message, level="warning"))
+                emit(ProjectionRequested())
+            elif not worker_identity(state):
+                _append_interrupt(state, message, emit)
+            return
+        result = event.value
+        if source_kind == "command":
+            c.complete(state, result, emit)
+            return
+        c.apply(state, result)
+        quiet_success = (
+            result.get("action") in {"bcast", "post"}
+            and result.get("level", "info") == "info"
+        )
+        if result.get("summary") and not worker_identity(state) and not quiet_success:
+            _append_interrupt(state, result.get("model_message", result["summary"]), emit)
 
 
 def register_features(builder, *, session, config):
     builder.add(Feature("swarm_settings", components=profile_setting(config), order=[Setting]))
     # launch_member assigns this durable kind; unlike environment or display
     # names it also identifies members during reload/recovery without disk IO.
-    if worker_identity(getattr(session, "state", None)) and builder.has("rlm"):
+    if worker_identity(getattr(session, "state", None)) and getattr(builder, "has", lambda _: False)("rlm"):
         # Restrict agent-directed delegation, not internal maintenance. Preserve
-        # the existing shared queue/poller so automatic compaction still works.
+        # the existing RLMCompletionHandler so automatic compaction still works.
         feature = builder._features["rlm"]
         builder.add(replace(feature, components=[
             component for component in feature.components if not isinstance(component, Tool)
         ]))
     controller = SwarmController(config, session)
     builder.add(Feature("swarm", components=[
-        SwarmBuffers(), SwarmRuntimeReady(controller), SwarmCompletionCheck(controller),
+        SwarmBuffers(), SwarmRuntimeReady(controller), SwarmCompletionHandler(controller),
         SwarmTool(controller, "broadcast", "swarm_broadcast"),
         SwarmTool(controller, "interrupt", "swarm_interrupt"),
         SwarmTool(controller, "continue_swarm", "swarm_continue"),
@@ -2568,8 +2811,9 @@ def register_features(builder, *, session, config):
         Command("/swarm", "Launch a swarm", controller.command,
                 raw=True, usage='/swarm -n AGENTS [-p PODS] [--channels NAME,...] [--name NAME] [--profile PROFILE]',
                 section="Swarm"),
-    ], order=[RegisterSpecialBuffers, SwarmBuffers, SwarmRuntimeReady, Command,
-              SwarmCompletionCheck, InterruptDelivery, ToolDispatchStart]))
+    ], order=[IoFence, RegisterSpecialBuffers, SwarmBuffers, SwarmRuntimeReady,
+              SwarmCompletionHandler, Command, Tool],
+       drivers=[SwarmDriver]))
     builder.add(Feature("swarm_guidance", components=[
         SwarmSkillRegistration(), SwarmSystemPrompt(load_worker_prompt()),
     ], order=[SwarmSkillRegistration, SwarmSystemPrompt, SystemPromptSkillList, MessageRenderer]))

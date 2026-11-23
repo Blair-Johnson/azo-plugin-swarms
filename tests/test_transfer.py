@@ -13,10 +13,10 @@ import uuid
 import zipfile
 
 import pytest
-from agent_utils import Session
-from agent_utils import checkpoint_revisions as revisions
-from agent_utils.session_repository import SessionRepository
-from agent_zoo import projects
+from agent_utils import Pipeline, Session
+from agent_utils.storage import revisions
+from agent_utils.storage.repository import SessionRepository
+from agent_zoo.storage import projects
 from tmux_pilot.fs_store import RecordStore, StoreError, file_lock
 from tmux_pilot.process_identity import capture_process_identity
 
@@ -29,7 +29,7 @@ SPEC.loader.exec_module(transfer)
 def checkpoint(project, sid, *, parent="", marker="selected"):
     projects.ensure_project(project)
     projects.ensure_session_dir(project, sid)
-    session = Session(system_prompt="offline transfer test")
+    session = Session(pipeline=Pipeline([]), system_prompt="offline transfer test")
     session.state.marker = marker
     session.state.session_cwd = "/old/root/work"
     session.state.terminal_cwd = "/old/root/work"

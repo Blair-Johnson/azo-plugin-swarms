@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import uuid
 
 import pytest
-from agent_zoo.live_session_registry import LiveSessionRecord, LiveProcessObservation
+from agent_zoo.host.registry import LiveSessionRecord, LiveProcessObservation
 from tmux_pilot.process_identity import ProcessIdentity, ObservationState
 import swarm
 from test_recovery import runtime, reserve

@@ -9,9 +9,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 import pytest
 from agent_utils import Tool
-from agent_utils.files.buffer_manager import BufferManager, ReadonlyBufferView
-from agent_zoo.runtime.commands import Command
-from agent_zoo.runtime_launch import RuntimeLauncher
+from agent_utils.features.buffers import BufferManager, ReadonlyBufferView
+from agent_zoo.features.commands import Command
+from agent_zoo.host.launch import RuntimeLauncher
 import swarm
 from test_recovery import runtime, seed
 
@@ -20,7 +20,7 @@ from test_recovery import runtime, seed
 def buffers(runtime):
     runtime.state.buffer_manager = BufferManager()
     runtime.state.step = 7
-    swarm.SwarmBuffers()(runtime.state)
+    swarm.SwarmBuffers().register(runtime.state)
     return runtime
 
 

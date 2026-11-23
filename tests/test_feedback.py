@@ -23,9 +23,12 @@ def test_completion_is_plain_language_without_internal_ids(action, expected):
     text = swarm.operation_summary(dict(id="sw0", name="research"), operation)
     assert text == f"research (sw0): {expected}."
     assert OP_ID not in text and len(text) < 90
-    ctx = SimpleNamespace(state=SimpleNamespace(), session=SimpleNamespace(inject=Mock()))
-    result = swarm.SwarmController({}).complete(ctx, dict(summary=text))
-    ctx.session.inject.assert_called_once_with(text, role="user", system_generated=True)
+    state = SimpleNamespace(pending_interrupts=[])
+    emitted = []
+    result = swarm.SwarmController({}).complete(state, dict(summary=text), emitted.append)
+    assert state.pending_interrupts == [text]
+    assert any(type(ev).__name__ == "InterruptQueued" for ev in emitted)
+    assert any(type(ev).__name__ == "EmitNotice" and ev.text == text and ev.level == "info" for ev in emitted)
     assert result == swarm.CommandResult.notice(text, level="info")
 
 

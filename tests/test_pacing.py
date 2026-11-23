@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from agent_zoo.runtime.command_actions import _afk
-from agent_zoo.runtime.commands import CommandError
+from agent_zoo.features.commands.core import _afk
+from agent_zoo.features.commands import CommandError
 import swarm
 from test_recovery import runtime
 from test_adoption import lineage, client_for, reload
@@ -44,32 +44,33 @@ def test_afk_parsing_contract(raw, target, message):
     'afk sw0 "text" -p 0',
 ])
 def test_malformed_slash_input_is_status_only(runtime, raw):
-    ctx = SimpleNamespace(state=runtime.state, defer=Mock(), session=SimpleNamespace(inject=Mock()))
+    ctx = SimpleNamespace(state=runtime.state, submit_io=Mock(return_value="op_1"), emit=Mock())
     with pytest.raises(CommandError):
         swarm.SwarmController({}).command(ctx, raw_args=raw)
-    ctx.defer.assert_not_called()
-    ctx.session.inject.assert_not_called()
+    ctx.submit_io.assert_not_called()
+    ctx.emit.assert_not_called()
     assert not runtime.store.records().list("operations")
 
 
 def test_afk_oversize_rejected_before_background_or_socket(runtime, monkeypatch):
-    ctx = SimpleNamespace(state=runtime.state, defer=Mock(), session=SimpleNamespace(inject=Mock()))
+    ctx = SimpleNamespace(state=runtime.state, submit_io=Mock(return_value="op_1"), emit=Mock())
     attach = Mock(side_effect=AssertionError("must validate before socket"))
     monkeypatch.setattr(swarm.AzoWs, "attach", attach)
     with pytest.raises(CommandError, match="1 MiB"):
         swarm.SwarmController({}).command(ctx, raw_args='afk "' + "雪" * 200000 + '"')
-    ctx.defer.assert_not_called()
-    ctx.session.inject.assert_not_called()
+    ctx.submit_io.assert_not_called()
+    ctx.emit.assert_not_called()
     attach.assert_not_called()
 
 
 @pytest.mark.parametrize("message,expected", [
-    (None, None), ("clear", ""), ("OFF", ""), ("none", ""), ("-", ""),
+    (None, "saved instructions"), ("clear", ""), ("OFF", ""), ("none", ""), ("-", ""),
     ("Keep working\non the next task", "Keep working\non the next task"),
 ])
 def test_native_afk_is_instructions_not_pace(message, expected):
-    result = _afk(SimpleNamespace(state=SimpleNamespace(_afk_message="saved instructions")), message=message)
-    assert result.pace is None and result.afk_message == expected
+    state = SimpleNamespace(afk_message="saved instructions", _afk_message="saved instructions")
+    result = _afk(SimpleNamespace(state=state), message=message)
+    assert not result.events and state.afk_message == expected and state._afk_message == expected
     assert swarm.afk_command(message) == ("/afk" if message is None else "/afk " + message)
 
 

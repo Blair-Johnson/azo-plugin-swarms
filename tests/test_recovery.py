@@ -11,9 +11,10 @@ from unittest.mock import Mock
 import uuid
 
 import pytest
-from agent_utils import Session
-from agent_utils.session_repository import SessionRepository
-from agent_zoo.runtime_launch import RuntimeSettings
+from agent_utils import Entry, Pipeline, Session
+from agent_utils.core.io import IoTable
+from agent_utils.storage.repository import SessionRepository
+from agent_zoo.host.launch import RuntimeSettings
 from tmux_pilot.process_identity import HostIdentity, ProcessIdentity
 import swarm
 
@@ -35,7 +36,8 @@ def runtime(tmp_path, monkeypatch):
         local_state_root=str(tmp_path / "local"))
     state = SimpleNamespace(_session_id="parent", _instance_id="parent-a", swarm_access={}, grants={},
         _agent_zoo_context={"project_name": "test", "project_store_root": settings.store_root},
-        session_cwd=str(tmp_path), settings=settings, session_launcher=Mock(), pending_interrupts=[])
+        cwd=str(tmp_path), session_cwd=str(tmp_path), settings=settings, session_launcher=Mock(),
+        pending_interrupts=[], io=IoTable())
     store, pool = swarm.allocate_pool(state, swarm.parse_command("-n2 -p2"))
     return SimpleNamespace(state=state, store=store, pool=pool, host=host, identity=identity,
                            members=[m for p in pool["pods"] for m in p["members"]], tmp=tmp_path)
@@ -45,10 +47,12 @@ def seed(runtime, member, *, instance=None):
     sid = member["session_id"]
     instance = instance or uuid.uuid4().hex
     repository = SessionRepository(swarm.project_directory(runtime.state) / "sessions" / sid)
-    session = Session(system_prompt="offline seed")
+    session = Session(pipeline=Pipeline([]), system_prompt="offline seed")
     session.state._session_id = sid
     session.state._instance_id = instance
-    session.inject("saved durable text", role="user")
+    session.state.entries.append(
+        Entry(messages=[{"role": "user", "content": "saved durable text"}], index=len(session.state.entries), step=0)
+    )
     writer = repository.create_instance(session_id=sid, instance_id=instance, origin_host_id="host-a")
     commit = writer.save(session)
     return repository.load(session_id=sid, commit_id=commit.commit_id)

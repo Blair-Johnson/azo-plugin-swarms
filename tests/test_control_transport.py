@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_zoo.session_io import SessionIO
-from agent_zoo.session_websocket import SessionWebSocketServer
+from agent_zoo.transport.session_io import SessionIO
+from agent_zoo.transport.websocket import SessionWebSocketServer
 from tmux_pilot.process_identity import capture_process_identity
 import swarm
 

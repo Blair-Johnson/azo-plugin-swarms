@@ -3,6 +3,7 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
+from agent_utils.core.events import IoCompleted, IoFailed
 import swarm
 from test_recovery import runtime
 from test_swarm_tools import tool_runtime
@@ -25,15 +26,17 @@ def test_background_notification_policy(tool_runtime, action, outcome):
     else:
         method = "continue_swarm" if action == "continue" else action
         receipt = getattr(c, method)("sw0", state)
-    assert receipt and not t.futures[0].done()
-    result = asyncio.run(t.factories[0]())
+    effects = t.take_effects()
+    assert receipt and len(effects) == 1
+    effect = effects[0]
+    result = asyncio.run(effect.request.factory())
     result["access"] = {"sw0": "", "sw1": ""}
-    t.futures[0].set_result(result)
-    check = swarm.SwarmCompletionCheck(c)
-    check(state)
-    check(state)
+    handler_comp = swarm.SwarmCompletionHandler(c)
+    emitted = []
+    handler_comp.handle(IoCompleted(op_id=effect.op_id, value=result), state, emitted.append)
+    handler_comp.handle(IoCompleted(op_id=effect.op_id, value=result), state, emitted.append)
     assert state.swarm_access["sw1"] == ""  # Quiet completion still applies state.
-    assert not c.pending
+    assert not c.in_flight
     expected = ["Unrelated notice"]
     if action not in {"bcast", "post"} or outcome != "info":
         expected.append(result["summary"])
@@ -43,14 +46,16 @@ def test_background_notification_policy(tool_runtime, action, outcome):
 def test_real_board_post_and_duplicate_are_quiet(tool_runtime):
     t = tool_runtime
     c, state = t.controller, t.runtime.state
-    for index in range(2):
+    for _ in range(2):
         c.post_message("sw0", 0, "general", "durable", "stable", state)
-        result = asyncio.run(t.factories[index]())
+        effect, = t.take_effects()
+        result = asyncio.run(effect.request.factory())
         assert "committed" in result["summary"]
-        t.futures[index].set_result(result)
-        swarm.SwarmCompletionCheck(c)(state)
+        swarm.SwarmCompletionHandler(c).handle(
+            IoCompleted(op_id=effect.op_id, value=result), state, lambda _ev: None
+        )
     assert len(t.runtime.store.messages("pod-1", "general")) == 1
-    assert not state.pending_interrupts and not c.pending
+    assert not state.pending_interrupts and not c.in_flight
 
 
 @pytest.mark.parametrize("action", ["bcast", "post"])
@@ -61,7 +66,9 @@ def test_future_failure_still_notifies_parent(tool_runtime, action):
         c.broadcast("sw0", "hello", state=state)
     else:
         c.post_message("sw0", 0, "general", "hello", "stable", state)
-    t.futures[0].set_exception(RuntimeError("IO loop failed"))
-    swarm.SwarmCompletionCheck(c)(state)
+    effect, = t.take_effects()
+    swarm.SwarmCompletionHandler(c).handle(
+        IoFailed(op_id=effect.op_id, error=RuntimeError("IO loop failed")), state, lambda _ev: None
+    )
     assert state.pending_interrupts == ["Swarm operation failed: IO loop failed"]
-    assert not c.pending
+    assert not c.in_flight

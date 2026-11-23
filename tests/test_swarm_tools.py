@@ -1,11 +1,14 @@
 """Named model APIs and owner-thread completion; no command-string round trip."""
 import asyncio
-from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
+
 import pytest
 from agent_utils import Tool, Session
-from agent_zoo.runtime.commands import CommandError
+from agent_utils.core.events import IoCompleted, IoFailed, RenderRequested
+from agent_utils.core.io import IoTable, SubmitOp
+from agent_zoo.events import EmitNotice, SessionReady
+from agent_zoo.features.commands import CommandError
 import swarm
 from test_recovery import runtime
 
@@ -13,22 +16,22 @@ from test_recovery import runtime
 @pytest.fixture
 def tool_runtime(runtime):
     r = runtime
+    r.state.io = IoTable()
     session = SimpleNamespace(state=r.state, pipeline=object())
     c = swarm.SwarmController({"llm": {"default": "offline"}}, session)
     c.grants = r.state.grants.copy()
-    futures, factories = [], []
-    def submit(factory):
-        future = Future(); futures.append(future); factories.append(factory)
-        return future
-    r.state._session_websocket_server = SimpleNamespace(submit_background=submit,
-        session_io=SimpleNamespace(send=Mock(side_effect=AssertionError("slash ingress forbidden"))))
-    return SimpleNamespace(runtime=r, controller=c, session=session, futures=futures, factories=factories)
+
+    def take_effects():
+        return [eff for eff in r.state.io.take_outbox() if isinstance(eff, SubmitOp)]
+
+    return SimpleNamespace(runtime=r, controller=c, session=session, take_effects=take_effects)
 
 
 def test_exact_five_tools_have_named_zero_based_arguments():
     features = []
     swarm.register_features(SimpleNamespace(add=features.append), session=SimpleNamespace(), config={})
-    tools = {t.name: t for t in features[0].components if isinstance(t, Tool)}
+    swarm_feature = next(f for f in features if f.name == "swarm")
+    tools = {t.name: t for t in swarm_feature.components if isinstance(t, Tool)}
     assert set(tools) == {"swarm_broadcast", "swarm_interrupt", "swarm_continue", "swarm_cancel", "swarm_post"}
     import inspect
     assert list(inspect.signature(tools["swarm_broadcast"].fn).parameters) == ["swarm_id", "message", "pods", "state"]
@@ -41,25 +44,26 @@ def test_tool_nonblocking_payload_preserved_and_completion_once(tool_runtime):
     text = '  quoted "\\\\\n\u96ea\t  '
     receipt = c.broadcast("sw0", text, [1, 0, 1], state)
     assert receipt == "Sending message to sw0 (pods 1, 0)..."
-    assert len(t.futures) == 1 and not t.futures[0].done()
+    effects = t.take_effects()
+    assert len(effects) == 1 and isinstance(effects[0].request, swarm.SwarmTask)
     execute = AsyncMock(return_value=dict(action="bcast", summary="OK sent=2/2", access={"sw0": ""}, grants={}))
     c.execute = execute
-    result = asyncio.run(t.factories[0]())
+    result = asyncio.run(effects[0].request.factory())
     request = execute.call_args.args[1]
     assert request["message"] == text and request["pods"] == (1, 0)
     assert request["operation_id"] not in receipt
-    t.futures[0].set_result(result)
-    check = swarm.SwarmCompletionCheck(c)
-    check(state); check(state)
-    assert not state.pending_interrupts and not c.pending
-    state._session_websocket_server.session_io.send.assert_not_called()
+    handler = swarm.SwarmCompletionHandler(c)
+    handler.handle(IoCompleted(op_id=effects[0].op_id, value=result), state, lambda _ev: None)
+    handler.handle(IoCompleted(op_id=effects[0].op_id, value=result), state, lambda _ev: None)
+    assert not state.pending_interrupts and not c.in_flight
 
 
 @pytest.mark.parametrize("change", ["state", "session", "instance", "pipeline"])
 def test_stale_completion_is_observed_but_not_applied(tool_runtime, change):
     t = tool_runtime; state = t.runtime.state
     t.controller.interrupt("sw0", state)
-    t.futures[0].set_result(dict(summary="must not deliver", access={"forged": ""}, grants={"forged": {}}))
+    effect, = t.take_effects()
+    result = dict(summary="must not deliver", access={"forged": ""}, grants={"forged": {}})
     if change == "state":
         t.session.state = SimpleNamespace()
     elif change == "session":
@@ -68,7 +72,9 @@ def test_stale_completion_is_observed_but_not_applied(tool_runtime, change):
         state._instance_id = "different"
     else:
         t.session.pipeline = object()
-    swarm.SwarmCompletionCheck(t.controller)(state)
+    swarm.SwarmCompletionHandler(t.controller).handle(
+        IoCompleted(op_id=effect.op_id, value=result), state, lambda _ev: None
+    )
     assert not state.pending_interrupts and "forged" not in state.swarm_access
     assert "forged" not in t.controller.grants
 
@@ -77,30 +83,29 @@ def test_stale_completion_is_observed_but_not_applied(tool_runtime, change):
 def test_invalid_tool_selectors_never_submit(tool_runtime, pods):
     with pytest.raises(ValueError):
         tool_runtime.controller.broadcast("sw0", "payload", pods, tool_runtime.runtime.state)
-    assert tool_runtime.futures == []
+    assert tool_runtime.take_effects() == []
 
 
 def test_missing_background_service_is_immediate_no_submission(tool_runtime):
     state = tool_runtime.runtime.state
-    state._session_websocket_server = None
+    state.io = None
     with pytest.raises(ValueError, match="Background execution unavailable"):
         tool_runtime.controller.interrupt("sw0", state)
-    assert not tool_runtime.futures
 
 
 def test_empty_message_and_frame_limit_before_submission(tool_runtime):
     for text in (" ", "\u96ea" * 600000):
         with pytest.raises(ValueError):
             tool_runtime.controller.broadcast("sw0", text, state=tool_runtime.runtime.state)
-    assert not tool_runtime.futures
+    assert not tool_runtime.take_effects()
 
 
 def test_malformed_slash_only_status_no_model_injection(tool_runtime):
     t = tool_runtime
-    ctx = SimpleNamespace(state=t.runtime.state, session=SimpleNamespace(inject=Mock()), defer=Mock())
+    ctx = SimpleNamespace(state=t.runtime.state, emit=Mock(), submit_io=Mock(return_value="op_1"))
     with pytest.raises(CommandError):
         t.controller.command(ctx, raw_args='bcast sw0 "unterminated')
-    ctx.defer.assert_not_called(); ctx.session.inject.assert_not_called()
+    ctx.submit_io.assert_not_called(); ctx.emit.assert_not_called()
 
 
 @pytest.mark.parametrize("raw", [
@@ -110,17 +115,20 @@ def test_malformed_slash_only_status_no_model_injection(tool_runtime):
 def test_deferred_slash_failure_is_status_only(tool_runtime, monkeypatch, raw):
     t = tool_runtime
     state = t.runtime.state
-    ctx = SimpleNamespace(state=state, session=SimpleNamespace(inject=Mock()), defer=Mock())
+    ctx = SimpleNamespace(state=state, emit=Mock(), submit_io=lambda req, **kw: state.io.submit(req, **kw))
     send = AsyncMock(side_effect=AssertionError("invalid target must not send"))
     monkeypatch.setattr(swarm, "send_to_member", send)
     t.controller.command(ctx, raw_args=raw)
-    ctx.defer.assert_called_once()
-    result = asyncio.run(ctx.defer.call_args.args[0]())
+    effect, = t.take_effects()
+    result = asyncio.run(effect.request.factory())
     assert result["level"] == "warning"
     assert swarm.parse_command(raw)["target"] in result["summary"]
-    notice = ctx.defer.call_args.kwargs["then"](ctx, result)
-    assert notice == swarm.CommandResult.notice(result["summary"], level="warning")
-    ctx.session.inject.assert_not_called()
+    emitted = []
+    swarm.SwarmCompletionHandler(t.controller).handle(
+        IoCompleted(op_id=effect.op_id, value=result), state, emitted.append
+    )
+    assert any(isinstance(ev, EmitNotice) and ev.text == result["summary"] and ev.level == "warning" for ev in emitted)
+    assert not any(type(ev).__name__ == "InterruptQueued" for ev in emitted)
     assert not state.pending_interrupts
     assert not t.runtime.store.records().list("operations")
     send.assert_not_awaited()
@@ -130,14 +138,14 @@ def test_deferred_tool_failure_still_notifies_model(tool_runtime):
     t = tool_runtime
     state = t.runtime.state
     t.controller.interrupt("missing", state)
-    result = asyncio.run(t.factories[0]())
+    effect, = t.take_effects()
+    result = asyncio.run(effect.request.factory())
     assert result["level"] == "warning"
-    t.futures[0].set_result(result)
-    check = swarm.SwarmCompletionCheck(t.controller)
-    check(state)
-    check(state)
+    handler = swarm.SwarmCompletionHandler(t.controller)
+    handler.handle(IoCompleted(op_id=effect.op_id, value=result), state, lambda _ev: None)
+    handler.handle(IoCompleted(op_id=effect.op_id, value=result), state, lambda _ev: None)
     assert state.pending_interrupts == [result["summary"]]
-    assert not t.controller.pending
+    assert not t.controller.in_flight
 
 
 def test_user_takeover_parser_is_exact_and_not_model_request():
@@ -154,31 +162,31 @@ def test_post_id_exposed_before_write_and_idempotent_completion(tool_runtime):
     t = tool_runtime; state = t.runtime.state
     receipt = t.controller.post_message("sw0", 0, "general", "durable", "stable-id", state)
     assert "stable-id" in receipt
-    first = asyncio.run(t.factories[0]())
+    first = asyncio.run(t.take_effects()[0].request.factory())
     assert "committed" in first["summary"]
     t.controller.post_message("sw0", 0, "general", "durable", "stable-id", state)
-    second = asyncio.run(t.factories[1]())
+    second = asyncio.run(t.take_effects()[0].request.factory())
     assert "already committed" in second["summary"]
     assert len(t.runtime.store.messages("pod-1", "general")) == 1
     t.controller.post_message("sw0", 0, "general", "changed", "stable-id", state)
-    assert "different content" in asyncio.run(t.factories[2]())["summary"]
+    assert "different content" in asyncio.run(t.take_effects()[0].request.factory())["summary"]
 
 
-def test_event_before_server_schedules_only_from_interrupt_check(tool_runtime):
+def test_session_ready_submits_once_and_deduplicates(tool_runtime):
     t = tool_runtime; state = t.runtime.state
-    server = state._session_websocket_server
-    state._session_websocket_server = None
-    event = SimpleNamespace(payload=dict(session_id=state._session_id, instance_id=state._instance_id,
-                                        restored=True, startup_mode="paused", paused=True, revision_id="revision"))
+    event = SessionReady(
+        session_id=state._session_id,
+        instance_id=state._instance_id,
+        restored=True,
+        startup_mode="paused",
+        paused=True,
+        revision_id="revision",
+    )
     handler = swarm.SwarmRuntimeReady(t.controller)
-    handler.handle_harness_event(event, state); handler.handle_harness_event(event, state)
-    assert len(t.controller.ready_events) == 1 and not t.futures
-    check = swarm.SwarmCompletionCheck(t.controller)
-    check(state)
-    assert not t.futures
-    state._session_websocket_server = server
-    check(state); check(state)
-    assert len(t.futures) == 1 and not t.controller.ready_events
+    handler.handle(event, state, lambda _ev: None)
+    handler.handle(event, state, lambda _ev: None)
+    effects = t.take_effects()
+    assert len(effects) == 1 and len(t.controller.in_flight) == 1
 
 
 def test_partial_summary_keeps_counts_and_bounds_failure_detail():
@@ -200,15 +208,15 @@ def test_partial_summary_keeps_counts_and_bounds_failure_detail():
 def test_new_plugin_builds_real_pipelines(tmp_path, monkeypatch, pipeline_name, session_kind, is_member):
     from pathlib import Path
     import agent_zoo.pipelines as pipelines
-    import agent_zoo.plugins as plugins
-    from agent_zoo.modes import default_modes, rlm_modes
+    import agent_zoo.plugins.loader as plugin_loader
+    from agent_zoo.features.modes import default_modes, rlm_modes
     root = tmp_path / "plugins"; (root / "common").mkdir(parents=True)
     skill_path = Path(swarm.resolve_state_root()) / "plugin-configs/azo-plugin-swarms/skills/swarm/SKILL.md"
     skill_path.parent.mkdir(parents=True)
     skill_path.write_text((Path(swarm.__file__).resolve().parent.parent / "skills/swarm/SKILL.md").read_text())
     (root / "common" / "swarm.py").write_text(Path(swarm.__file__).read_text())
-    monkeypatch.setattr(plugins, "_base_dir", lambda: root)
-    monkeypatch.setattr(plugins.metadata, "entry_points", lambda **kwargs: [])
+    monkeypatch.setattr(plugin_loader, "_base_dir", lambda: root)
+    monkeypatch.setattr(plugin_loader.metadata, "entry_points", lambda **kwargs: [])
     # A restored member needs no launch environment. Conversely, inherited
     # environment, a matching title, or parent resource access is not membership.
     if is_member:
@@ -221,38 +229,36 @@ def test_new_plugin_builds_real_pipelines(tmp_path, monkeypatch, pipeline_name, 
     session.state._session_kind = session_kind
     session.state._session_name = "sw0p0a0"
     session.state.swarm_access = {"sw0": "pod-1" if is_member else ""}
-    pipeline = getattr(pipelines, pipeline_name)(session, config={}, skill_paths=[], max_idle=0,
-        terminal_backend="headless", mode_defs=default_modes() if pipeline_name == "build_default_pipeline" else rlm_modes(),
-        on_interrupt=lambda _: None)
+    pipeline = getattr(pipelines, pipeline_name)(
+        session,
+        config={},
+        skill_paths=[],
+        terminal_backend="headless",
+        mode_defs=default_modes() if pipeline_name == "build_default_pipeline" else rlm_modes(),
+        include_llm_drivers=False,
+    )
     session.pipeline = pipeline
     session.ensure_initialized()
-    registration = next(c for c in pipeline if type(c).__name__ == "SwarmSkillRegistration")
-    registration(session.state)
+    session.render()
     assert bool(session.state.skill_registry.get("Swarms")) == (not is_member)
     prompt = next(c for c in pipeline if type(c).__name__ == "SwarmSystemPrompt")
     rendered = prompt.transform([{"role": "system", "content": "Base"}], session.state)[0]["content"]
     assert ("# Swarm worker" in rendered) == is_member
-    assert pipeline.index(registration) < next(i for i, c in enumerate(pipeline) if type(c).__name__ == "MessageRenderer")
+    components = list(pipeline.components)
+    reg_idx = next(i for i, c in enumerate(components) if type(c).__name__ == "SwarmSkillRegistration")
+    renderer_idx = next(i for i, c in enumerate(components) if type(c).__name__ == "MessageRenderer")
+    assert reg_idx < renderer_idx
     tools = {c.name for c in pipeline if isinstance(c, Tool)}
     assert {t for t in tools if t.startswith("swarm_")} == {
         "swarm_broadcast", "swarm_interrupt", "swarm_continue", "swarm_cancel", "swarm_post"}
     assert "view" in tools
-    assert any(type(c).__name__ == "SwarmCompletionCheck" for c in pipeline)
+    assert any(type(c).__name__ == "SwarmCompletionHandler" for c in pipeline)
     has_rlm = pipeline_name == "build_default_pipeline" and not is_member
     assert tools & {"submit_rlm", "rlm_status", "cancel_rlm"} == (
         {"submit_rlm", "rlm_status", "cancel_rlm"} if has_rlm else set())
     has_compaction = pipeline_name == "build_default_pipeline"
-    for component in ("RLMProcessCheck", "ContextCompactionTrigger", "ContextCompactionRenderer"):
+    for component in ("RLMCompletionHandler", "ContextCompactionGate", "ContextCompactionRenderer"):
         assert any(type(c).__name__ == component for c in pipeline) == has_compaction
-    if has_compaction:
-        poller = next(c for c in pipeline if type(c).__name__ == "RLMProcessCheck")
-        trigger = next(c for c in pipeline if type(c).__name__ == "ContextCompactionTrigger")
-        assert poller.rlm_queue is trigger.rlm_queue
-        pump = Mock(return_value=session.state)
-        monkeypatch.setattr(poller.rlm_queue, "poll_due", lambda _: True)
-        monkeypatch.setattr(poller.rlm_queue, "pump_queue", pump)
-        assert poller(session.state) is session.state
-        pump.assert_called_once_with(session.state)
     if pipeline_name == "build_readonly_rlm_pipeline":
         assert "finish_rlm" in tools
 
@@ -277,22 +283,36 @@ def test_snapshot_rejects_grant_from_replaced_runtime(tool_runtime):
 def test_restored_ready_gates_historical_work_until_discovery(tool_runtime):
     t = tool_runtime; state = t.runtime.state
     state._runtime_startup_paused = False
-    event = SimpleNamespace(payload=dict(session_id=state._session_id, instance_id=state._instance_id,
-        restored=True, paused=False, startup_mode="normal", revision_id="saved"))
-    swarm.SwarmRuntimeReady(t.controller).handle_harness_event(event, state)
-    assert state._runtime_startup_paused is True
+    state.startup_paused = False
+    event = SessionReady(
+        session_id=state._session_id,
+        instance_id=state._instance_id,
+        restored=True,
+        paused=False,
+        startup_mode="normal",
+        revision_id="saved",
+    )
+    swarm.SwarmRuntimeReady(t.controller).handle(event, state, lambda _ev: None)
+    assert state._runtime_startup_paused is True and state.startup_paused is True
     # A completion with ordinary recovery information cannot release the hold.
     t.controller.apply(state, dict(summary="restored paused", grants={}))
-    assert state._runtime_startup_paused is True
+    assert state._runtime_startup_paused is True and state.startup_paused is True
     t.controller.apply(state, dict(release_startup_hold=True))
-    assert state._runtime_startup_paused is False
+    assert state._runtime_startup_paused is False and state.startup_paused is False
 
 
 def test_explicit_paused_start_is_not_released_by_empty_discovery(tool_runtime):
     t = tool_runtime; state = t.runtime.state
     state._runtime_startup_paused = True
-    event = SimpleNamespace(payload=dict(session_id=state._session_id, instance_id=state._instance_id,
-        restored=True, paused=True, startup_mode="paused", revision_id="saved"))
-    swarm.SwarmRuntimeReady(t.controller).handle_harness_event(event, state)
+    state.startup_paused = True
+    event = SessionReady(
+        session_id=state._session_id,
+        instance_id=state._instance_id,
+        restored=True,
+        paused=True,
+        startup_mode="paused",
+        revision_id="saved",
+    )
+    swarm.SwarmRuntimeReady(t.controller).handle(event, state, lambda _ev: None)
     t.controller.apply(state, dict(release_startup_hold=True))
-    assert state._runtime_startup_paused is True
+    assert state._runtime_startup_paused is True and state.startup_paused is True

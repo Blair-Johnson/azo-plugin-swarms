@@ -5,7 +5,7 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import Mock
 import pytest
-from agent_zoo.runtime.commands import Command, CommandRegistry, CommandError
+from agent_zoo.features.commands import Command, CommandRegistry, CommandError
 import swarm
 from test_recovery import runtime
 from test_adoption import lineage, client_for
@@ -28,26 +28,27 @@ def test_registration_exposes_one_raw_user_command_without_work(monkeypatch):
 
 @pytest.mark.parametrize("raw", ["", "-n0", "-n3 -p2", 'bcast "unterminated', "cancel sw0 sw1"])
 def test_invalid_command_has_no_background_or_storage_work(runtime, monkeypatch, raw):
-    ctx = SimpleNamespace(state=runtime.state, session=SimpleNamespace(inject=Mock()), defer=Mock())
+    ctx = SimpleNamespace(state=runtime.state, emit=Mock(), submit_io=Mock(return_value="op_1"))
     forbidden = Mock(side_effect=AssertionError("invalid command side effect"))
     monkeypatch.setattr(swarm, "store_for", forbidden)
     with pytest.raises(CommandError):
         swarm.SwarmController({}).command(ctx, raw_args=raw)
-    ctx.defer.assert_not_called(); ctx.session.inject.assert_not_called(); forbidden.assert_not_called()
+    ctx.submit_io.assert_not_called(); ctx.emit.assert_not_called(); forbidden.assert_not_called()
 
 
 def test_valid_slash_control_uses_detached_shared_request(runtime):
     r = runtime
     c = swarm.SwarmController({})
     c.grants = r.state.grants.copy()
-    ctx = SimpleNamespace(state=r.state, session=SimpleNamespace(inject=Mock()), defer=Mock())
+    ctx = SimpleNamespace(state=r.state, emit=Mock(), submit_io=Mock(return_value="op_1"))
     c.command(ctx, raw_args='bcast sw0 -p 0 "  first\nlast  "')
-    assert ctx.defer.call_count == 1
-    work = ctx.defer.call_args.args[0]
+    assert ctx.submit_io.call_count == 1
+    task = ctx.submit_io.call_args.args[0]
+    assert isinstance(task, swarm.SwarmTask)
     from unittest.mock import AsyncMock
     c.execute = AsyncMock(return_value={})
     r.state._agent_zoo_context["project_name"] = "changed"
-    asyncio.run(work())
+    asyncio.run(task.factory())
     snapshot, request = c.execute.call_args.args
     assert snapshot is not r.state and snapshot._agent_zoo_context["project_name"] == "test"
     assert request["message"] == "  first\nlast  " and request["pods"] == (0,)
