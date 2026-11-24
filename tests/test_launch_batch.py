@@ -63,8 +63,10 @@ def test_all_workers_spawn_before_any_becomes_ready(runtime, monkeypatch, recove
             label=member["label"], session_id=member["session_id"], state="ready_paused",
         ),
     )
-    import agent_zoo.drivers.sessions as sessions_mod
-    monkeypatch.setattr(sessions_mod, "capture_process_identity", lambda pid: r.identity)
+    import agent_zoo.drivers.sessions.inspection as sessions_inspection
+    import agent_zoo.drivers.sessions.live as sessions_live
+    monkeypatch.setattr(sessions_live, "capture_process_identity", lambda pid: r.identity)
+    monkeypatch.setattr(sessions_inspection, "capture_process_identity", lambda pid: r.identity)
 
     driver = swarm.make_swarm_session_driver(launcher=_BatchLauncher(), store_root=r.state.settings.store_root)
     controller = swarm.SwarmController({})

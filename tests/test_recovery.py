@@ -15,7 +15,8 @@ from agent_utils import Entry, Pipeline, Session
 from agent_utils.core.events import IoCompleted, IoFailed
 from agent_utils.core.io import IoTable
 from agent_utils.storage.repository import SessionRepository
-import agent_zoo.drivers.sessions as sessions_mod
+import agent_zoo.drivers.sessions.inspection as sessions_inspection
+import agent_zoo.drivers.sessions.live as sessions_live
 from agent_zoo.events import DiscoverSessionsResult, SessionSpawnResult
 from agent_zoo.host.launch import RuntimeSettings
 from tmux_pilot.process_identity import HostIdentity, ProcessIdentity
@@ -36,9 +37,10 @@ def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(swarm, "native_self", lambda: identity.to_dict())
     monkeypatch.setattr(swarm, "capture_process_identity", lambda pid: identity if pid == 100 else None)
     monkeypatch.setattr(swarm, "list_live_sessions", lambda *a, **k: [])
-    monkeypatch.setattr(sessions_mod, "local_host_identity", lambda: host)
-    monkeypatch.setattr(sessions_mod, "capture_process_identity", lambda pid: identity if pid == 100 else None)
-    monkeypatch.setattr(sessions_mod, "list_live_sessions", lambda *a, **k: [])
+    monkeypatch.setattr(sessions_inspection, "local_host_identity", lambda: host)
+    monkeypatch.setattr(sessions_inspection, "capture_process_identity", lambda pid: identity if pid == 100 else None)
+    monkeypatch.setattr(sessions_live, "capture_process_identity", lambda pid: identity if pid == 100 else None)
+    monkeypatch.setattr(sessions_live, "list_live_sessions", lambda *a, **k: [])
     settings = RuntimeSettings(project="test", model="offline", workdir=str(tmp_path),
         state_root=str(tmp_path / "state"), store_root=str(tmp_path / "registry"),
         local_state_root=str(tmp_path / "local"))
@@ -415,8 +417,9 @@ def test_crosshost_confirmed_recovery_uses_destination_not_origin_argv(runtime, 
     monkeypatch.setattr(swarm, "observe_process", lambda identity: SimpleNamespace(
         state=swarm.ObservationState.UNKNOWN if identity.host_id == "host-a" else swarm.ObservationState.ALIVE))
     monkeypatch.setattr(swarm, "capture_process_identity", lambda pid: destination_child if pid == 501 else destination_parent)
-    monkeypatch.setattr(sessions_mod, "local_host_identity", lambda: destination_host)
-    monkeypatch.setattr(sessions_mod, "capture_process_identity", lambda pid: destination_child if pid == 501 else destination_parent)
+    monkeypatch.setattr(sessions_inspection, "local_host_identity", lambda: destination_host)
+    monkeypatch.setattr(sessions_inspection, "capture_process_identity", lambda pid: destination_child if pid == 501 else destination_parent)
+    monkeypatch.setattr(sessions_live, "capture_process_identity", lambda pid: destination_child if pid == 501 else destination_parent)
     monkeypatch.setattr(AzoWs, "attach", Mock(side_effect=AssertionError("never contact source loopback")))
     r.state._instance_id = "parent-on-b"
     r.state.grants = {}

@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from agent_utils import Tool, Session
-from agent_utils.core.events import IoCompleted, IoFailed, RenderRequested
+from agent_utils.core.events import IoCompleted, IoFailed, RenderRequested, SessionStarted
 from agent_utils.core.io import IoTable, SubmitOp
 from agent_zoo.events import EmitNotice, RunPluginTask, SessionReady
 from agent_zoo.features.commands import CommandError
@@ -241,6 +241,7 @@ def test_new_plugin_builds_real_pipelines(tmp_path, monkeypatch, pipeline_name, 
     )
     session.pipeline = pipeline
     session.ensure_initialized()
+    session.step(SessionStarted())
     session.render()
     assert bool(session.state.skill_registry.get("Swarms")) == (not is_member)
     prompt = next(c for c in pipeline if type(c).__name__ == "SwarmSystemPrompt")

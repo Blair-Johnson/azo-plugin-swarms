@@ -11,7 +11,8 @@ import uuid
 import pytest
 from agent_utils.core.events import IoCompleted
 from agent_zoo.cli.wsctl import AzoWs
-import agent_zoo.drivers.sessions as sessions_mod
+import agent_zoo.drivers.sessions.inspection as sessions_inspection
+import agent_zoo.drivers.sessions.live as sessions_live
 from agent_zoo.events import DiscoverSessions, SessionDeliveryResult
 from agent_zoo.host.registry import LiveProcessObservation, LiveSessionRecord
 from tmux_pilot.process_identity import ObservationState, ProcessIdentity
@@ -58,12 +59,14 @@ def lineage(runtime, monkeypatch):
 
     monkeypatch.setattr(swarm, "list_live_sessions", _list)
     monkeypatch.setattr(swarm, "capture_process_identity", _capture)
-    monkeypatch.setattr(sessions_mod, "list_live_sessions", _list)
-    monkeypatch.setattr(sessions_mod, "capture_process_identity", _capture)
-    monkeypatch.setattr(
-        sessions_mod, "observe_process",
-        lambda ident: SimpleNamespace(state=ObservationState.ALIVE, reason="mock-alive", observed_at=time.time()),
+    monkeypatch.setattr(sessions_live, "list_live_sessions", _list)
+    monkeypatch.setattr(sessions_live, "capture_process_identity", _capture)
+    monkeypatch.setattr(sessions_inspection, "capture_process_identity", _capture)
+    _obs_alive = lambda ident: SimpleNamespace(
+        state=ObservationState.ALIVE, reason="mock-alive", observed_at=time.time()
     )
+    monkeypatch.setattr(sessions_live, "observe_process", _obs_alive)
+    monkeypatch.setattr(sessions_inspection, "observe_process", _obs_alive)
     return SimpleNamespace(runtime=r, member=member, identity=identity, rows=rows, row=row, a=a)
 
 
@@ -177,7 +180,8 @@ def test_restart_ready_claim_with_new_native_identity(lineage, monkeypatch):
     l.rows[0] = replace(retire(l.a), metadata=dict(l.a.metadata, recovery=claim))
     l.rows.append(b)
     monkeypatch.setattr(swarm, "capture_process_identity", lambda pid: identity)
-    monkeypatch.setattr(sessions_mod, "capture_process_identity", lambda pid: identity)
+    monkeypatch.setattr(sessions_live, "capture_process_identity", lambda pid: identity)
+    monkeypatch.setattr(sessions_inspection, "capture_process_identity", lambda pid: identity)
     target = discover_proposal(l.runtime.store, l.member)
     assert target["path"][0]["kind"] == "restart" and target["instance_id"] == b.instance_id
     claim["status"] = "starting"
