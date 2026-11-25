@@ -11,6 +11,7 @@ import uuid
 import pytest
 from agent_utils.core.events import IoCompleted
 from agent_zoo.cli.wsctl import AzoWs
+import agent_zoo.drivers.sessions.connections as sessions_connections
 import agent_zoo.drivers.sessions.inspection as sessions_inspection
 import agent_zoo.drivers.sessions.live as sessions_live
 from agent_zoo.events import DiscoverSessions, SessionDeliveryResult
@@ -59,6 +60,8 @@ def lineage(runtime, monkeypatch):
 
     monkeypatch.setattr(swarm, "list_live_sessions", _list)
     monkeypatch.setattr(swarm, "capture_process_identity", _capture)
+    monkeypatch.setattr(sessions_connections, "list_live_sessions", _list)
+    monkeypatch.setattr(sessions_connections, "capture_process_identity", _capture)
     monkeypatch.setattr(sessions_live, "list_live_sessions", _list)
     monkeypatch.setattr(sessions_live, "capture_process_identity", _capture)
     monkeypatch.setattr(sessions_inspection, "capture_process_identity", _capture)
@@ -180,6 +183,7 @@ def test_restart_ready_claim_with_new_native_identity(lineage, monkeypatch):
     l.rows[0] = replace(retire(l.a), metadata=dict(l.a.metadata, recovery=claim))
     l.rows.append(b)
     monkeypatch.setattr(swarm, "capture_process_identity", lambda pid: identity)
+    monkeypatch.setattr(sessions_connections, "capture_process_identity", lambda pid: identity)
     monkeypatch.setattr(sessions_live, "capture_process_identity", lambda pid: identity)
     monkeypatch.setattr(sessions_inspection, "capture_process_identity", lambda pid: identity)
     target = discover_proposal(l.runtime.store, l.member)

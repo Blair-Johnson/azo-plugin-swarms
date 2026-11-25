@@ -15,6 +15,7 @@ from agent_utils import Entry, Pipeline, Session
 from agent_utils.core.events import IoCompleted, IoFailed
 from agent_utils.core.io import IoTable
 from agent_utils.storage.repository import SessionRepository
+import agent_zoo.drivers.sessions.connections as sessions_connections
 import agent_zoo.drivers.sessions.inspection as sessions_inspection
 import agent_zoo.drivers.sessions.live as sessions_live
 from agent_zoo.events import DiscoverSessionsResult, SessionSpawnResult
@@ -39,6 +40,8 @@ def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(swarm, "list_live_sessions", lambda *a, **k: [])
     monkeypatch.setattr(sessions_inspection, "local_host_identity", lambda: host)
     monkeypatch.setattr(sessions_inspection, "capture_process_identity", lambda pid: identity if pid == 100 else None)
+    monkeypatch.setattr(sessions_connections, "capture_process_identity", lambda pid: identity if pid == 100 else None)
+    monkeypatch.setattr(sessions_connections, "list_live_sessions", lambda *a, **k: [])
     monkeypatch.setattr(sessions_live, "capture_process_identity", lambda pid: identity if pid == 100 else None)
     monkeypatch.setattr(sessions_live, "list_live_sessions", lambda *a, **k: [])
     settings = RuntimeSettings(project="test", model="offline", workdir=str(tmp_path),
@@ -419,6 +422,7 @@ def test_crosshost_confirmed_recovery_uses_destination_not_origin_argv(runtime, 
     monkeypatch.setattr(swarm, "capture_process_identity", lambda pid: destination_child if pid == 501 else destination_parent)
     monkeypatch.setattr(sessions_inspection, "local_host_identity", lambda: destination_host)
     monkeypatch.setattr(sessions_inspection, "capture_process_identity", lambda pid: destination_child if pid == 501 else destination_parent)
+    monkeypatch.setattr(sessions_connections, "capture_process_identity", lambda pid: destination_child if pid == 501 else destination_parent)
     monkeypatch.setattr(sessions_live, "capture_process_identity", lambda pid: destination_child if pid == 501 else destination_parent)
     monkeypatch.setattr(AzoWs, "attach", Mock(side_effect=AssertionError("never contact source loopback")))
     r.state._instance_id = "parent-on-b"
@@ -427,6 +431,7 @@ def test_crosshost_confirmed_recovery_uses_destination_not_origin_argv(runtime, 
     r.state.settings = replace(r.state.settings, workdir=str(destination_workdir),
                                store_root=str(r.tmp / "destination-registry"), config_path=str(r.tmp / "destination.toml"))
     r.state._agent_zoo_context["project_store_root"] = r.state.settings.store_root
+    swarm.session_context(r.state).store_root = r.state.settings.store_root
     with pytest.raises(ValueError, match="unknown"):
         swarm.claim_recovery(r.state, r.store)
     swarm.claim_recovery(r.state, r.store, expected_epoch=1, confirmed_stopped=True)

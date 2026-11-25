@@ -16,7 +16,7 @@ from test_recovery import runtime
 
 @pytest.fixture
 def settings_file():
-    path = Path(swarm.resolve_state_root()) / "plugin-configs/azo-plugin-swarms/config/swarm.json"
+    path = swarm.swarm_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -253,7 +253,7 @@ def test_setting_rejects_non_choices_without_writing(config, value):
 
 
 def test_disabled_profiles_and_cli_only_profiles_are_not_choices(config):
-    path = Path(swarm.resolve_state_root()) / "config.yaml"
+    path = swarm.PluginStorage(swarm.PLUGIN_NAME).state_root / "config.yaml"
     saved = deepcopy(config)
     saved["llm"]["models"][PROFILE]["enabled"] = False
     saved["llm"]["disabled_tags"] = ["blocked"]
@@ -270,7 +270,7 @@ def test_disabled_profiles_and_cli_only_profiles_are_not_choices(config):
 
 def test_saved_profile_disabled_after_registration_rejected(config):
     from agent_zoo.features.settings import SettingError
-    path = Path(swarm.resolve_state_root()) / "config.yaml"
+    path = swarm.PluginStorage(swarm.PLUGIN_NAME).state_root / "config.yaml"
     config["llm"]["models"]["other"]["enabled"] = False
     path.write_text(json.dumps(config))
     registry, ctx = settings_registry(config)
@@ -283,7 +283,7 @@ def test_saved_profile_disabled_after_registration_rejected(config):
 
 def test_malformed_saved_global_config_is_safe(config):
     from agent_zoo.features.settings import SettingError
-    path = Path(swarm.resolve_state_root()) / "config.yaml"
+    path = swarm.PluginStorage(swarm.PLUGIN_NAME).state_root / "config.yaml"
     path.write_text("llm: [SECRET")
     assert swarm._build_settings_box(config) is None
     with pytest.raises(SettingError) as exc_info:

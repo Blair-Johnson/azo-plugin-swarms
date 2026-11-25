@@ -46,7 +46,7 @@ from agent_utils.features.interrupts import InterruptDelivery, InterruptQueued
 from agent_utils.features.skills import SkillSource
 from agent_utils.storage.repository import SessionRepository
 from agent_zoo.config.loader import CONFIG_PATH, load_layered_config
-from agent_zoo.core.feature_state import ZooState, session_state
+from agent_zoo.core.feature_state import ZooState
 from agent_zoo.drivers.sessions import (
     AgentZooSessionDriver, DeliveryUnknown, PreSendRace, resolve_session_lineage, validate_loopback_ws_url,
 )
@@ -54,8 +54,12 @@ from agent_zoo.durability import (
     PluginStorage,
     PluginStoreDriver,
     QueuedWorkerDriver,
+    SessionContext,
     StoreUpdate,
+    atomic_write_json,
     file_lock,
+    session_context,
+    session_state,
 )
 from agent_zoo.events import (
     AdoptSession, ConnectSession, DisconnectSession, DiscoverSessions, DiscoverSessionsResult, EmitNotice,
@@ -70,7 +74,6 @@ from agent_zoo.features.system_prompt import SystemPromptSkillList
 from agent_zoo.host.launch import CheckpointRef, InstanceRef, RuntimeSettings
 from agent_zoo.host.registry import list_live_sessions
 from agent_zoo.llm.catalog import enabled_llm_models, require_model_enabled
-from agent_zoo.storage.projects import resolve_state_root
 from agent_zoo.storage.store import resolve_local_root
 from tmux_pilot.fs_store import RecordStore
 from tmux_pilot.process_identity import (
@@ -78,6 +81,7 @@ from tmux_pilot.process_identity import (
 )
 
 LOG = logging.getLogger(__name__)
+PLUGIN_NAME = "azo-plugin-swarms"
 NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\Z")
 WORKER_KIND = re.compile(r"(?P<swarm>sw[0-9]+)p(?P<pod>[0-9]+)a(?P<agent>[0-9]+)\Z")
 SWARM_LOCK_FENCE_NAME = "swarm"
@@ -236,14 +240,23 @@ def get_session_cwd(state) -> str:
     return cwd
 
 
+def _resolve_session_context(state: Any, config: Mapping[str, Any] | None = None) -> SessionContext:
+    ctx = session_context(state)
+    if config and (not ctx.config_path or not ctx.config_sets):
+        cfg_ctx = session_context(SimpleNamespace(config=dict(config)))
+        if not ctx.config_path and cfg_ctx.config_path:
+            ctx.config_path = cfg_ctx.config_path
+        if not ctx.config_sets and cfg_ctx.config_sets:
+            ctx.config_sets = cfg_ctx.config_sets
+    return ctx
+
+
 def _state_project_name(state) -> str:
-    context = dict(getattr(state, "_agent_zoo_context", {}) or {})
-    return str(context.get("project_name") or _session_meta(state).project_name or "")
+    return str(session_context(state).project_name or _session_meta(state).project_name or "")
 
 
 def _state_store_root(state) -> str:
-    context = dict(getattr(state, "_agent_zoo_context", {}) or {})
-    return str(context.get("project_store_root") or getattr(state, "_store_root", "") or "")
+    return str(session_context(state).store_root or "")
 
 
 def _append_interrupt(state, message: str, emit: EmitFn | None = None) -> None:
@@ -265,7 +278,7 @@ def worker_identity(state):
 
 
 def swarm_config_path():
-    return Path(resolve_state_root()) / "plugin-configs/azo-plugin-swarms/config/swarm.json"
+    return PluginStorage(PLUGIN_NAME, config_filename="config/swarm.json").config.path
 
 
 def read_swarm_config(path):
@@ -295,11 +308,11 @@ def load_default_profile():
 
 def saved_model_config(config):
     """Persistent layers only: never the session model or CLI config_sets (build/driver time only)."""
-    path = (config.get("_runtime_launch", {}) or {}).get("config_path")
+    path = session_context(SimpleNamespace(config=config or {})).config_path
     try:
         if path and Path(path).resolve() == CONFIG_PATH.resolve():
             path = None
-        return load_layered_config(state_root=resolve_state_root(), config_path=path or None)
+        return load_layered_config(state_root=PluginStorage(PLUGIN_NAME).state_root, config_path=path or None)
     except (OSError, ValueError, TypeError, AttributeError, YAMLError):
         raise SettingError("Cannot read saved Agent Zoo model settings") from None
 
@@ -426,7 +439,7 @@ def profile_setting(config, *, settings_box: _SettingsBox | None = None):
 def load_worker_prompt():
     """Read once while building the pipeline, never while rendering or polling."""
     relative = Path("config/worker_prompt.md")
-    installed = Path(resolve_state_root()) / "plugin-configs" / "azo-plugin-swarms" / relative
+    installed = PluginStorage(PLUGIN_NAME).config_dir / relative
     bundled = Path(__file__).resolve().parent.parent / relative
     for path in (installed, bundled):
         try:
@@ -442,7 +455,7 @@ def load_worker_prompt():
 def _preload_swarm_skill() -> tuple[str | None, str | None, str | None]:
     """Read the Swarms SKILL.md ONCE at build/init time, never inside ``handle()``."""
     relative = Path("skills/swarm/SKILL.md")
-    installed = Path(resolve_state_root()) / "plugin-configs" / "azo-plugin-swarms" / relative
+    installed = PluginStorage(PLUGIN_NAME).config_dir / relative
     package = installed if installed.is_file() else Path(__file__).resolve().parent.parent / relative
     try:
         text = package.read_text(encoding="utf-8")
@@ -961,14 +974,14 @@ def project_directory(state):
     project = _state_project_name(state) or "default"
     if project in {".", ".."} or Path(project).name != project or "\\" in project:
         raise ValueError("Project must be a single path component")
-    return Path(resolve_state_root()) / "projects" / project
+    return PluginStorage(PLUGIN_NAME).state_root / "projects" / project
 
 
 def store_for(state, swarm_id):
     durable = project_directory(state) / "swarms" / name(swarm_id)
     key = hashlib.sha256(str(durable.resolve()).encode()).hexdigest()
     cache = resolve_local_root() / "swarm-cache" / key / "messages.sqlite3"
-    if cache.resolve().is_relative_to(Path(resolve_state_root()).resolve()):
+    if cache.resolve().is_relative_to(PluginStorage(PLUGIN_NAME).state_root.resolve()):
         raise ValueError("Host-local cache root must be outside shared state home")
     smeta = _session_meta(state)
     grant = getattr(state, "grants", {}).get(swarm_id)
@@ -1252,7 +1265,7 @@ class SwarmBuffers:
     handles = (SessionReady, SessionRestored, RenderRequested, TurnSettled)
     reads = {"buffer_manager"}
     writes = {"buffer_manager"}
-    optional_reads = {"swarm_access", "swarm_resource_uids", "_agent_zoo_context"}
+    optional_reads = {"swarm_access", "swarm_resource_uids"}
     init = {"swarm_access": initial_access, "swarm_resource_uids": dict}
 
     def register(self, state):
@@ -1642,6 +1655,7 @@ def reserve_member_launch(state, swarm_id: str, member_id: str, settings: Runtim
                  session_id=member_id, attempt_id=attempt_id)
     source = (SessionSource(kind="resume", session_id=checkpoint.session_id, revision_id=checkpoint.revision_id)
               if checkpoint is not None else SessionSource(kind="fresh"))
+    smeta = _session_meta(state)
     spec = SessionSpec(
         project=settings.project, workdir=settings.workdir, model=settings.model,
         pipeline_key=settings.pipeline_key, env_name=settings.env_name,
@@ -1650,14 +1664,14 @@ def reserve_member_launch(state, swarm_id: str, member_id: str, settings: Runtim
         local_state_root=settings.local_state_root, host=settings.host, port=settings.port,
         modern=settings.modern, continuation_policy=settings.continuation_policy,
         kind=member["label"], title=f"{pool['name']} / {member['label']}",
-        parent_session_id=state._session_id, first_user_message="", spawn_policy="",
+        parent_session_id=smeta.session_id, first_user_message="", spawn_policy="",
         startup_mode="paused", lifetime="independent",
         extra_env=(("AZO_SWARM_ID", swarm_id), ("AZO_SWARM_POD_ID", pod_id),
                    ("AZO_SWARM_GRANT", json.dumps(grant))),
     )
     request_doc = dict(
         target=dict(session_id=member_id, instance_id=target.instance_id), source=asdict(source),
-        settings=asdict(settings), parent_session_id=state._session_id, kind=member["label"],
+        settings=asdict(settings), parent_session_id=smeta.session_id, kind=member["label"],
         title=spec.title, lifetime="independent", startup_mode="paused", first_user_message="",
     )
     attempt = store.reserve_attempt(member_id, dict(
@@ -1763,12 +1777,13 @@ def process_evidence(value):
 
 def owned_stores(state):
     """Discover authoritative directories too, repairing an incomplete index only on mutation."""
+    smeta = _session_meta(state)
     root = project_directory(state) / "swarms"
     index = {"pools": {}}
     candidates = set(getattr(state, "swarm_access", {}))
     if root.exists():
         index = RecordStore(root, create=False).get("registry", "pools", {"pools": {}})
-        candidates.update(k for k, v in index["pools"].items() if v["owner"] == state._session_id)
+        candidates.update(k for k, v in index["pools"].items() if v["owner"] == smeta.session_id)
         candidates.update(p.name for p in root.iterdir() if p.is_dir() and NAME.fullmatch(p.name)
                           and (re.fullmatch(r"sw[0-9]+", p.name) or (p / "format.json").is_file()))
     result = []
@@ -1786,7 +1801,7 @@ def owned_stores(state):
         try:
             pool = validate_pool(pool)
             require_resource_reference(state, pool)
-            if pool["owner_session_id"] == state._session_id:
+            if pool["owner_session_id"] == smeta.session_id:
                 result.append((swarm_id, store, None))
         except Exception as exc:
             result.append((swarm_id, None, str(exc)))
@@ -1795,7 +1810,7 @@ def owned_stores(state):
 
 def build_owner_discover_request(state, pool) -> DiscoverSessions:
     return DiscoverSessions(
-        store_root=_state_store_root(state), session_id=state._session_id,
+        store_root=_state_store_root(state), session_id=_session_meta(state).session_id,
         include_stale=True, probe_local_processes=True, resolve_lineage=True,
         anchor_instance_id=pool["owner"]["parent_instance_id"],
         expected_process_identity=deepcopy(pool["owner"].get("process_identity")),
@@ -1806,8 +1821,9 @@ def build_owner_discover_request(state, pool) -> DiscoverSessions:
 def owner_replaced_from_discovery(state, discovered: DiscoverSessionsResult | None) -> bool:
     if discovered is None or discovered.status != "ready" or discovered.lineage is None:
         return False
+    smeta = _session_meta(state)
     target = discovered.lineage.target
-    return (target.session_id == state._session_id and target.instance_id == state._instance_id
+    return (target.session_id == smeta.session_id and target.instance_id == smeta.instance_id
             and not target.is_terminal and target.process_identity == native_self())
 
 
@@ -1830,12 +1846,13 @@ def classify_attempt_from_discovery(state, attempt: dict, pool: dict | None = No
     )
     if discovered is None or discovered.status == "error":
         return "confirmed_stopped" if attested else "unknown"
+    smeta = _session_meta(state)
     project_name, rows = _state_project_name(state), discovered.rows
     sid = attempt["session_id"]
     for row in rows:
         meta = row.metadata or {}
         if (row.session_id == sid and meta.get("project_name") == project_name
-                and meta.get("parent_session_id") == state._session_id):
+                and meta.get("parent_session_id") == smeta.session_id):
             claim = meta.get("recovery") if isinstance(meta.get("recovery"), Mapping) else {}
             if process_evidence(row.process_identity) == "alive" or (claim and process_evidence(claim.get("owner")) == "alive"):
                 return "alive"
@@ -1864,7 +1881,7 @@ def classify_attempt_from_discovery(state, attempt: dict, pool: dict | None = No
             return process_evidence(cur.process_identity)
         nxt = succs[0]
         if (nxt.session_id != sid or (nxt.metadata or {}).get("project_name") != project_name
-                or (nxt.metadata or {}).get("parent_session_id") != state._session_id
+                or (nxt.metadata or {}).get("parent_session_id") != smeta.session_id
                 or not cur.is_terminal or not cur.is_confirmed_stopped):
             return "unknown"
         cur = nxt
@@ -1876,14 +1893,15 @@ def rebind_live_parent_successor(state, store: SwarmStore, request: dict, *,
     """Preserve positively live existing children on certified same-host parent replacement."""
     if request.get("confirmed_stopped"):
         return None
+    smeta = _session_meta(state)
     records = store.records(write=True)
     with file_lock(records.lock_path("swarm-gates", "mutation")):
         pool = store.pool()
         require_resource_reference(state, pool)
         if (pool["version"] != 2 or pool["desired_state"] == "cancelled"
-                or pool["owner_session_id"] != state._session_id
+                or pool["owner_session_id"] != smeta.session_id
                 or not pool["owner"].get("process_identity")
-                or pool["owner"]["parent_instance_id"] == state._instance_id
+                or pool["owner"]["parent_instance_id"] == smeta.instance_id
                 or domain(pool["owner"]["process_identity"]) != domain(native_self())
                 or not owner_replaced_from_discovery(state, owner_discovered)):
             return None
@@ -1896,12 +1914,12 @@ def rebind_live_parent_successor(state, store: SwarmStore, request: dict, *,
                for p in pool["pods"] for m in p["members"] if m["session_id"] not in attempted):
             return None
         previous = deepcopy(pool["owner"])
-        pool["owner"] = dict(previous, parent_instance_id=state._instance_id,
+        pool["owner"] = dict(previous, parent_instance_id=smeta.instance_id,
                              host=local_host_identity().to_dict(), process_identity=native_self())
-        records.put("owner_history", state._instance_id, dict(
+        records.put("owner_history", smeta.instance_id, dict(
             kind="verified-parent-replacement", previous=previous, current=pool["owner"], at_ns=time.time_ns()))
         records.put("swarm", "pool", pool)
-        grant = parent_grant(pool, state._instance_id)
+        grant = parent_grant(pool, smeta.instance_id)
         store.grant = grant
         state.grants[pool["id"]] = deepcopy(grant)
         state.swarm_access[pool["id"]] = ""
@@ -1930,11 +1948,12 @@ def claim_recovery(state, store: SwarmStore, *, expected_epoch=None, confirmed_s
                    discovered: DiscoverSessionsResult | None = None,
                    owner_discovered: DiscoverSessionsResult | None = None):
     """Takeover and every writer share this gate. No timeout/heartbeat grants authority."""
+    smeta = _session_meta(state)
     records = store.records(write=True)
     with file_lock(records.lock_path("swarm-gates", "mutation")):
         pool = store.pool()
         require_resource_reference(state, pool)
-        if pool["owner_session_id"] != state._session_id:
+        if pool["owner_session_id"] != smeta.session_id:
             raise ValueError("Only the durable owning parent may recover")
         if pool["desired_state"] == "cancelled":
             raise ValueError("Cancelled swarms remain cancelled")
@@ -1946,7 +1965,7 @@ def claim_recovery(state, store: SwarmStore, *, expected_epoch=None, confirmed_s
         if pool["version"] == 1 and not confirmed_stopped:
             raise ValueError("v1 migration requires explicit confirmation all old writers and external work stopped")
         owner_state = "unknown" if pool["version"] == 1 else process_evidence(pool["owner"]["process_identity"])
-        same_owner = (pool["version"] == 2 and pool["owner"]["parent_instance_id"] == state._instance_id
+        same_owner = (pool["version"] == 2 and pool["owner"]["parent_instance_id"] == smeta.instance_id
                       and pool["owner"].get("process_identity") == native_self())
         replaced = (False if same_owner or pool["version"] == 1 or imported
                     else owner_replaced_from_discovery(state, owner_discovered))
@@ -1962,11 +1981,11 @@ def claim_recovery(state, store: SwarmStore, *, expected_epoch=None, confirmed_s
         previous, token, operation_id = deepcopy(pool.get("owner")), uuid.uuid4().hex, uuid.uuid4().hex
         pool.update(
             version=2, resource_uid=pool.get("resource_uid") or uuid.uuid4().hex,
-            owner=dict(epoch=epoch + 1, token=token, parent_instance_id=state._instance_id,
+            owner=dict(epoch=epoch + 1, token=token, parent_instance_id=smeta.instance_id,
                        host=local_host_identity().to_dict(), process_identity=native_self()),
             host=local_host_identity().to_dict(), phase="recovering", desired_state="paused",
             recovery=dict(
-                operation_id=operation_id, parent_instance_id=state._instance_id, expected_previous_epoch=epoch,
+                operation_id=operation_id, parent_instance_id=smeta.instance_id, expected_previous_epoch=epoch,
                 previous_owner=previous, phase="recovering",
                 selected_checkpoints=(deepcopy((pool.get("recovery") or {}).get("selected_checkpoints", {}))
                                       if pool.get("phase") in {"recovering", "mixed"} or imported else {}),
@@ -1982,7 +2001,7 @@ def claim_recovery(state, store: SwarmStore, *, expected_epoch=None, confirmed_s
         if prior.get("recovery"):
             records.put("recovery_history", prior["recovery"]["operation_id"], prior["recovery"])
         records.put("swarm", "pool", pool)
-        grant = parent_grant(pool, state._instance_id)
+        grant = parent_grant(pool, smeta.instance_id)
         store.grant = grant
         state.grants[pool["id"]] = deepcopy(grant)
         state.swarm_access[pool["id"]] = ""
@@ -2053,6 +2072,7 @@ def pin_checkpoint(state, store, member):
 
 
 def member_resource(state):
+    smeta = _session_meta(state)
     candidates = set(getattr(state, "swarm_access", {}))
     if os.environ.get("AZO_SWARM_ID"):
         candidates.add(name(os.environ["AZO_SWARM_ID"]))
@@ -2063,7 +2083,7 @@ def member_resource(state):
         require_resource_reference(state, pool)
         for pod in pool["pods"]:
             for member in pod["members"]:
-                if member["session_id"] == state._session_id:
+                if member["session_id"] == smeta.session_id:
                     matches.append((store, pool, pod, member))
     if len(matches) > 1:
         raise ValueError("Session belongs to multiple swarm resources")
@@ -2078,8 +2098,9 @@ def _try_commit_member_bootstrap(state, store: SwarmStore, pool: dict, pod: dict
     revision = event.get("revision_id")
     if not revision:
         raise ValueError("Child startup has no exact revision")
+    sid = _session_meta(state).session_id
     try:
-        shared = shared_checkpoint(state, state._session_id, revision)
+        shared = shared_checkpoint(state, sid, revision)
     except FileNotFoundError:
         return None
     swarm_id = pool["id"]
@@ -2087,9 +2108,9 @@ def _try_commit_member_bootstrap(state, store: SwarmStore, pool: dict, pod: dict
     state.grants[swarm_id] = grant
     store.grant = grant
     with store.mutation() as (records, _):
-        row = records.get("members", state._session_id, {})
-        require_checkpoint_ancestry(state, state._session_id, shared, row.get("shared_checkpoint"))
-        with records.transaction("attempts", state._session_id) as saved:
+        row = records.get("members", sid, {})
+        require_checkpoint_ancestry(state, sid, shared, row.get("shared_checkpoint"))
+        with records.transaction("attempts", sid) as saved:
             selected = saved.get("selected_checkpoint")
             if not replacement and selected and selected["revision_id"] != revision:
                 raise ValueError("Loaded revision does not match recovery plan")
@@ -2097,11 +2118,11 @@ def _try_commit_member_bootstrap(state, store: SwarmStore, pool: dict, pod: dict
                 instance_id=event["instance_id"], revision_id=revision,
                 paused=event.get("paused") is True, epoch=grant["epoch"], process_identity=native_self(),
             )
-        row.update(shared_checkpoint=dict(session_id=state._session_id, instance_id=shared.instance_id,
+        row.update(shared_checkpoint=dict(session_id=sid, instance_id=shared.instance_id,
                                           revision_id=revision),
                    work_blocked=unresolved_tools(shared.document),
                    recovery_status="ready_paused" if event.get("paused") is True else "ready")
-        records.put("members", state._session_id, row)
+        records.put("members", sid, row)
     return dict(
         summary=f"{swarm_id}: agent ready{' (paused)' if event.get('paused') is True else ''}.",
         access=dict(state.swarm_access), replace_access=True, grants=deepcopy(state.grants),
@@ -2127,6 +2148,7 @@ def require_parent(state):
 
 def allocate_pool(state, request):
     require_parent(state)
+    smeta = _session_meta(state)
     registry = RecordStore(project_directory(state) / "swarms")
     with registry.transaction("registry", "pools", default={"next": 0, "pools": {}}) as index:
         used = set(index["pools"]) | {p["name"] for p in index["pools"].values()}
@@ -2138,11 +2160,11 @@ def allocate_pool(state, request):
             number += 1
         swarm_id = f"sw{number}"
         index["next"] = number + 1
-        index["pools"][swarm_id] = dict(name=alias or swarm_id, owner=state._session_id)
+        index["pools"][swarm_id] = dict(name=alias or swarm_id, owner=smeta.session_id)
     store = store_for(state, swarm_id)
     pool = store.create(swarm_id, pods=request["pods"], agents=request["agents"],
                         channels=request["channels"], display_name=alias,
-                        owner_session_id=state._session_id, owner_instance_id=state._instance_id,
+                        owner_session_id=smeta.session_id, owner_instance_id=smeta.instance_id,
                         model_profile=request.get("profile"))
     state.grants[swarm_id] = deepcopy(store.grant)
     state.swarm_resource_uids = {**getattr(state, "swarm_resource_uids", {}), swarm_id: pool["resource_uid"]}
@@ -2153,19 +2175,20 @@ def allocate_pool(state, request):
 
 def resolve_pool(state, target):
     require_parent(state)
+    smeta = _session_meta(state)
     candidates = set(getattr(state, "swarm_access", {}))
     root = project_directory(state) / "swarms"
     if root.exists():
         index = RecordStore(root, create=False).get("registry", "pools", {"pools": {}})
-        candidates.update(key for key, row in index["pools"].items() if row["owner"] == state._session_id)
+        candidates.update(key for key, row in index["pools"].items() if row["owner"] == smeta.session_id)
     matches = []
     for swarm_id in sorted(candidates):
         store = store_for(state, swarm_id)
         pool = store.pool()
         require_resource_reference(state, pool)
-        if pool.get("owner_session_id") != state._session_id:
+        if pool.get("owner_session_id") != smeta.session_id:
             continue
-        if any(m["session_id"] == state._session_id for pod in pool["pods"] for m in pod["members"]):
+        if any(m["session_id"] == smeta.session_id for pod in pool["pods"] for m in pod["members"]):
             raise ValueError("Swarm peers cannot control pools")
         if (target in (pool["id"], pool["name"]) if target is not None else pool["desired_state"] != "cancelled"):
             matches.append((store, pool))
@@ -2230,15 +2253,17 @@ def _validate_launch_inputs(state, config, *, profile=None) -> str:
 
 
 def launch_settings(state, config, *, profile=None):
-    provenance = config.get("_runtime_launch", {}) or {}
+    ctx = _resolve_session_context(state, config)
     model = _validate_launch_inputs(state, config, profile=profile)
     project_name, store_root = _state_project_name(state), _state_store_root(state)
+    storage = PluginStorage(PLUGIN_NAME)
     return RuntimeSettings(
-        project=project_name, workdir=get_session_cwd(state), state_root=str(resolve_state_root()),
+        project=project_name, workdir=get_session_cwd(state),
+        state_root=str(ctx.state_root or storage.state_root),
         store_root=store_root,
-        local_state_root=str(getattr(state, "_persistence_local_root", "") or resolve_local_root(config)),
-        config_path=str(provenance.get("config_path") or ""),
-        config_sets=tuple(provenance.get("config_sets") or ()), model=model,
+        local_state_root=str(ctx.local_state_root or resolve_local_root(config)),
+        config_path=str(ctx.config_path or ""),
+        config_sets=tuple(ctx.config_sets or ()), model=model,
         env_name=str((config.get("pilot", {}) or {}).get("_env_name") or ""),
         pipeline_key="default", host="127.0.0.1", port=0,
     )
@@ -2770,21 +2795,33 @@ class SwarmController:
         rt = self._rt(state)
         if settings:
             _validate_launch_inputs(state, self.config, profile=profile)
-        return SimpleNamespace(
-            _session_id=smeta.session_id,
-            _instance_id=smeta.instance_id,
-            _agent_zoo_context=deepcopy(getattr(state, "_agent_zoo_context", {}) or {}),
-            _project_name=smeta.project_name,
-            _store_root=getattr(state, "_store_root", ""),
+        ctx = _resolve_session_context(state, self.config)
+        snap = SimpleNamespace(
             swarm_access=dict(durable.swarm_access),
             grants=deepcopy(rt.grants),
             swarm_resource_uids=dict(durable.swarm_resource_uids),
             cwd=cwd,
             session_cwd=cwd,
-            _persistence_local_root=getattr(state, "_persistence_local_root", ""),
             settings=None,
             _requested_profile=profile,
         )
+        snap_meta = session_state(snap)
+        snap_meta.session_id = smeta.session_id
+        snap_meta.instance_id = smeta.instance_id
+        snap_meta.project_name = smeta.project_name or ctx.project_name
+        snap_meta.kind = smeta.kind or ctx.session_kind
+        snap_ctx = session_context(snap)
+        snap_ctx.session_id = smeta.session_id
+        snap_ctx.instance_id = smeta.instance_id
+        snap_ctx.project_name = ctx.project_name or smeta.project_name
+        snap_ctx.state_root = ctx.state_root
+        snap_ctx.store_root = ctx.store_root
+        snap_ctx.local_state_root = ctx.local_state_root
+        snap_ctx.workspace_dir = cwd
+        snap_ctx.pipeline_key = ctx.pipeline_key
+        snap_ctx.config_path = ctx.config_path
+        snap_ctx.config_sets = ctx.config_sets
+        return snap
 
     def _fail_background(self, source_kind: str, fence: tuple, exc: object, state, emit) -> None:
         LOG.warning("Swarm background operation failed for %s: %s", fence[1:3], exc)
@@ -3127,8 +3164,9 @@ class SwarmController:
         require_parent(snapshot)
         saved_pool = _unwrap_event((yield SwarmStoreRequest(op="store_pool", params={"store": store})))
         owner = saved_pool.get("owner") or {}
+        snap_meta = _session_meta(snapshot)
         check_owner = (saved_pool.get("version") == 2 and bool(owner.get("parent_instance_id"))
-                       and owner.get("process_identity") is not None and owner["parent_instance_id"] != snapshot._instance_id)
+                       and owner.get("process_identity") is not None and owner["parent_instance_id"] != snap_meta.instance_id)
         disc_reqs: list[IoRequest] = [
             DiscoverSessions(store_root=_state_store_root(snapshot), include_stale=True, probe_local_processes=True)
         ]
@@ -3212,10 +3250,11 @@ class SwarmController:
                             raise ValueError("Peer lacks capability control:shutdown; no send attempted")
                         cancel_props.append((idx, proposal))
                     elif action == "share_data":
+                        snap_meta = _session_meta(snapshot)
                         ready_batch.append((idx, build_member_data_request(
                             proposal, artifacts=request["artifacts"], channel=request["channel"],
-                            message=request.get("message", ""), sender_session_id=snapshot._session_id,
-                            sender_instance_id=snapshot._instance_id, operation_id=operation["id"],
+                            message=request.get("message", ""), sender_session_id=snap_meta.session_id,
+                            sender_instance_id=snap_meta.instance_id, operation_id=operation["id"],
                             store=store, member=member)))
                     else:
                         ready_batch.append((idx, build_member_input_request(proposal, request, store=store, member=member)))
@@ -3351,14 +3390,15 @@ class SwarmController:
         if resource is None:
             raise ValueError("No actual swarm member matches restored session identity")
         store, pool, pod, member = resource
+        snap_sid = _session_meta(snapshot).session_id
         attempt = _unwrap_event((yield SwarmStoreRequest(
-            op="bootstrap_read_attempt", params={"store": store, "session_id": snapshot._session_id}
+            op="bootstrap_read_attempt", params={"store": store, "session_id": snap_sid}
         )))
         if not attempt or attempt.get("epoch") != pool["owner"]["epoch"]:
             raise ValueError("Child attempt belongs to an old owner generation")
         current = attempt.get("current") or attempt
         grant = dict(parent_grant(pool, pool["owner"]["parent_instance_id"]), role="member",
-                     session_id=snapshot._session_id, instance_id=current["instance_id"],
+                     session_id=snap_sid, instance_id=current["instance_id"],
                      attempt_id=attempt["attempt_id"])
         store.grant = grant
         snapshot.swarm_access = {pool["id"]: pod["id"]}
@@ -3370,7 +3410,7 @@ class SwarmController:
                 try:
                     attempt, grant, (disc_req, meta), live_self = _unwrap_event((yield SwarmStoreRequest(
                         op="bootstrap_prep_discover",
-                        params={"store": store, "session_id": snapshot._session_id, "grant": grant, "member": member},
+                        params={"store": store, "session_id": snap_sid, "grant": grant, "member": member},
                     )))
                     res: DiscoverSessionsResult = _unwrap_event((yield disc_req))
                     if res.status != "ready" or res.lineage is None:
@@ -3396,7 +3436,7 @@ class SwarmController:
                     break
                 except (ValueError, OSError) as exc:
                     latest = _unwrap_event((yield SwarmStoreRequest(
-                        op="bootstrap_read_attempt", params={"store": store, "session_id": snapshot._session_id}
+                        op="bootstrap_read_attempt", params={"store": store, "session_id": snap_sid}
                     ))) or {}
                     raced = latest.get("binding_revision", 0) != prev_rev
                     pub = any(w in str(exc) for w in ("missing from registry", "not yet discoverable", "not confirmed retired"))
@@ -3497,8 +3537,8 @@ class SwarmController:
 
 
 RUNTIME_READS = {
-    "swarm_access", "swarm_resource_uids", "_agent_zoo_context", "_store_root", "cwd",
-    "session_cwd", "_persistence_local_root", "startup_paused",
+    "swarm_access", "swarm_resource_uids", "cwd",
+    "session_cwd", "startup_paused",
 }
 
 

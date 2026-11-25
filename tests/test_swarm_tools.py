@@ -214,7 +214,7 @@ def test_new_plugin_builds_real_pipelines(tmp_path, monkeypatch, pipeline_name, 
     import agent_zoo.plugins.loader as plugin_loader
     from agent_zoo.features.modes import default_modes, rlm_modes
     root = tmp_path / "plugins"; (root / "common").mkdir(parents=True)
-    skill_path = Path(swarm.resolve_state_root()) / "plugin-configs/azo-plugin-swarms/skills/swarm/SKILL.md"
+    skill_path = swarm.PluginStorage(swarm.PLUGIN_NAME).config_dir / "skills/swarm/SKILL.md"
     skill_path.parent.mkdir(parents=True)
     skill_path.write_text((Path(swarm.__file__).resolve().parent.parent / "skills/swarm/SKILL.md").read_text())
     (root / "common" / "swarm.py").write_text(Path(swarm.__file__).read_text())

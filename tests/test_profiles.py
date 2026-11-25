@@ -26,7 +26,7 @@ def config():
         PROFILE: {"enabled": True},
         "other": {"enabled": True},
     }}}
-    path = Path(swarm.resolve_state_root()) / "config.yaml"
+    path = swarm.PluginStorage(swarm.PLUGIN_NAME).state_root / "config.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(config))
     return config

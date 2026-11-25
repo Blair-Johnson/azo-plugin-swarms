@@ -59,7 +59,7 @@ def test_block_content_is_preserved():
 
 
 def test_installed_prompt_is_literal_and_only_reloaded_on_pipeline_rebuild(monkeypatch):
-    path = Path(swarm.resolve_state_root()) / "plugin-configs/azo-plugin-swarms/config/worker_prompt.md"
+    path = swarm.PluginStorage(swarm.PLUGIN_NAME).config_dir / "config/worker_prompt.md"
     path.parent.mkdir(parents=True)
     path.write_text("Local policy {unchanged}")
     component = swarm.SwarmSystemPrompt(swarm.load_worker_prompt())
@@ -169,7 +169,7 @@ def test_parent_launch_message_separate_from_short_status():
 
 
 def test_installed_skill_copy_path_and_explicit_refresh(tmp_path, monkeypatch):
-    path = Path(swarm.resolve_state_root()) / "plugin-configs/azo-plugin-swarms/skills/swarm/SKILL.md"
+    path = swarm.PluginStorage(swarm.PLUGIN_NAME).config_dir / "skills/swarm/SKILL.md"
     path.parent.mkdir(parents=True)
     path.write_text('---\nname: Swarms\ndescription: Initial description\n---\nUser assigns work too.\n')
     monkeypatch.setattr(swarm, "__file__", str(tmp_path / "plugins/common/swarm.py"))

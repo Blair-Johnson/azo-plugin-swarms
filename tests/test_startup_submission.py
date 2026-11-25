@@ -123,7 +123,8 @@ def test_real_driver_runs_startup_off_thread_and_applies_once(startup_runtime):
     r.factory.assert_called_once()
     snapshot, payload = r.factory.call_args.args
     assert snapshot is not r.state
-    assert (snapshot._session_id, snapshot._instance_id) == ("startup-session", "startup-instance")
+    snap_meta = swarm.session_state(snapshot)
+    assert (snap_meta.session_id, snap_meta.instance_id) == ("startup-session", "startup-instance")
     assert payload["revision_id"] == "seed" and payload["paused"] is True
     assert r.threads and r.threads[0] != threading.get_ident()
     r.apply.assert_called_once_with(r.state, r.result)
