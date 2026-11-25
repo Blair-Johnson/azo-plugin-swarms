@@ -7,7 +7,6 @@ import pytest
 from agent_utils import Entry, PipelineBuilder, Session, core_feature, interrupts_feature
 from agent_utils.core.events import IoCompleted
 from agent_utils.core.io import IoTable
-from agent_zoo.events import RunPluginTask
 from agent_zoo.features.projection.transcript import entry_to_items
 from agent_zoo.llm.providers.openai_responses import _extract_system, _messages_to_responses_input
 import swarm
@@ -50,7 +49,7 @@ def test_parent_completion_reaches_model_as_system_generated_user(action):
     if action == "bcast":
         result.update(pool={"id": "sw1"}, operation=dict(
             action="bcast", message=text, outcomes=[{"label": "sw1p0a0"}]))
-    op_id = session.state.io.submit(RunPluginTask(fn=lambda: None), tag="swarm")
+    op_id = session.state.io.submit(swarm.SwarmStoreRequest(op="refresh_snapshot"), tag="swarm")
     controller.in_flight[op_id] = (controller.identity(session.state), "command", {"action": action})
     session.step(IoCompleted(op_id=op_id, value=result))
     session.render()

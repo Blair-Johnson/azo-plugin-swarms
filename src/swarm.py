@@ -7,7 +7,7 @@ Unified onto ``AgentZooSessionDriver`` (pure ``SessionRequest``s + host
 """
 from __future__ import annotations
 
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from copy import deepcopy
@@ -19,7 +19,6 @@ import os
 from pathlib import Path
 import re
 import sqlite3
-import threading
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -45,7 +44,6 @@ from agent_utils.features.buffers import ReadonlyBufferView
 from agent_utils.features.core import IoFence, MessageRenderer, RenderTransformRegistrar
 from agent_utils.features.interrupts import InterruptDelivery, InterruptQueued
 from agent_utils.features.skills import SkillSource
-from agent_utils.runtime.driver import Driver
 from agent_utils.storage.repository import SessionRepository
 from agent_zoo.config.loader import CONFIG_PATH, load_layered_config
 from agent_zoo.core.feature_state import ZooState, session_state
@@ -55,6 +53,7 @@ from agent_zoo.drivers.sessions import (
 from agent_zoo.durability import (
     PluginStorage,
     PluginStoreDriver,
+    QueuedWorkerDriver,
     StoreUpdate,
     file_lock,
 )
@@ -2220,13 +2219,20 @@ def pool_launch_settings(settings, config, pool):
     return replace(settings, model=validate_model_profile(config, pool["model_profile"]))
 
 
-def launch_settings(state, config, *, profile=None):
-    provenance = config.get("_runtime_launch", {}) or {}
+def _validate_launch_inputs(state, config, *, profile=None) -> str:
+    """Pure Sans-I/O validation of launch model, project, and coordination store."""
     model = (validate_model_profile(config, profile) if profile is not None
              else str((config.get("llm", {}) or {}).get("default") or ""))
     project_name, store_root = _state_project_name(state), _state_store_root(state)
     if not model or not project_name or not store_root:
         raise ValueError("Current model, project, and coordination store are required to launch a swarm")
+    return model
+
+
+def launch_settings(state, config, *, profile=None):
+    provenance = config.get("_runtime_launch", {}) or {}
+    model = _validate_launch_inputs(state, config, profile=profile)
+    project_name, store_root = _state_project_name(state), _state_store_root(state)
     return RuntimeSettings(
         project=project_name, workdir=get_session_cwd(state), state_root=str(resolve_state_root()),
         store_root=store_root,
@@ -2367,122 +2373,12 @@ class SwarmStoreRequest(IoRequest):
     params: dict[str, Any] = field(default_factory=dict)
 
 
-class SwarmStoreDriver(Driver):
+class SwarmStoreDriver(QueuedWorkerDriver):
     """Commit-class Sans-I/O driver owning ALL ``SwarmStore``/``RecordStore``/checkpoint/liveness I/O."""
 
     request_types = (SwarmStoreRequest,)
     durability = "commit"
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._cond = threading.Condition(threading.RLock())
-        self._queue: deque[tuple[OpId, SwarmStoreRequest]] = deque()
-        self._cancelled: set[OpId] = set()
-        self._in_progress = False
-        self._closing = False
-        self._closed = False
-        self._worker: threading.Thread | None = None
-
-    def start(self, emit: EmitFn) -> None:
-        super().start(emit)
-        with self._cond:
-            self._closing = False
-            self._closed = False
-            if self._worker is None or not self._worker.is_alive():
-                self._worker = threading.Thread(
-                    target=self._worker_loop,
-                    name="agent-zoo-swarm-store",
-                    daemon=True,
-                )
-                self._worker.start()
-
-    def submit(self, op_id: OpId, req: IoRequest) -> None:
-        if not isinstance(req, SwarmStoreRequest):
-            raise TypeError(
-                f"SwarmStoreDriver expected SwarmStoreRequest, got {type(req).__name__}"
-            )
-        with self._cond:
-            if self._closing or self._closed or op_id in self._cancelled:
-                return
-            self._queue.append((op_id, req))
-            if self._worker is None or not self._worker.is_alive():
-                self._worker = threading.Thread(
-                    target=self._worker_loop,
-                    name="agent-zoo-swarm-store",
-                    daemon=True,
-                )
-                self._worker.start()
-            self._cond.notify_all()
-
-    def cancel(self, op_id: OpId) -> None:
-        with self._cond:
-            self._cancelled.add(op_id)
-
-    def drain(self, *, timeout_s: float | None = None) -> None:
-        deadline = (
-            None if timeout_s is None else (time.monotonic() + max(0.0, float(timeout_s)))
-        )
-        with self._cond:
-            while (self._queue or self._in_progress) and not self._closed:
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return
-                    self._cond.wait(timeout=min(remaining, 0.25))
-                else:
-                    self._cond.wait(timeout=0.25)
-
-    def quiesce(self, *, policy: str = "terminate", deadline: float | None = None) -> list:
-        del policy
-        remaining = None if deadline is None else max(0.0, float(deadline) - time.monotonic())
-        self.drain(timeout_s=remaining)
-        return []
-
-    def close(self) -> None:
-        with self._cond:
-            self._closing = True
-            worker = self._worker
-            self._cond.notify_all()
-        if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout=5.0)
-        with self._cond:
-            self._closed = True
-            self._worker = None
-            self._cancelled.clear()
-            self._cond.notify_all()
-
-    def _is_fenced(self, op_id: OpId) -> bool:
-        with self._cond:
-            return self._closed or op_id in self._cancelled
-
-    def _worker_loop(self) -> None:
-        while True:
-            with self._cond:
-                while not self._queue:
-                    if self._closing or self._closed:
-                        return
-                    self._cond.wait(timeout=0.5)
-                op_id, req = self._queue.popleft()
-                cancelled = op_id in self._cancelled
-                if not cancelled:
-                    self._in_progress = True
-            if cancelled:
-                with self._cond:
-                    self._cancelled.discard(op_id)
-                    self._cond.notify_all()
-                continue
-            try:
-                value = self.execute(req)
-                if not self._is_fenced(op_id):
-                    self._safe_emit(IoCompleted(op_id=op_id, value=value))
-            except Exception as exc:
-                if not self._is_fenced(op_id):
-                    self._safe_emit(IoFailed(op_id=op_id, error=exc))
-            finally:
-                with self._cond:
-                    self._in_progress = False
-                    self._cancelled.discard(op_id)
-                    self._cond.notify_all()
+    worker_name = "agent-zoo-swarm-store"
 
     def register_sim(self, sim, *, delay: float = 0.001):
         """Register deterministic simulation handler on a ``SimulationRuntime``."""
@@ -2550,8 +2446,15 @@ class SwarmStoreDriver(Driver):
             config = p["config"]
             profile_arg = request.get("profile")
             if profile_arg is None:
-                profile_arg = snapshot.settings.model
+                if getattr(snapshot, "settings", None) is not None:
+                    profile_arg = snapshot.settings.model
+                elif getattr(snapshot, "_requested_profile", None) is not None:
+                    profile_arg = snapshot._requested_profile
+                else:
+                    profile_arg = str((config.get("llm", {}) or {}).get("default") or "")
             profile = validate_model_profile(config, profile_arg)
+            if getattr(snapshot, "settings", None) is None:
+                snapshot.settings = launch_settings(snapshot, config, profile=profile)
             req_doc = dict(request, profile=profile)
             store, pool = allocate_pool(snapshot, req_doc)
             return profile, store, pool
@@ -2644,6 +2547,10 @@ class SwarmStoreDriver(Driver):
             pool_now = store.pool()
             if pool_now["desired_state"] == "cancelled":
                 raise ValueError("Cancelled swarms remain cancelled")
+            if getattr(snapshot, "settings", None) is None:
+                snapshot.settings = launch_settings(
+                    snapshot, config, profile=getattr(snapshot, "_requested_profile", None)
+                )
             settings = pool_launch_settings(snapshot.settings, config, pool_now)
             claimed = claim_recovery(
                 snapshot, store,
@@ -2723,7 +2630,7 @@ class SwarmStoreDriver(Driver):
             return owned_stores(p["snapshot"])
 
         if op == "launch_settings":
-            return launch_settings(p["snapshot"], p["config"])
+            return launch_settings(p["snapshot"], p["config"], profile=p.get("profile"))
 
         if op == "bootstrap_read_attempt":
             store = p["store"]
@@ -2861,6 +2768,8 @@ class SwarmController:
         cwd = get_session_cwd(state)
         durable = _swarm_durable(state)
         rt = self._rt(state)
+        if settings:
+            _validate_launch_inputs(state, self.config, profile=profile)
         return SimpleNamespace(
             _session_id=smeta.session_id,
             _instance_id=smeta.instance_id,
@@ -2873,7 +2782,8 @@ class SwarmController:
             cwd=cwd,
             session_cwd=cwd,
             _persistence_local_root=getattr(state, "_persistence_local_root", ""),
-            settings=launch_settings(state, self.config, profile=profile) if settings else None,
+            settings=None,
+            _requested_profile=profile,
         )
 
     def _fail_background(self, source_kind: str, fence: tuple, exc: object, state, emit) -> None:

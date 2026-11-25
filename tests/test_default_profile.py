@@ -158,7 +158,7 @@ def settings_request(harness, ctx, value=None):
                 reply = eff.request.payload
             elif isinstance(eff.request, PluginStoreRequest):
                 try:
-                    val = harness.driver._execute(eff.request)
+                    val = harness.driver.execute(eff.request)
                 except Exception as exc:
                     harness.dispatcher.handle(IoFailed(op_id=eff.op_id, error=exc), state, lambda _e: None)
                 else:
