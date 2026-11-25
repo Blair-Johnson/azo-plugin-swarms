@@ -68,7 +68,7 @@ def host_runtime(r, monkeypatch, *, sid, iid, checkpoint=None):
     }
     session = Session(system_prompt="SYS", cwd=str(r.tmp))
     session._session_id = sid
-    controller = swarm.SwarmController(config, session)
+    controller = swarm.SwarmController(config)
     pipeline = (
         PipelineBuilder()
         .add(core_feature())
@@ -113,7 +113,6 @@ def host_runtime(r, monkeypatch, *, sid, iid, checkpoint=None):
         "project_store_root": str(r.tmp / "registry"),
     }
     state._persistence_local_root = str(r.tmp / "local")
-    state.session_launcher = r.state.session_launcher
     startup_mode = "normal" if checkpoint else "paused"
     state._runtime_startup_mode = startup_mode
     state.startup_paused = startup_mode == "paused"
@@ -128,7 +127,6 @@ def host_runtime(r, monkeypatch, *, sid, iid, checkpoint=None):
             "project_name": "test",
             "project_store_root": str(r.tmp / "registry"),
         }
-        state.session_launcher = r.state.session_launcher
         state.startup_paused = False
         revision_id = checkpoint.state.commit_id
     else:

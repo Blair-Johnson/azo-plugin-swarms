@@ -16,7 +16,7 @@ from conftest import run_swarm_workflow
 @pytest.mark.parametrize("action", ["create", "bcast", "interrupt", "continue", "cancel"])
 def test_parent_completion_reaches_model_as_system_generated_user(action):
     session = Session(system_prompt="Initial instructions")
-    controller = swarm.SwarmController({}, session)
+    controller = swarm.SwarmController({})
     handler = swarm.SwarmCompletionHandler(controller)
     session.pipeline = (
         PipelineBuilder()

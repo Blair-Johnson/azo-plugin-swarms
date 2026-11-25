@@ -28,7 +28,7 @@ class _NoModelWork:
 @pytest.fixture
 def startup_runtime(tmp_path, monkeypatch):
     session = Session(system_prompt="offline startup submission", cwd=str(tmp_path))
-    controller = swarm.SwarmController({}, session)
+    controller = swarm.SwarmController({})
     work = []
     pipeline = (
         PipelineBuilder()

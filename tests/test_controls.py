@@ -14,7 +14,7 @@ def test_registration_exposes_one_raw_user_command_without_work(monkeypatch):
     forbidden = Mock(side_effect=AssertionError("registration must not do work"))
     for attribute in ("allocate_pool", "resolve_pool", "reserve_member_launch", "store_for"):
         monkeypatch.setattr(swarm, attribute, forbidden)
-    swarm.register_features(SimpleNamespace(add=features.append), session=SimpleNamespace(), config={})
+    swarm.register_features(SimpleNamespace(add=features.append), config={})
     commands = [c for f in features for c in f.components if isinstance(c, Command)]
     command, = commands
     assert command.path == "/swarm" and command.raw and not command.args

@@ -94,6 +94,7 @@ def client_for(monkeypatch, row, **hello_changes):
     q = asyncio.Queue()
     client = SimpleNamespace(
         connect=AsyncMock(), close=AsyncMock(), send_json=AsyncMock(),
+        drain_initial_hello=AsyncMock(),
         recv=AsyncMock(return_value={"type": "_closed"}),
         _queue=q, protocol_errors=[],
         observation=lambda: SimpleNamespace(hello=hello, protocol_errors=[]),

@@ -183,7 +183,7 @@ def test_installed_skill_copy_path_and_explicit_refresh(tmp_path, monkeypatch):
     assert state.skill_registry.get("Swarms").description == "Initial description"
     # Explicit SkillRefreshRequested refreshes from disk via IoCompleted.
     refresher = SkillRefreshHandler(state.skill_registry)
-    refresher.handle(SkillRefreshRequested(), state, lambda _ev: None)
+    refresher.handle(SkillRefreshRequested(sources=(component._preloaded[2],)), state, lambda _ev: None)
     glob_effect, = state.io.take_outbox()
     refresher.handle(IoCompleted(op_id=glob_effect.op_id, value=[str(path)]), state, lambda _ev: None)
     read_effect, = state.io.take_outbox()

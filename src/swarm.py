@@ -32,8 +32,11 @@ from agent_utils.core.events import (
     IoLost,
     IoReattached,
     RenderRequested,
+    RunToolCall,
     SessionRestored,
+    SessionStarted,
     TimerFired,
+    ToolCallFinished,
     TurnSettled,
 )
 from agent_utils.core.io import IoRequest, OpId, StartTimer
@@ -41,9 +44,15 @@ from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import MODEL_RENDER_CHANNEL, DurableSpec
 from agent_utils.core.tool import Tool
 from agent_utils.features.buffers import ReadonlyBufferView
-from agent_utils.features.core import IoFence, MessageRenderer, RenderTransformRegistrar
+from agent_utils.features.core import (
+    IoFence,
+    MessageRenderer,
+    RenderPlanInitializer,
+    RenderTransformRegistrar,
+    SchemaPublisher,
+    ToolRunner,
+)
 from agent_utils.features.interrupts import InterruptDelivery, InterruptQueued
-from agent_utils.features.skills import SkillSource
 from agent_utils.storage.repository import SessionRepository
 from agent_zoo.config.loader import CONFIG_PATH, load_layered_config
 from agent_zoo.core.feature_state import ZooState
@@ -51,14 +60,16 @@ from agent_zoo.drivers.sessions import (
     AgentZooSessionDriver, DeliveryUnknown, PreSendRace, resolve_session_lineage, validate_loopback_ws_url,
 )
 from agent_zoo.durability import (
+    BundledSkillRegistrar,
+    PluginConfigBox,
     PluginStorage,
     PluginStoreDriver,
     QueuedWorkerDriver,
-    SessionContext,
-    StoreUpdate,
     atomic_write_json,
     file_lock,
+    preload_bundled_skill,
     session_context,
+    session_cwd,
     session_state,
 )
 from agent_zoo.events import (
@@ -231,26 +242,6 @@ def _readiness_release(state: Any, emit: EmitFn | None = None) -> None:
         emit(PacingCheck(reason="swarm_ready"))
 
 
-def get_session_cwd(state) -> str:
-    """Resolve active session working directory purely from ``state.cwd`` (with legacy fallbacks)."""
-    cwd = str(
-        getattr(state, "cwd", "") or getattr(state, "session_cwd", "")
-        or getattr(state, "terminal_cwd", "") or ""
-    ).strip()
-    return cwd
-
-
-def _resolve_session_context(state: Any, config: Mapping[str, Any] | None = None) -> SessionContext:
-    ctx = session_context(state)
-    if config and (not ctx.config_path or not ctx.config_sets):
-        cfg_ctx = session_context(SimpleNamespace(config=dict(config)))
-        if not ctx.config_path and cfg_ctx.config_path:
-            ctx.config_path = cfg_ctx.config_path
-        if not ctx.config_sets and cfg_ctx.config_sets:
-            ctx.config_sets = cfg_ctx.config_sets
-    return ctx
-
-
 def _state_project_name(state) -> str:
     return str(session_context(state).project_name or _session_meta(state).project_name or "")
 
@@ -308,7 +299,7 @@ def load_default_profile():
 
 def saved_model_config(config):
     """Persistent layers only: never the session model or CLI config_sets (build/driver time only)."""
-    path = session_context(SimpleNamespace(config=config or {})).config_path
+    path = session_context(None, config=config or {}).config_path
     try:
         if path and Path(path).resolve() == CONFIG_PATH.resolve():
             path = None
@@ -353,24 +344,66 @@ def save_default_profile(config, profile):
         raise SettingError("Cannot save swarm default profile") from None
 
 
-@dataclass
-class _SettingsBox:
-    """Build-time preloaded settings cache so ``Setting.get`` / ``Setting.set`` are 100% pure Sans-I/O."""
+def _validate_swarm_config_dict(data: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise SettingError("Swarm config must be a JSON object")
+    profile = data.get("default_profile")
+    if profile is not None and (not isinstance(profile, str) or not profile.strip()):
+        raise SettingError("Swarm default_profile must be a nonempty profile name or null")
+    return dict(data)
 
-    saved_config: dict[str, Any]
-    choices: tuple[str, ...]
-    global_default: str | None
-    override: str | None = None
-    load_error: str | None = None
+
+class _SwarmProfileBox(PluginConfigBox):
+    """``PluginConfigBox`` specialized for ``swarm.default_profile`` with bundled/global fallback."""
+
+    def __init__(
+        self,
+        *,
+        saved_config: dict[str, Any],
+        choices: tuple[str, ...],
+        global_default: str | None,
+        bundled_default: str | None = None,
+        bundled_error: str | None = None,
+    ) -> None:
+        self.saved_config = saved_config
+        self.choices = choices
+        self.global_default = global_default
+        self.bundled_default = bundled_default
+        self._installed_existed = False
+        super().__init__(
+            PLUGIN_NAME,
+            config_filename="config/swarm.json",
+            default={},
+            validate=_validate_swarm_config_dict,
+        )
+        if self.load_error is not None:
+            if "default_profile" in self.load_error:
+                self.load_error = "Swarm default_profile must be a nonempty profile name or null"
+            elif "JSON object" in self.load_error:
+                self.load_error = "Swarm config must be a JSON object"
+            else:
+                self.load_error = "Cannot read swarm config"
+        elif not self._installed_existed and bundled_error is not None:
+            self.load_error = bundled_error
+
+    def reload(self) -> dict[str, Any]:
+        self._installed_existed = self.store.path.exists()
+        return super().reload()
 
     def current_value(self) -> str:
-        if self.load_error:
-            raise SettingError(self.load_error)
-        profile = self.override if self.override is not None else self.global_default
+        data = self.require_loaded()
+        if "default_profile" in data:
+            profile = data["default_profile"]
+        elif self._installed_existed:
+            profile = None
+        else:
+            profile = self.bundled_default
+        if profile is None:
+            profile = self.global_default
         return validate_saved_profile(self.saved_config, profile)
 
 
-def _build_settings_box(config: dict[str, Any]) -> _SettingsBox | None:
+def _build_settings_box(config: dict[str, Any]) -> _SwarmProfileBox | None:
     try:
         saved = saved_model_config(config)
         choices = tuple(enabled_llm_models(saved))
@@ -380,22 +413,26 @@ def _build_settings_box(config: dict[str, Any]) -> _SettingsBox | None:
     if not choices or len(choices) > 128 or any(len(key.encode("utf-8")) > 256 for key in choices):
         return None
     global_default = (saved.get("llm", {}) or {}).get("default")
-    override: str | None = None
-    load_error: str | None = None
-    try:
-        override = load_default_profile()
-    except SettingError as exc:
-        load_error = str(exc)
-    return _SettingsBox(
+    bundled_default: str | None = None
+    bundled_error: str | None = None
+    if not swarm_config_path().exists():
+        bundled = Path(__file__).resolve().parent.parent / "config/swarm.json"
+        try:
+            bundled_cfg = read_swarm_config(bundled)
+            if bundled_cfg is not None:
+                bundled_default = bundled_cfg.get("default_profile")
+        except SettingError as exc:
+            bundled_error = str(exc)
+    return _SwarmProfileBox(
         saved_config=saved,
         choices=choices,
         global_default=global_default,
-        override=override,
-        load_error=load_error,
+        bundled_default=bundled_default,
+        bundled_error=bundled_error,
     )
 
 
-def profile_setting(config, *, settings_box: _SettingsBox | None = None):
+def profile_setting(config, *, settings_box: _SwarmProfileBox | None = None):
     box = settings_box if settings_box is not None else _build_settings_box(config)
     if box is None:
         return []
@@ -406,26 +443,11 @@ def profile_setting(config, *, settings_box: _SettingsBox | None = None):
     def _set(ctx, value):
         box.current_value()
         validate_saved_profile(box.saved_config, value)
-        prev = box.override
-        box.override = value
-
-        def _rollback():
-            box.override = prev
-
-        state = getattr(ctx, "state", None)
-        io_table = getattr(state, "io", None) if state is not None else None
-        submit_persist = getattr(ctx, "submit_persist_io", None)
-        if io_table is not None and callable(submit_persist):
-            submit_persist(
-                StoreUpdate(
-                    plugin="azo-plugin-swarms",
-                    scope="config",
-                    config_filename="config/swarm.json",
-                    key="default_profile",
-                    value=value,
-                ),
-                rollback=_rollback,
-            )
+        box.mutate(
+            ctx,
+            lambda d: {**d, "default_profile": value},
+            require_persist=False,
+        )
 
     return [Setting(
         "swarm.default_profile", "Default model profile", "choice",
@@ -452,64 +474,32 @@ def load_worker_prompt():
             'Do your assigned work yourself; do not spawn subagents. Share findings with swarm_post.')
 
 
-def _preload_swarm_skill() -> tuple[str | None, str | None, str | None]:
-    """Read the Swarms SKILL.md ONCE at build/init time, never inside ``handle()``."""
-    relative = Path("skills/swarm/SKILL.md")
-    installed = PluginStorage(PLUGIN_NAME).config_dir / relative
-    package = installed if installed.is_file() else Path(__file__).resolve().parent.parent / relative
-    try:
-        text = package.read_text(encoding="utf-8")
-    except (OSError, UnicodeError, ValueError):
-        LOG.warning("Cannot read swarm skill at %s", package, exc_info=True)
-        return str(package.parent), str(package), None
-    return str(package.parent), str(package), text
+def _preload_swarm_skill():
+    """Read the Swarms SKILL.md ONCE at build/init time via ``preload_bundled_skill``."""
+    installed = PluginStorage(PLUGIN_NAME).config_dir / "skills/swarm"
+    bundled = Path(__file__).resolve().parent.parent / "skills/swarm"
+    skill_dir = installed if (installed / "SKILL.md").is_file() else bundled
+    return preload_bundled_skill(
+        skill_dir,
+        kind=PLUGIN_NAME,
+        precedence=-5000,
+        scope="bundled",
+        native=True,
+        always_list=True,
+    )
 
 
-class SwarmSkillRegistration(RenderTransformRegistrar):
-    """Bind the preloaded coordinator skill once to each live/restored registry (pure Sans-I/O)."""
-    handles = (SessionReady, SessionRestored, RenderRequested)
-    optional_reads = {"skill_registry"}
-    writes = {"skill_registry"}
+class SwarmSkillRegistration(BundledSkillRegistrar):
+    """Bind the preloaded coordinator skill once per session/registry (pure Sans-I/O)."""
 
-    def __init__(self, *, skill_dir: str | None = None, skill_path: str | None = None, skill_text: str | None = None):
-        if skill_dir is None and skill_path is None and skill_text is None:
-            skill_dir, skill_path, skill_text = _preload_swarm_skill()
-        self._skill_dir = skill_dir
-        self._skill_path = skill_path
-        self._skill_text = skill_text
-        self.registry = None
-        self.worker = None
-
-    def sync(self, state):
-        registry = getattr(state, "skill_registry", None)
-        worker = bool(worker_identity(state))
-        if registry is None or (
-            registry is self.registry and worker == self.worker
-            and (not worker or registry.get("Swarms") is None)
-        ):
-            return state
-        if worker:
-            registry._file_skills = [s for s in registry._file_skills if s.name.lower() != "swarms"]
-            registry._dynamic_skills = {k: v for k, v in registry._dynamic_skills.items() if k.lower() != "swarms"}
-            registry._sources = [s for s in registry._sources if s.kind != "azo-plugin-swarms"]
-            registry._rebuild()
-        elif self._skill_dir:
-            source = SkillSource(
-                self._skill_dir, kind="azo-plugin-swarms", scope="bundled",
-                precedence=-5000, native=True, always_list=True,
-            )
-            registry.add_sources([source])
-            if self._skill_path and self._skill_text is not None:
-                try:
-                    registry.register_skill_text(self._skill_path, self._skill_text, source=source)
-                except ValueError:
-                    LOG.warning("Cannot register swarm skill at %s", self._skill_path, exc_info=True)
-        self.registry, self.worker = registry, worker
-        return state
-
-    def handle(self, event, state, emit):
-        del event, emit
-        self.sync(state)
+    def __init__(self, *, preloaded=None):
+        super().__init__(
+            preloaded=preloaded if preloaded is not None else _preload_swarm_skill(),
+            skill_name="Swarms",
+            runtime_key="swarm.bundled_skill",
+            exclude_when=lambda state: bool(worker_identity(state)),
+            handles=(SessionStarted, SessionReady, SessionRestored, RenderRequested),
+        )
 
 
 class SwarmSystemPrompt(RenderTransformRegistrar):
@@ -2130,15 +2120,6 @@ def _try_commit_member_bootstrap(state, store: SwarmStore, pool: dict, pod: dict
     )
 
 
-def _commit_member_bootstrap(state, store: SwarmStore, pool: dict, pod: dict, grant: dict,
-                             event: dict, *, replacement: bool, timeout: float = 25.0) -> dict:
-    del timeout
-    result = _try_commit_member_bootstrap(state, store, pool, pod, grant, event, replacement=replacement)
-    if result is None:
-        raise ValueError("Initial checkpoint is not shared; member is not recoverable")
-    return result
-
-
 def require_parent(state):
     if not _session_meta(state).session_id:
         raise ValueError("A saved parent session identity is required")
@@ -2253,12 +2234,12 @@ def _validate_launch_inputs(state, config, *, profile=None) -> str:
 
 
 def launch_settings(state, config, *, profile=None):
-    ctx = _resolve_session_context(state, config)
+    ctx = session_context(state, config=config)
     model = _validate_launch_inputs(state, config, profile=profile)
     project_name, store_root = _state_project_name(state), _state_store_root(state)
     storage = PluginStorage(PLUGIN_NAME)
     return RuntimeSettings(
-        project=project_name, workdir=get_session_cwd(state),
+        project=project_name, workdir=session_cwd(state),
         state_root=str(ctx.state_root or storage.state_root),
         store_root=store_root,
         local_state_root=str(ctx.local_state_root or resolve_local_root(config)),
@@ -2404,19 +2385,6 @@ class SwarmStoreDriver(QueuedWorkerDriver):
     request_types = (SwarmStoreRequest,)
     durability = "commit"
     worker_name = "agent-zoo-swarm-store"
-
-    def register_sim(self, sim, *, delay: float = 0.001):
-        """Register deterministic simulation handler on a ``SimulationRuntime``."""
-        from agent_utils.runtime.simulation import SimOutcome
-
-        def _handler(_op_id, req, _sim):
-            try:
-                return SimOutcome(value=self.execute(req), delay=delay)
-            except Exception as exc:
-                return SimOutcome(error=exc, delay=delay)
-
-        sim.register_handler(SwarmStoreRequest, _handler)
-        return self
 
     def execute(self, req: SwarmStoreRequest) -> Any:
         op = req.op
@@ -2723,10 +2691,10 @@ class _WorkflowRunner:
 class SwarmController:
     """100% pure Sans-I/O workflow controller over ``AgentZooSessionDriver``, ``SwarmStoreDriver``, and ``TimerDriver``."""
 
-    def __init__(self, config, session=None, *, settings_box: _SettingsBox | None = None):
-        self.config, self.session = config, session
-        self._settings_box: _SettingsBox | None = settings_box
-        self._state: Any = getattr(session, "state", None)
+    def __init__(self, config, *, settings_box: _SwarmProfileBox | None = None):
+        self.config = config
+        self._settings_box: _SwarmProfileBox | None = settings_box
+        self._state: Any = None
         self._fallback_runtime = SwarmRuntimeState()
 
     def _rt(self, state: Any = None) -> SwarmRuntimeState:
@@ -2782,7 +2750,7 @@ class SwarmController:
     def identity(self, state):
         smeta = _session_meta(state)
         return (id(state), smeta.session_id, smeta.instance_id,
-                id(getattr(self.session, "pipeline", None)))
+                int(getattr(state, "io_generation", 0) or 0))
 
     def snapshot(self, state, *, settings=False, profile=None):
         if state is not None:
@@ -2790,12 +2758,12 @@ class SwarmController:
         smeta = _session_meta(state)
         if not smeta.session_id or not smeta.instance_id:
             raise ValueError("Final runtime session and instance identities are required")
-        cwd = get_session_cwd(state)
+        cwd = session_cwd(state)
         durable = _swarm_durable(state)
         rt = self._rt(state)
         if settings:
             _validate_launch_inputs(state, self.config, profile=profile)
-        ctx = _resolve_session_context(state, self.config)
+        ctx = session_context(state, config=self.config)
         snap = SimpleNamespace(
             swarm_access=dict(durable.swarm_access),
             grants=deepcopy(rt.grants),
@@ -3678,7 +3646,7 @@ class SwarmCompletionHandler:
         event.stop()
         fence, source_kind, payload = entry
         identity = c.identity(state)
-        if fence != identity or (c.session is not None and getattr(c.session, "state", state) is not state):
+        if fence != identity:
             LOG.warning("Discarding stale swarm completion for %s", fence[1:3])
             if isinstance(payload, Mapping) and "_wf" in payload:
                 rt.workflows.pop(payload["_wf"], None)
@@ -3693,7 +3661,50 @@ class SwarmCompletionHandler:
             c._deliver_final(source_kind, state, event.value, emit)
 
 
-def register_features(builder, *, session, config):
+_RLM_PARENT_TOOLS = frozenset({"submit_rlm", "rlm_status", "cancel_rlm"})
+
+
+class SwarmRlmToolGuard:
+    """Block parent RLM tool execution inside swarm worker sessions (pure Sans-I/O)."""
+
+    handles = (RunToolCall,)
+    optional_reads = {"pending_tool_calls"}
+    writes: set[str] = set()
+
+    def handle(self, event, state, emit):
+        if not worker_identity(state):
+            return
+        tc = event.tool_call
+        if tc.result is None and tc.name in _RLM_PARENT_TOOLS:
+            tc.result = f"ERROR: '{tc.name}' is not available to swarm workers."
+            tc.error = True
+            tc.finished_at = event.ts
+            event.stop()
+            emit(ToolCallFinished(tc))
+
+
+class SwarmRlmSchemaFilter:
+    """Hide parent RLM tool schemas inside swarm worker sessions (pure Sans-I/O)."""
+
+    handles = (RenderRequested, TurnSettled)
+    optional_reads = {"tool_schemas"}
+    writes = {"tool_schemas"}
+
+    def handle(self, event, state, emit):
+        del event, emit
+        if not worker_identity(state):
+            return
+        schemas = getattr(state, "tool_schemas", None)
+        if not isinstance(schemas, dict):
+            return
+        for tool_name in _RLM_PARENT_TOOLS:
+            if tool_name in schemas:
+                entry = dict(schemas[tool_name])
+                entry["available"] = False
+                schemas[tool_name] = entry
+
+
+def register_features(builder, *, config):
     settings_box = _build_settings_box(config)
     builder.add(Feature(
         "swarm_settings",
@@ -3701,21 +3712,20 @@ def register_features(builder, *, session, config):
         order=[Setting],
         drivers=[PluginStoreDriver],
     ))
-    if worker_identity(getattr(session, "state", None)) and getattr(builder, "has", lambda _: False)("rlm"):
-        feature = builder._features["rlm"]
-        builder.add(replace(feature, components=[c for c in feature.components if not isinstance(c, Tool)]))
-    controller = SwarmController(config, session, settings_box=settings_box)
+    controller = SwarmController(config, settings_box=settings_box)
     builder.add(Feature(
         "swarm",
         components=[
             SwarmBuffers(),
             SwarmRuntimeReady(controller),
             SwarmCompletionHandler(controller),
+            SwarmRlmToolGuard(),
             SwarmTool(controller, "broadcast", "swarm_broadcast"),
             SwarmTool(controller, "interrupt", "swarm_interrupt"),
             SwarmTool(controller, "continue_swarm", "swarm_continue"),
             SwarmTool(controller, "cancel", "swarm_cancel"),
             SwarmTool(controller, "post_message", "swarm_post", parent_only=False),
+            SwarmRlmSchemaFilter(),
             Command(
                 "/swarm", "Launch a swarm", controller.command, raw=True,
                 usage="/swarm -n AGENTS [-p PODS] [--channels NAME,...] [--name NAME] [--profile PROFILE]",
@@ -3724,7 +3734,8 @@ def register_features(builder, *, session, config):
         ],
         order=[
             IoFence, RegisterSpecialBuffers, SwarmBuffers, SwarmRuntimeReady,
-            SwarmCompletionHandler, Command, Tool,
+            SwarmCompletionHandler, Command, ToolRunner, SwarmRlmToolGuard, Tool,
+            SchemaPublisher, SwarmRlmSchemaFilter, RenderPlanInitializer,
         ],
         drivers=[make_swarm_session_driver, SwarmStoreDriver],
         durable_state=SWARM_DURABLE_SPEC,

@@ -20,7 +20,7 @@ def tool_runtime(runtime):
     r = runtime
     r.state.io = IoTable()
     session = SimpleNamespace(state=r.state, pipeline=object())
-    c = swarm.SwarmController({"llm": {"default": "offline"}}, session)
+    c = swarm.SwarmController({"llm": {"default": "offline"}})
     c.grants = r.state.grants.copy()
 
     def take_effects():
@@ -31,7 +31,7 @@ def tool_runtime(runtime):
 
 def test_exact_five_tools_have_named_zero_based_arguments():
     features = []
-    swarm.register_features(SimpleNamespace(add=features.append), session=SimpleNamespace(), config={})
+    swarm.register_features(SimpleNamespace(add=features.append), config={})
     swarm_feature = next(f for f in features if f.name == "swarm")
     tools = {t.name: t for t in swarm_feature.components if isinstance(t, Tool)}
     assert set(tools) == {"swarm_broadcast", "swarm_interrupt", "swarm_continue", "swarm_cancel", "swarm_post"}
@@ -68,17 +68,24 @@ def test_stale_completion_is_observed_but_not_applied(tool_runtime, change):
     t.controller.interrupt("sw0", state)
     effect, = t.take_effects()
     result = dict(summary="must not deliver", access={"forged": ""}, grants={"forged": {}})
+    target_state = state
     if change == "state":
-        t.session.state = SimpleNamespace()
+        target_state = SimpleNamespace(
+            _session_id=state._session_id,
+            _instance_id=state._instance_id,
+            pending_interrupts=[],
+            swarm_access={},
+        )
     elif change == "session":
         state._session_id = "different"
     elif change == "instance":
         state._instance_id = "different"
     else:
-        t.session.pipeline = object()
+        state.io_generation = int(getattr(state, "io_generation", 0) or 0) + 1
     swarm.SwarmCompletionHandler(t.controller).handle(
-        IoCompleted(op_id=effect.op_id, value=result), state, lambda _ev: None
+        IoCompleted(op_id=effect.op_id, value=result), target_state, lambda _ev: None
     )
+    assert not target_state.pending_interrupts and "forged" not in target_state.swarm_access
     assert not state.pending_interrupts and "forged" not in state.swarm_access
     assert "forged" not in t.controller.grants
 
@@ -258,8 +265,17 @@ def test_new_plugin_builds_real_pipelines(tmp_path, monkeypatch, pipeline_name, 
     assert "view" in tools
     assert any(type(c).__name__ == "SwarmCompletionHandler" for c in pipeline)
     has_rlm = pipeline_name == "build_default_pipeline" and not is_member
-    assert tools & {"submit_rlm", "rlm_status", "cancel_rlm"} == (
+    available_tools = {name for name, entry in session.state.tool_schemas.items() if entry.get("available")}
+    assert available_tools & {"submit_rlm", "rlm_status", "cancel_rlm"} == (
         {"submit_rlm", "rlm_status", "cancel_rlm"} if has_rlm else set())
+    if pipeline_name == "build_default_pipeline" and is_member:
+        from agent_utils.core.events import RunToolCall
+        from agent_utils.core.state import ToolCall
+
+        tc = ToolCall(id="rlm-block-1", name="submit_rlm", raw_args="{}", parsed_args={"prompt": "nope"})
+        session.state.pending_tool_calls.append(tc)
+        session.step(RunToolCall(tc))
+        assert tc.error and "not available to swarm workers" in str(tc.result)
     has_compaction = pipeline_name == "build_default_pipeline"
     for component in ("RLMCompletionHandler", "ContextCompactionGate", "ContextCompactionRenderer"):
         assert any(type(c).__name__ == component for c in pipeline) == has_compaction
@@ -339,7 +355,7 @@ def test_swarm_module_and_pipeline_are_strictly_sans_io(tmp_path, monkeypatch):
         .add(interrupts_feature())
         .add(special_buffers_feature())
     )
-    swarm.register_features(builder, session=session, config={})
+    swarm.register_features(builder, config={})
     pipeline = builder.build()
     assert_pipeline_sans_io(pipeline)
 

@@ -22,7 +22,7 @@ def _make_sim_swarm(tmp_path, monkeypatch):
         "llm": {"default": "offline", "models": {"offline": {"enabled": True}}},
     }
     session = Session(system_prompt="sim parent", cwd=str(tmp_path))
-    controller = swarm.SwarmController(config, session)
+    controller = swarm.SwarmController(config)
     pipeline = (
         PipelineBuilder()
         .add(core_feature())

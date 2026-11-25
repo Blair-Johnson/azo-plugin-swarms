@@ -120,7 +120,7 @@ def settings_registry(config):
 
     session = Session()
     features = []
-    swarm.register_features(SimpleNamespace(add=features.append), session=session, config=config)
+    swarm.register_features(SimpleNamespace(add=features.append), config=config)
     feature = next(feature for feature in features if feature.name == "swarm_settings")
     session.pipeline = PipelineBuilder().add(feature).build()
     session.ensure_initialized()

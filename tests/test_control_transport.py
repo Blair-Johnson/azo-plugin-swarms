@@ -105,7 +105,7 @@ def test_agent_tool_requires_background_service_not_slash_ingress():
     io = SessionIO(session_id="parent")
     state = SimpleNamespace(_session_id="parent", _instance_id="parent-instance", swarm_access={"sw0": ""},
                             _session_websocket_server=SimpleNamespace(session_io=io),
-                            session_cwd=str(__import__("pathlib").Path.cwd()))
+                            cwd=str(__import__("pathlib").Path.cwd()))
     controller = swarm.SwarmController({})
     with pytest.raises(ValueError, match="Background execution unavailable"):
         controller.broadcast("sw0", "exact payload", state=state)
