@@ -2,7 +2,6 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 import pytest
-from agent_zoo.events import RunPluginTask
 from agent_zoo.features.commands import Command, CommandError, CommandRegistry
 import swarm
 from conftest import execute_swarm_request
@@ -43,7 +42,7 @@ def test_valid_slash_control_uses_detached_shared_request(runtime):
     c.command(ctx, raw_args='bcast sw0 -p 0 "  first\nlast  "')
     assert ctx.submit_io.call_count == 1
     task = ctx.submit_io.call_args.args[0]
-    assert isinstance(task, RunPluginTask)
+    assert isinstance(task, swarm.SwarmStoreRequest) and task.op == "control_begin"
     _, _, meta = c.in_flight["op_1"]
     assert meta["message"] == "  first\nlast  " and meta["pods"] == (0,)
     assert meta["operation_id"]
@@ -52,7 +51,7 @@ def test_valid_slash_control_uses_detached_shared_request(runtime):
         for member in r.members:
             records.put("members", member["session_id"], dict(recovery_status="ready_paused"))
     r.state._agent_zoo_context["project_name"] = "changed"
-    store, pool, members, op = task.fn()
+    store, pool, members, op = swarm.SwarmStoreDriver().execute(task)
     assert pool["id"] == "sw0" and len(members) == 1 and op["pods"] == (0,)
 
 

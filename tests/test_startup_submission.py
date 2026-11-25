@@ -1,4 +1,4 @@
-"""Startup submission across the real AgentZooSessionDriver + PluginTaskDriver boundary; no providers."""
+"""Startup submission across the real AgentZooSessionDriver + SwarmStoreDriver boundary; no providers."""
 import logging
 import threading
 import time
@@ -8,7 +8,7 @@ from unittest.mock import Mock
 import pytest
 from agent_utils import Feature, PipelineBuilder, Runtime, Session, core_feature, interrupts_feature
 from agent_utils.core.events import BeforeLLM, IoCompleted
-from agent_zoo.drivers.plugin_task import PluginTaskDriver
+from agent_utils.runtime.drivers.timer import TimerDriver
 from agent_zoo.events import SessionReady
 
 import swarm
@@ -49,7 +49,7 @@ def startup_runtime(tmp_path, monkeypatch):
                     swarm.SwarmCompletionHandler,
                     swarm.InterruptDelivery,
                 ],
-                drivers=[swarm.make_swarm_session_driver, PluginTaskDriver],
+                drivers=[swarm.make_swarm_session_driver, swarm.SwarmStoreDriver, TimerDriver],
             )
         )
         .build()
@@ -65,7 +65,7 @@ def startup_runtime(tmp_path, monkeypatch):
     state.swarm_resource_uids = {}
 
     driver = swarm.make_swarm_session_driver()
-    runtime = Runtime(session, drivers=[driver, PluginTaskDriver()])
+    runtime = Runtime(session, drivers=[driver, swarm.SwarmStoreDriver(), TimerDriver()])
     threads = []
     result = dict(summary="startup completed once", access={"sw0": ""}, grants={})
 

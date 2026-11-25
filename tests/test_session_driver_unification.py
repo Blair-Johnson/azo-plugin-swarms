@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from agent_utils import Feature, PipelineBuilder, Session, core_feature, interrupts_feature
-from agent_utils.runtime.simulation import SimOutcome, SimulationRuntime
+from agent_utils.runtime.simulation import SimulationRuntime
 from agent_zoo.drivers.sessions import SimSessionDriver
-from agent_zoo.events import RunPluginTask, SessionArtifact, SessionDataReceived
+from agent_zoo.events import SessionArtifact, SessionDataReceived
 from agent_zoo.features.special_buffers import special_buffers_feature
 from tmux_pilot.process_identity import HostIdentity, ProcessIdentity
 import swarm
@@ -61,10 +61,7 @@ def _make_sim_swarm(tmp_path, monkeypatch):
     st.swarm_resource_uids = {}
 
     sim_sessions = SimSessionDriver().register(sim := SimulationRuntime(session, seed=42))
-    sim.register_handler(
-        RunPluginTask,
-        lambda op_id, req, s: SimOutcome(value=req.fn(*req.args, **req.kwargs), delay=0.001),
-    )
+    swarm.SwarmStoreDriver().register_sim(sim, delay=0.001)
     return session, controller, sim, sim_sessions, config
 
 

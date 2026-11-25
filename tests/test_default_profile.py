@@ -31,7 +31,7 @@ def test_default_precedence_and_persistence(runtime, config, launches, settings_
     settings_file.write_text(json.dumps(settings))
     original = deepcopy(config)
     ctx = SimpleNamespace(state=runtime.state, submit_io=Mock(return_value="op_1"))
-    controller = swarm.SwarmController(config)
+    controller = swarm.SwarmController(config, settings_box=swarm._build_settings_box(config))
     controller.command(ctx, raw_args="-n2" + (f" --profile {explicit}" if explicit else ""))
     settings_file.write_text('{"default_profile":"other"}')
     result = drain_first_request(controller, runtime.state, ctx.submit_io.call_args.args[0])
@@ -48,8 +48,9 @@ def test_default_precedence_and_persistence(runtime, config, launches, settings_
 def test_invalid_json_config_is_status_only(runtime, config, settings_file, text):
     settings_file.write_text(text)
     ctx = SimpleNamespace(state=runtime.state, submit_io=Mock(return_value="op_1"), emit=Mock())
+    controller = swarm.SwarmController(config, settings_box=swarm._build_settings_box(config))
     with pytest.raises(CommandError, match="swarm config|default_profile|Swarm config"):
-        swarm.SwarmController(config).command(ctx, raw_args="-n2")
+        controller.command(ctx, raw_args="-n2")
     ctx.submit_io.assert_not_called()
     ctx.emit.assert_not_called()
     runtime.state.session_launcher.prepare.assert_not_called()
@@ -61,8 +62,9 @@ def test_unknown_or_disabled_default_rejected_before_defer(runtime, config, sett
     if disabled:
         config["llm"]["models"][PROFILE]["enabled"] = False
     ctx = SimpleNamespace(state=runtime.state, submit_io=Mock(return_value="op_1"))
+    controller = swarm.SwarmController(config, settings_box=swarm._build_settings_box(config))
     with pytest.raises(CommandError, match="enabled saved model profile|disabled"):
-        swarm.SwarmController(config).command(ctx, raw_args="-n1")
+        controller.command(ctx, raw_args="-n1")
     ctx.submit_io.assert_not_called()
 
 
@@ -113,7 +115,8 @@ def test_unreadable_installed_config_does_not_silently_fall_back(settings_file, 
 
 def settings_registry(config):
     from agent_utils import PipelineBuilder, Session
-    from agent_zoo.features.settings import Setting, SettingsContext, SettingsRegistry
+    from agent_zoo.durability import PluginStoreDriver
+    from agent_zoo.features.settings import Setting, SettingsContext, SettingsDispatcher
 
     session = Session()
     features = []
@@ -121,15 +124,47 @@ def settings_registry(config):
     feature = next(feature for feature in features if feature.name == "swarm_settings")
     session.pipeline = PipelineBuilder().add(feature).build()
     session.ensure_initialized()
-    registry = SettingsRegistry([item for item in session.pipeline if isinstance(item, Setting)])
-    return registry, SettingsContext(state=session.state, emit=lambda _ev: None, config=config)
+    settings = [item for item in session.pipeline if isinstance(item, Setting)]
+    dispatcher = SettingsDispatcher(settings=settings, config=config)
+    driver = PluginStoreDriver()
+    ctx = SettingsContext(state=session.state, emit=lambda _ev: None, config=config)
+    return SimpleNamespace(dispatcher=dispatcher, registry=dispatcher.registry, driver=driver, session=session), ctx
 
 
-def settings_request(registry, ctx, value=None):
-    request = dict(type="plugin_settings", request_id="test", action="list")
-    if value is not None:
-        request.update(action="set", binding=registry.binding, key="swarm.default_profile", value=value)
-    return registry.handle(request, ctx)
+def settings_request(harness, ctx, value=None):
+    from agent_utils.core.events import IoCompleted, IoFailed
+    from agent_utils.core.io import SubmitOp
+    from agent_zoo.events import PluginStoreRequest, ReplyFrontendRequest, SettingsRequest
+
+    state = ctx.state
+    if value is None:
+        ev = SettingsRequest(request_id="test", action="list")
+    else:
+        ev = SettingsRequest(
+            request_id="test",
+            action="set",
+            binding=harness.dispatcher.registry.binding,
+            key="swarm.default_profile",
+            value=value,
+        )
+    harness.dispatcher.handle(ev, state, lambda _e: None)
+    reply = None
+    while True:
+        effects = [eff for eff in state.io.take_outbox() if isinstance(eff, SubmitOp)]
+        if not effects:
+            break
+        for eff in effects:
+            if isinstance(eff.request, ReplyFrontendRequest):
+                reply = eff.request.payload
+            elif isinstance(eff.request, PluginStoreRequest):
+                try:
+                    val = harness.driver._execute(eff.request)
+                except Exception as exc:
+                    harness.dispatcher.handle(IoFailed(op_id=eff.op_id, error=exc), state, lambda _e: None)
+                else:
+                    harness.dispatcher.handle(IoCompleted(op_id=eff.op_id, value=val), state, lambda _e: None)
+    assert reply is not None
+    return reply
 
 
 def test_setting_persists_without_mutating_session_or_existing_pool(runtime, config, settings_file):
@@ -174,7 +209,7 @@ def test_saved_global_fallback_ignores_session_overrides(runtime, config, launch
     registry, ctx = settings_registry(config)
     assert settings_request(registry, ctx)["settings"][0]["value"] == expected
     launch_ctx = SimpleNamespace(state=runtime.state, submit_io=Mock(return_value="op_1"))
-    ctrl = swarm.SwarmController(config)
+    ctrl = swarm.SwarmController(config, settings_box=swarm._build_settings_box(config))
     ctrl.command(launch_ctx, raw_args="-n1")
     result = drain_first_request(ctrl, runtime.state, launch_ctx.submit_io.call_args.args[0])
     assert result["pool"]["model_profile"] == expected
@@ -202,8 +237,8 @@ def test_getter_is_read_only_and_setter_does_not_copy_source_defaults(config, tm
 
 @pytest.mark.parametrize("text", ["{SECRET", "[]", '{"default_profile":false}', '{"default_profile":"missing"}'])
 def test_setting_malformed_or_unknown_default_is_safe_and_never_overwritten(config, settings_file, text):
-    registry, ctx = settings_registry(config)
     settings_file.write_text(text)
+    registry, ctx = settings_registry(config)
     result = settings_request(registry, ctx, "other")
     assert not result["ok"] and result["settings"][0]["error"]
     assert "SECRET" not in json.dumps(result)
@@ -234,31 +269,38 @@ def test_disabled_profiles_and_cli_only_profiles_are_not_choices(config):
 
 
 def test_saved_profile_disabled_after_registration_rejected(config):
-    registry, ctx = settings_registry(config)
+    from agent_zoo.features.settings import SettingError
     path = Path(swarm.resolve_state_root()) / "config.yaml"
     config["llm"]["models"]["other"]["enabled"] = False
     path.write_text(json.dumps(config))
+    registry, ctx = settings_registry(config)
     result = settings_request(registry, ctx, "other")
-    assert not result["ok"] and "enabled saved" in result["error"]["message"]
+    assert not result["ok"]
+    with pytest.raises(SettingError, match="enabled saved"):
+        swarm.save_default_profile(config, "other")
     assert not swarm.swarm_config_path().exists()
 
 
 def test_malformed_saved_global_config_is_safe(config):
-    registry, ctx = settings_registry(config)
+    from agent_zoo.features.settings import SettingError
     path = Path(swarm.resolve_state_root()) / "config.yaml"
     path.write_text("llm: [SECRET")
-    result = settings_request(registry, ctx, "other")
-    assert not result["ok"] and "SECRET" not in json.dumps(result)
+    assert swarm._build_settings_box(config) is None
+    with pytest.raises(SettingError) as exc_info:
+        swarm.save_default_profile(config, "other")
+    assert "SECRET" not in str(exc_info.value)
     assert not swarm.swarm_config_path().exists()
 
 
 def test_failed_atomic_save_preserves_existing_file(config, settings_file, monkeypatch):
+    import agent_utils.storage.durable_fs as durable_fs
+
     settings_file.write_text('{"default_profile":"offline","unknown":1}')
     original = settings_file.read_bytes()
     registry, ctx = settings_registry(config)
-    monkeypatch.setattr(swarm.os, "replace", Mock(side_effect=OSError("sensitive detail")))
+    monkeypatch.setattr(durable_fs.os, "replace", Mock(side_effect=OSError("sensitive detail")))
     result = settings_request(registry, ctx, "other")
     assert not result["ok"] and "sensitive detail" not in json.dumps(result)
     assert result["settings"][0]["value"] == "offline"
     assert settings_file.read_bytes() == original
-    assert not list(settings_file.parent.glob(".swarm-*"))
+    assert not list(settings_file.parent.glob(".swarm*"))

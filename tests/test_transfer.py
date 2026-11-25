@@ -269,7 +269,7 @@ def test_partial_publication_retains_journal_and_imported_revisions(source, monk
 def test_snapshot_uses_runtime_gate(source, monkeypatch):
     original = transfer.snapshot_records
     def gated(records):
-        with pytest.raises(StoreError, match="reentrant"):
+        with pytest.raises((StoreError, TimeoutError)):
             with file_lock(records.lock_path("swarm-gates", "mutation"), timeout=0):
                 pass
         return original(records)

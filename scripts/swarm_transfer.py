@@ -28,11 +28,12 @@ import time
 import uuid
 import zipfile
 
+from agent_zoo.durability import file_lock, fsync_dir, fsync_tree
 from agent_zoo.storage import projects
 from agent_zoo.storage.archive import export_sessions, import_sessions
 from agent_zoo.host.registry import list_live_sessions
 from tmux_pilot.atomic_publication import rename_exclusive
-from tmux_pilot.fs_store import RecordStore, file_lock
+from tmux_pilot.fs_store import RecordStore
 from tmux_pilot.process_identity import ObservationState, ProcessIdentity, observe_process
 
 FORMAT = "azo-swarm-transfer-v1"
@@ -95,22 +96,6 @@ def _sha(path):
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
-
-
-def _fsync_tree(root):
-    for directory, _, files in os.walk(root, topdown=False):
-        for filename in files:
-            with (Path(directory) / filename).open("rb") as stream:
-                os.fsync(stream.fileno())
-        _fsync_directory(directory)
-
-
-def _fsync_directory(path):
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 @contextmanager
@@ -475,7 +460,7 @@ def export_swarm(*, project, swarm, output, home=None, store_root=None,
                     with staged.open("rb") as stream:
                         os.fsync(stream.fileno())
                     rename_exclusive(staged, output)
-                    _fsync_directory(output.parent)
+                    fsync_dir(output.parent)
                 except BaseException as exc:
                     raise TransferError(f"Archive publication failed/uncertain; inspect {output} and {staged}: {exc}") from exc
                 result["sha256"] = _sha(output)
@@ -637,7 +622,7 @@ def _normalize_import(records, payload, result, operation_id, project):
 
 def _publish_pool(staged, target):
     rename_exclusive(staged, target)
-    _fsync_directory(target.parent)
+    fsync_dir(target.parent)
 
 
 def import_swarm(archive, *, project, home=None, store_root=None, workdir=None,
@@ -672,8 +657,8 @@ def import_swarm(archive, *, project, home=None, store_root=None, workdir=None,
             operation_id = uuid.uuid4().hex
             staging = root.parent / f".swarm-transfer-{operation_id}"
             shutil.copytree(checked, staging)
-            _fsync_tree(staging)
-            _fsync_directory(staging.parent)
+            fsync_tree(staging)
+            fsync_dir(staging.parent)
             marker = dict(version=1, operation_id=operation_id, phase="prepared", archive=str(archive),
                           archive_sha256=_sha(archive), staging=str(staging), target=str(root / pool["id"]),
                           source_project=payload["source_project"], project=project,

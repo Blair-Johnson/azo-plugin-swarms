@@ -19,6 +19,40 @@ def navigation(runtime):
 
 
 def read(runtime, identifier):
+    parts = identifier.split(":")
+    include_boards = len(parts) == 5 and parts[3] == "board"
+    include_operations = len(parts) == 3 and parts[2] == "operations"
+    include_transcripts = (len(parts) == 5 and parts[3] == "session") or (
+        len(parts) == 2 and bool(swarm.WORKER_KIND.fullmatch(parts[1]))
+    )
+    target_sid = None
+    if len(parts) == 5 and parts[3] == "session":
+        target_sid = parts[4]
+    elif len(parts) == 2 and (m := swarm.WORKER_KIND.fullmatch(parts[1])):
+        # Resolve target session_id from pool metadata without loading any transcript yet.
+        snap_meta = swarm.build_buffer_snapshot(
+            runtime.state, include_boards=False, include_operations=False, include_transcripts=False
+        )
+        pool = snap_meta.pools.get(m["swarm"])
+        if pool is not None:
+            pod = next((p for p in pool["pods"] if p["index"] == int(m["pod"])), None)
+            if pod is not None:
+                mem = next(
+                    (mb for mb in pod["members"] if mb["index"] == int(m["agent"]) and mb["label"] == parts[1]),
+                    None,
+                )
+                if mem is not None:
+                    target_sid = mem["session_id"]
+        if target_sid is None:
+            include_transcripts = False
+    snap = swarm.build_buffer_snapshot(
+        runtime.state,
+        include_boards=include_boards,
+        include_operations=include_operations,
+        include_transcripts=include_transcripts,
+        target_session_id=target_sid,
+    )
+    swarm.SwarmBuffers.refresh_snapshot(runtime.state, snap)
     return runtime.state.buffer_manager.resolve_for_read(runtime.state, identifier)
 
 

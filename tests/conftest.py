@@ -10,9 +10,9 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import pytest
-from agent_utils.core.events import IoCompleted, IoFailed
-from agent_utils.core.io import IoRequest, OpId
-from agent_zoo.drivers.plugin_task import PluginTaskDriver
+from agent_utils.core.events import IoCompleted, IoFailed, TimerFired
+from agent_utils.core.io import IoRequest, OpId, StartTimer
+from agent_utils.runtime.drivers.timer import TimerDriver
 from agent_zoo.drivers.sessions import AgentZooSessionDriver
 import swarm
 
@@ -71,10 +71,12 @@ def run_swarm_workflow(
             launcher=getattr(state, "session_launcher", None),
             store_root=swarm._state_store_root(state),
         )
-    plugin_driver = PluginTaskDriver()
+    store_driver = swarm.SwarmStoreDriver()
+    timer_driver = TimerDriver()
     events: queue.Queue = queue.Queue()
     session_driver.start(events.put)
-    plugin_driver.start(events.put)
+    store_driver.start(events.put)
+    timer_driver.start(events.put)
     next_op = 0
 
     def _dispatch(req: IoRequest) -> OpId:
@@ -83,8 +85,10 @@ def run_swarm_workflow(
         op_id = f"wf-op-{next_op}"
         if session_driver.handles(req):
             session_driver.submit(op_id, req)
-        elif plugin_driver.handles(req):
-            plugin_driver.submit(op_id, req)
+        elif store_driver.handles(req):
+            store_driver.submit(op_id, req)
+        elif timer_driver.handles(req):
+            timer_driver.submit(op_id, req)
         else:
             raise TypeError(f"No test driver for {type(req).__name__}")
         return op_id
@@ -104,7 +108,7 @@ def run_swarm_workflow(
                     if remaining <= 0:
                         raise TimeoutError(f"workflow op {type(yielded).__name__} timed out")
                     ev = events.get(timeout=remaining)
-                    if isinstance(ev, (IoCompleted, IoFailed)) and ev.op_id == op_id:
+                    if isinstance(ev, (IoCompleted, IoFailed, TimerFired)) and ev.op_id == op_id:
                         send_val = ev
                         break
             else:
@@ -114,18 +118,19 @@ def run_swarm_workflow(
                     continue
                 op_ids = [_dispatch(r) for r in reqs]
                 id_to_idx = {oid: idx for idx, oid in enumerate(op_ids)}
-                collected: dict[int, IoCompleted | IoFailed] = {}
+                collected: dict[int, IoCompleted | IoFailed | TimerFired] = {}
                 deadline = time.monotonic() + timeout_s
                 while len(collected) < len(op_ids):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError("workflow batch timed out")
                     ev = events.get(timeout=remaining)
-                    if isinstance(ev, (IoCompleted, IoFailed)) and ev.op_id in id_to_idx:
+                    if isinstance(ev, (IoCompleted, IoFailed, TimerFired)) and ev.op_id in id_to_idx:
                         collected[id_to_idx[ev.op_id]] = ev
                 send_val = [collected[i] for i in range(len(op_ids))]
     finally:
-        plugin_driver.close()
+        timer_driver.close()
+        store_driver.close()
         if owns_driver:
             session_driver.close()
 

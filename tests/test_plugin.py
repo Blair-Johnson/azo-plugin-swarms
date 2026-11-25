@@ -25,6 +25,7 @@ def buffers(runtime):
 
 
 def read(state, identifier):
+    swarm.SwarmBuffers.refresh_snapshot(state, swarm.build_buffer_snapshot(state))
     return state.buffer_manager.resolve_for_read(state, identifier)
 
 

@@ -189,8 +189,9 @@ def test_installed_skill_copy_path_and_explicit_refresh(tmp_path, monkeypatch):
     read_effect, = state.io.take_outbox()
     refresher.handle(IoCompleted(op_id=read_effect.op_id, value=path.read_text()), state, lambda _ev: None)
     assert state.skill_registry.get("Swarms").description == "Changed description"
+    # A new pipeline/component rebuild picks up the updated skill file; handle() itself never reads disk.
     state.skill_registry = SkillRegistry([])
-    component.handle(RenderRequested(), state, lambda _ev: None)
+    swarm.SwarmSkillRegistration().handle(RenderRequested(), state, lambda _ev: None)
     assert state.skill_registry.get("Swarms").description == "Changed description"
 
 

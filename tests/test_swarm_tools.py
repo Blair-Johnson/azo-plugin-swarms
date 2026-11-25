@@ -5,9 +5,10 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from agent_utils import Tool, Session
-from agent_utils.core.events import IoCompleted, IoFailed, RenderRequested, SessionStarted
+from agent_utils.core.events import IoCompleted, IoFailed, IoLost, IoReattached, RenderRequested, SessionRestored, SessionStarted
 from agent_utils.core.io import IoTable, SubmitOp
-from agent_zoo.events import EmitNotice, RunPluginTask, SessionReady
+from agent_utils.core.state import ReadinessGate
+from agent_zoo.events import EmitNotice, SessionReady
 from agent_zoo.features.commands import CommandError
 import swarm
 from conftest import drain_first_request
@@ -46,7 +47,7 @@ def test_tool_nonblocking_payload_preserved_and_completion_once(tool_runtime):
     receipt = c.broadcast("sw0", text, [1, 0, 1], state)
     assert receipt == "Sending message to sw0 (pods 1, 0)..."
     effects = t.take_effects()
-    assert len(effects) == 1 and isinstance(effects[0].request, RunPluginTask)
+    assert len(effects) == 1 and isinstance(effects[0].request, swarm.SwarmStoreRequest)
     _, _, meta = c.in_flight[effects[0].op_id]
     assert meta["message"] == text and meta["pods"] == (1, 0)
     assert meta["operation_id"] not in receipt
@@ -286,6 +287,7 @@ def test_snapshot_rejects_grant_from_replaced_runtime(tool_runtime):
 def test_restored_ready_gates_historical_work_until_discovery(tool_runtime):
     t = tool_runtime; state = t.runtime.state
     state.startup_paused = False
+    state.readiness = ReadinessGate()
     event = SessionReady(
         session_id=state._session_id,
         instance_id=state._instance_id,
@@ -295,17 +297,19 @@ def test_restored_ready_gates_historical_work_until_discovery(tool_runtime):
         revision_id="saved",
     )
     swarm.SwarmRuntimeReady(t.controller).handle(event, state, lambda _ev: None)
-    assert state.startup_paused is True
+    assert not state.readiness.is_ready
+    assert "swarm" in state.readiness.holds
     # A completion with ordinary recovery information cannot release the hold.
     t.controller.apply(state, dict(summary="restored paused", grants={}))
-    assert state.startup_paused is True
+    assert not state.readiness.is_ready
     t.controller.apply(state, dict(release_startup_hold=True))
-    assert state.startup_paused is False
+    assert state.readiness.is_ready
 
 
 def test_explicit_paused_start_is_not_released_by_empty_discovery(tool_runtime):
     t = tool_runtime; state = t.runtime.state
     state.startup_paused = True
+    state.readiness = ReadinessGate()
     event = SessionReady(
         session_id=state._session_id,
         instance_id=state._instance_id,
@@ -317,3 +321,60 @@ def test_explicit_paused_start_is_not_released_by_empty_discovery(tool_runtime):
     swarm.SwarmRuntimeReady(t.controller).handle(event, state, lambda _ev: None)
     t.controller.apply(state, dict(release_startup_hold=True))
     assert state.startup_paused is True
+
+
+def test_swarm_module_and_pipeline_are_strictly_sans_io(tmp_path, monkeypatch):
+    from agent_utils import PipelineBuilder, core_feature, interrupts_feature
+    from agent_zoo.features.special_buffers import special_buffers_feature
+    from agent_zoo.testing.sans_io_guard import assert_pipeline_sans_io, audit_module_sans_io
+
+    assert audit_module_sans_io(swarm.__file__) == []
+
+    monkeypatch.setenv("AGENT_ZOO_STATE_ROOT", str(tmp_path / "state"))
+    monkeypatch.setenv("AGENT_ZOO_LOCAL_STATE_ROOT", str(tmp_path / "local"))
+    session = Session(system_prompt="sans-io test", cwd=str(tmp_path))
+    builder = (
+        PipelineBuilder()
+        .add(core_feature())
+        .add(interrupts_feature())
+        .add(special_buffers_feature())
+    )
+    swarm.register_features(builder, session=session, config={})
+    pipeline = builder.build()
+    assert_pipeline_sans_io(pipeline)
+
+
+def test_swarm_store_driver_lifecycle_and_recovery_events(tool_runtime):
+    t = tool_runtime; state = t.runtime.state
+    state.readiness = ReadinessGate()
+    driver = swarm.SwarmStoreDriver()
+    assert driver.durability == "commit"
+    assert swarm.SwarmStoreRequest in driver.request_types
+
+    emitted = []
+    driver.start(emitted.append)
+    try:
+        driver.submit("op-snap", swarm.SwarmStoreRequest(op="refresh_snapshot", params={"snapshot": state}))
+        driver.drain(timeout_s=5.0)
+        assert any(isinstance(ev, IoCompleted) and ev.op_id == "op-snap" for ev in emitted)
+        driver.quiesce(policy="terminate")
+    finally:
+        driver.close()
+
+    # SessionRestored holds readiness and submits startup; IoReattached records owned instance;
+    # IoLost releases startup readiness hold and cleans up in-flight state.
+    ready_handler = swarm.SwarmRuntimeReady(t.controller)
+    comp_handler = swarm.SwarmCompletionHandler(t.controller)
+    ready_handler.handle(SessionRestored(), state, lambda _ev: None)
+    assert not state.readiness.is_ready
+    effects = t.take_effects()
+    assert len(effects) == 1
+    startup_op = effects[0].op_id
+
+    comp_handler.handle(IoReattached(op_id="op-re", handle={"instance_id": "child-inst-1"}), state, lambda _ev: None)
+    assert "child-inst-1" in t.controller._owned_instances
+
+    comp_handler.handle(IoLost(op_id=startup_op, reason="driver_restarted"), state, lambda _ev: None)
+    assert state.readiness.is_ready
+    assert not t.controller.in_flight
+    assert any("lost" in str(msg).lower() for msg in state.pending_interrupts)

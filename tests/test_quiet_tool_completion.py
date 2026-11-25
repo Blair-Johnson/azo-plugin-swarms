@@ -18,7 +18,8 @@ def test_background_notification_policy(tool_runtime, action, outcome):
             if outcome == "exception":
                 raise ValueError("Delivery failed")
             return dict(summary="Operation result", level=outcome)
-        c._run_post_sync = fake_post
+            yield  # pragma: no cover
+        c._wf_post = fake_post
         receipt = c.post_message("sw0", 0, "general", "hello", "stable", state)
     else:
         def fake_control(snapshot, request, *, store=None):

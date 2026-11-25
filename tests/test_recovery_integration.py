@@ -7,10 +7,10 @@ from unittest.mock import Mock
 import pytest
 from agent_utils import Entry, Feature, PipelineBuilder, Runtime, Session, ToolCall, core_feature, interrupts_feature
 from agent_utils.core.events import AwaitRequest, BeforeLLM, RunToolCall
+from agent_utils.runtime.drivers.timer import TimerDriver
 from agent_utils.features.buffers import BufferManager
 from agent_utils.storage.repository import SessionRepository
 from agent_utils.storage.serialization import capture_session_document
-from agent_zoo.drivers.plugin_task import PluginTaskDriver
 from agent_zoo.events import SessionReady
 from agent_zoo.features.special_buffers import special_buffers_feature
 from agent_zoo.features.turn import turn_orchestration_feature
@@ -95,7 +95,7 @@ def host_runtime(r, monkeypatch, *, sid, iid, checkpoint=None):
                     WorkCounter,
                     swarm.InterruptDelivery,
                 ],
-                drivers=[swarm.make_swarm_session_driver, PluginTaskDriver],
+                drivers=[swarm.make_swarm_session_driver, swarm.SwarmStoreDriver, TimerDriver],
             )
         )
         .build()
@@ -149,7 +149,7 @@ def host_runtime(r, monkeypatch, *, sid, iid, checkpoint=None):
         launcher=r.state.session_launcher,
         store_root=str(r.tmp / "registry"),
     )
-    rt = Runtime(session, drivers=[driver, PluginTaskDriver()])
+    rt = Runtime(session, drivers=[driver, swarm.SwarmStoreDriver(), TimerDriver()])
     rt.start()
     rt.post(
         SessionReady(
@@ -260,11 +260,12 @@ def test_real_restored_parent_holds_saved_work_through_recovery_poll(runtime, mo
     with host_runtime(r, monkeypatch, sid="parent", iid="restored-parent", checkpoint=checkpoint) as b:
         assert b.seen[0]["restored"] is True
         assert b.seen[0]["revision_id"] == checkpoint.state.commit_id
-        assert b.session.state.startup_paused
+        assert not b.session.state.readiness.is_ready
+        assert "swarm" in b.session.state.readiness.holds
         assert b.work == []
         b.drain_until(lambda: not b.controller.in_flight)
         assert b.work == []
-        assert b.session.state.startup_paused
+        assert not b.session.state.readiness.is_ready
         assert b.session.state.entries[-1].tool_calls[0].id == "old-call"
         assert any("blocked" in str(x) for x in b.session.state.pending_interrupts)
         r.state.session_launcher.start.assert_not_called()

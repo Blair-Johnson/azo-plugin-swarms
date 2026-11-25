@@ -4,6 +4,7 @@ from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
+from agent_utils.core.state import ReadinessGate
 from agent_utils.features.buffers import BufferManager
 from agent_zoo.events import SessionReady
 import swarm
@@ -32,10 +33,12 @@ def test_parent_pauses_before_first_restored_work_pass(runtime, saved_access):
     if not saved_access:
         state.swarm_access = {}
     state.startup_paused = False
+    state.readiness = ReadinessGate()
     state.buffer_manager = BufferManager()
     controller = swarm.SwarmController({})
     notify(state, controller)
-    assert state.startup_paused is True
+    assert not state.readiness.is_ready
+    assert "swarm" in state.readiness.holds
     assert state.buffer_manager.special_buffer_namespaces() == ["swarm:"]
     assert len(controller.in_flight) == 1
     _, source_kind, payload = next(iter(controller.in_flight.values()))
@@ -50,12 +53,13 @@ def test_unrelated_restored_session_hold_can_be_released(runtime):
     state.swarm_access = {}
     state.grants = {}
     state.startup_paused = False
+    state.readiness = ReadinessGate()
     state.buffer_manager = BufferManager()
     controller = swarm.SwarmController({})
     notify(state, controller)
-    assert state.startup_paused is True
+    assert not state.readiness.is_ready
     controller.apply(state, {"release_startup_hold": True})
-    assert state.startup_paused is False
+    assert state.readiness.is_ready
 
 
 def test_proven_parent_successor_reattaches_children_without_epoch_rotation(runtime, monkeypatch):
