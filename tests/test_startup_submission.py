@@ -189,3 +189,30 @@ def test_stale_completion_is_logged_and_discarded(startup_runtime, caplog):
     records = [record for record in caplog.records if "Discarding stale swarm completion" in record.message]
     assert len(records) == 1
     assert records[0].levelno == logging.WARNING
+
+
+def test_restored_startup_failures_release_readiness_hold(startup_runtime, monkeypatch):
+    r = startup_runtime
+    restored_event = SessionReady(
+        session_id=r.event.session_id,
+        instance_id=r.event.instance_id,
+        restored=True,
+    )
+    # 1. Background failure must release readiness hold.
+    r.factory.side_effect = RuntimeError("boom during reconcile")
+    r.runtime.start()
+    r.runtime.post(restored_event)
+    deadline = time.monotonic() + 5.0
+    while (not r.state.readiness.is_ready or r.controller.in_flight) and time.monotonic() < deadline:
+        r.runtime.step_once(timeout=0.02)
+    assert r.state.readiness.is_ready
+    assert not r.state.readiness.holds
+    assert not r.controller.in_flight
+
+    # 2. Synchronous snapshot failure must also release readiness hold.
+    monkeypatch.setattr(r.controller, "snapshot", Mock(side_effect=RuntimeError("snapshot boom")))
+    r.runtime.post(restored_event)
+    assert r.runtime.step_once(timeout=1.0)
+    assert r.state.readiness.is_ready
+    assert not r.state.readiness.holds
+

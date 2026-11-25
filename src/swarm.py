@@ -2793,6 +2793,11 @@ class SwarmController:
 
     def _fail_background(self, source_kind: str, fence: tuple, exc: object, state, emit) -> None:
         LOG.warning("Swarm background operation failed for %s: %s", fence[1:3], exc)
+        if source_kind == "startup" and state is not None:
+            rt = self._rt(state)
+            if rt.startup_hold is not None:
+                rt.startup_hold = None
+                _readiness_release(state, emit)
         message = f"Swarm operation failed: {brief_error(exc)}"
         if source_kind == "command":
             if emit is not None:
@@ -3584,6 +3589,9 @@ class SwarmRuntimeReady:
         try:
             controller.submit_startup(state, payload)
         except Exception as exc:
+            if rt.startup_hold == fence:
+                rt.startup_hold = None
+                _readiness_release(state, emit)
             LOG.exception("Swarm startup submission failed for %s", fence[1:3])
             if not worker_identity(state):
                 _append_interrupt(state, f"Swarm startup failed: {brief_error(exc)}", emit)
