@@ -17,6 +17,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import random
 import re
 import sqlite3
 import time
@@ -3299,6 +3300,13 @@ class SwarmController:
         mem_info = _unwrap_event((yield SwarmStoreRequest(
             op="member_resource", params={"snapshot": snapshot}
         )))
+        if not isinstance(mem_info, Mapping) or "resource" not in mem_info:
+            return dict(
+                summary="",
+                access={},
+                grants={},
+                release_startup_hold=bool(event.get("restored")),
+            )
         if mem_info["resource"] is not None:
             return (yield from self._wf_bootstrap_member(
                 snapshot, event, mem_info["resource"],
@@ -3328,8 +3336,10 @@ class SwarmController:
                 op="owned_stores", params={"snapshot": snapshot}
             )))
         summaries = []
+        blocked = False
         for swarm_id, store, error in stores:
             if error:
+                blocked = True
                 summaries.append(f"{swarm_id}: recovery blocked: {brief_error(error)}")
                 continue
             pool = _unwrap_event((yield SwarmStoreRequest(op="store_pool", params={"store": store})))
@@ -3340,13 +3350,15 @@ class SwarmController:
                 result = yield from self._wf_recover(snapshot, store, {})
                 summaries.append(result["summary"])
             except Exception as exc:
+                blocked = True
                 summaries.append(f"{swarm_id}: recovery blocked: {brief_error(exc)}")
         buf_snap = _unwrap_event((yield SwarmStoreRequest(
             op="refresh_snapshot", params={"snapshot": snapshot}
         )))
         return dict(summary="\n".join(summaries), access=snapshot.swarm_access, grants=snapshot.grants,
                     resource_uids=getattr(snapshot, "swarm_resource_uids", {}),
-                    _buffer_snapshot=buf_snap, level="info")
+                    _buffer_snapshot=buf_snap, level="info",
+                    release_startup_hold=not blocked)
 
     def _wf_bootstrap_member(self, snapshot, event: dict, resource=None, *,
                              self_identity=None, launch_grant=None):
@@ -3756,3 +3768,1249 @@ def register_features(builder, *, config):
         ],
         order=[SwarmSkillRegistration, SwarmSystemPrompt, SystemPromptSkillList, MessageRenderer],
     ))
+
+
+# ---------------------------------------------------------------------------
+# Deterministic Simulation Testing (DST) Plugin Hooks
+# ---------------------------------------------------------------------------
+
+_SIM_HOST_DICT = {
+    "host_id": "sim-host",
+    "boot_id": "sim-boot",
+    "pid_namespace": "sim-ns",
+    "hostname": "sim-host",
+}
+
+_SIM_PARENT_PROC_DICT = {
+    "host_id": "sim-host",
+    "boot_id": "sim-boot",
+    "pid_namespace": "sim-ns",
+    "pid": 9001,
+    "start_token": "start-9001",
+}
+
+_SWARM_TOOL_NAMES = frozenset({
+    "swarm_broadcast",
+    "swarm_interrupt",
+    "swarm_continue",
+    "swarm_cancel",
+    "swarm_post",
+})
+
+
+class _SimSwarmHandle:
+    """Lightweight pure in-memory handle matching ``SwarmStore`` attributes used by workflows."""
+
+    def __init__(self, world: _SimSwarmWorld, swarm_id: str, *, grant: dict[str, Any] | None = None) -> None:
+        self._world = world
+        self.swarm_id = swarm_id
+        self.durable = f"/sim/state/projects/sim/swarms/{swarm_id}"
+        self.cache = f"/sim/local/swarm-cache/{swarm_id}/messages.sqlite3"
+        self.grant = deepcopy(grant)
+
+    def pool(self) -> dict[str, Any]:
+        return deepcopy(self._world.pools[self.swarm_id]["pool"])
+
+
+class _SimSwarmWorld:
+    """100% deterministic, pure in-memory simulator backing ``SwarmStoreRequest``."""
+
+    def __init__(self, rng: random.Random) -> None:
+        self.rng = rng
+        self.next_pool_num = 0
+        self.next_seq = 1
+        self.pools: dict[str, dict[str, Any]] = {}
+
+    def _next_hex32(self) -> str:
+        return f"{self.rng.getrandbits(128):032x}"
+
+    def _next_seq(self) -> int:
+        val = self.next_seq
+        self.next_seq += 1
+        return val
+
+    @staticmethod
+    def _now_ns(sim: Any) -> int:
+        return 1_700_000_000_000_000_000 + int(round(float(getattr(sim, "now", 0.0) or 0.0) * 1_000_000_000))
+
+    def _handle(self, swarm_id: str, snapshot: Any = None, *, grant: dict[str, Any] | None = None) -> _SimSwarmHandle:
+        if grant is None and snapshot is not None:
+            grant = (getattr(snapshot, "grants", None) or {}).get(swarm_id)
+        return _SimSwarmHandle(self, swarm_id, grant=grant)
+
+    def _require_record(self, store_or_id: Any) -> dict[str, Any]:
+        swarm_id = store_or_id.swarm_id if isinstance(store_or_id, _SimSwarmHandle) else str(store_or_id)
+        rec = self.pools.get(swarm_id)
+        if rec is None:
+            raise ValueError(f"Unknown simulated swarm: {swarm_id}")
+        return rec
+
+    def _require_grant(self, rec: dict[str, Any], grant: dict[str, Any] | None, *, allow_cancelled: bool = False) -> None:
+        pool = rec["pool"]
+        if not pool["owner"].get("parent_instance_id") or pool["owner"].get("process_identity") is None:
+            raise ValueError("Unbound owner instance has no mutation authority")
+        if not isinstance(grant, dict) or any(
+            grant.get(k) != v
+            for k, v in {
+                "resource_uid": pool["resource_uid"],
+                "epoch": pool["owner"]["epoch"],
+                "token": pool["owner"]["token"],
+            }.items()
+        ):
+            raise ValueError("Stale or absent swarm runtime grant; recovery required")
+        if pool["desired_state"] == "cancelled" and not allow_cancelled:
+            raise ValueError("Swarm is cancelled")
+        if grant.get("role") == "parent":
+            if (
+                grant.get("session_id") != pool["owner_session_id"]
+                or grant.get("instance_id") != pool["owner"]["parent_instance_id"]
+            ):
+                raise ValueError("Stale owner instance")
+        elif grant.get("role") == "member":
+            member_ids = {m["session_id"] for p in pool["pods"] for m in p["members"]}
+            if grant.get("session_id") not in member_ids:
+                raise ValueError("Session is not an actual swarm member")
+            attempt = rec["attempts"].get(grant.get("session_id", ""))
+            if (
+                not attempt
+                or attempt.get("attempt_id") != grant.get("attempt_id")
+                or attempt.get("epoch") != grant["epoch"]
+                or (attempt.get("current") or attempt).get("instance_id") != grant.get("instance_id")
+                or attempt.get("state") in {"exited", "fenced"}
+            ):
+                raise ValueError("Stale child runtime grant")
+        else:
+            raise ValueError("Invalid runtime grant role")
+
+    def _sim_launch_settings(self, snapshot: Any, config: dict[str, Any], *, profile: str | None = None) -> RuntimeSettings:
+        ctx = session_context(snapshot, config=config)
+        llm_cfg = (config.get("llm", {}) or {}) if isinstance(config, Mapping) else {}
+        model = (
+            validate_model_profile(config, profile)
+            if profile is not None
+            else str(llm_cfg.get("default") or "sim-model")
+        )
+        project = _state_project_name(snapshot) or "sim"
+        store_root = _state_store_root(snapshot) or "/sim/store"
+        return RuntimeSettings(
+            project=project,
+            workdir=session_cwd(snapshot) or "/workspace",
+            state_root=str(ctx.state_root or "/sim/state"),
+            store_root=store_root,
+            local_state_root=str(ctx.local_state_root or "/sim/local"),
+            config_path=str(ctx.config_path or ""),
+            config_sets=tuple(ctx.config_sets or ()),
+            model=model,
+            env_name="",
+            pipeline_key="default",
+            host="127.0.0.1",
+            port=0,
+        )
+
+    def hydrate_restored_pools(self, state: Any, *, session: Any = None) -> None:
+        """Populate in-memory records for swarms already bound in a restored checkpoint."""
+        durable = _swarm_durable(state)
+        smeta = _session_meta(state)
+        owner_sid = str(
+            smeta.session_id
+            or getattr(session, "_session_id", "")
+            or getattr(state, "_session_id", "")
+            or "sim-parent"
+        )
+        model = str(((getattr(state, "config", None) or {}).get("llm", {}) or {}).get("default") or "sim-model")
+        for swarm_id, scope in sorted(durable.swarm_access.items()):
+            if swarm_id in self.pools or scope:
+                continue
+            m = re.fullmatch(r"sw([0-9]+)", swarm_id)
+            if m:
+                self.next_pool_num = max(self.next_pool_num, int(m.group(1)) + 1)
+            uid = durable.swarm_resource_uids.get(swarm_id) or self._next_hex32()
+            if not re.fullmatch(r"[0-9a-f]{32}", str(uid)):
+                uid = self._next_hex32()
+            pods = [
+                {
+                    "id": f"pod-{i + 1}",
+                    "index": i,
+                    "members": [
+                        {
+                            "session_id": f"{swarm_id}-m{i}-0",
+                            "index": 0,
+                            "label": f"{swarm_id}p{i}a0",
+                        }
+                    ],
+                }
+                for i in range(2)
+            ]
+            pool = {
+                "version": 2,
+                "resource_uid": uid,
+                "id": swarm_id,
+                "name": swarm_id,
+                "channels": ["general", "findings"],
+                "pods": pods,
+                "owner_session_id": owner_sid,
+                "host": dict(_SIM_HOST_DICT),
+                "desired_state": "paused",
+                "phase": "paused",
+                "created_ns": 1_700_000_000_000_000_000,
+                "model_profile": model,
+                "owner": {
+                    "epoch": 1,
+                    "token": self._next_hex32(),
+                    "parent_instance_id": f"prev-{swarm_id}",
+                    "host": dict(_SIM_HOST_DICT),
+                    "process_identity": dict(_SIM_PARENT_PROC_DICT),
+                },
+                "recovery": None,
+            }
+            validate_pool(pool)
+            self.pools[swarm_id] = {
+                "pool": pool,
+                "members": {
+                    mem["session_id"]: {
+                        "session_id": mem["session_id"],
+                        "recovery_status": "ready_paused",
+                        "work_blocked": False,
+                        "shared_checkpoint": {
+                            "session_id": mem["session_id"],
+                            "instance_id": f"{mem['session_id']}-prev",
+                            "revision_id": f"rev-init-{mem['session_id']}",
+                        },
+                    }
+                    for pod in pods
+                    for mem in pod["members"]
+                },
+                "attempts": {},
+                "operations": {},
+                "boards": {},
+                "transcripts": {},
+            }
+
+    def build_snapshot(
+        self,
+        snapshot: Any,
+        *,
+        include_boards: bool = True,
+        include_operations: bool = True,
+        include_transcripts: bool = True,
+    ) -> SwarmSnapshot:
+        access = dict(_swarm_durable(snapshot).swarm_access)
+        snap = SwarmSnapshot()
+        sender = str(_session_meta(snapshot).session_id or "")
+        for swarm_id in sorted(access):
+            rec = self.pools.get(swarm_id)
+            if rec is None:
+                continue
+            pool = deepcopy(rec["pool"])
+            snap.pools[swarm_id] = pool
+            try:
+                require_resource_reference(snapshot, pool)
+                scope = _effective_scope_from_pool(snapshot, swarm_id, pool)
+            except ValueError:
+                continue
+            if include_operations and not scope and pool.get("owner_session_id") == sender:
+                snap.operations[swarm_id] = sorted(
+                    (deepcopy(op) for op in rec["operations"].values()),
+                    key=lambda row: row.get("created_ns", 0),
+                    reverse=True,
+                )
+            for pod in pool["pods"]:
+                if scope and pod["id"] != scope:
+                    continue
+                if include_boards:
+                    for channel in pool["channels"]:
+                        snap.boards[(swarm_id, pod["id"], channel)] = deepcopy(
+                            rec["boards"].get((pod["id"], channel), [])
+                        )
+                if include_transcripts:
+                    for member in pod["members"]:
+                        sid = member["session_id"]
+                        if sid in rec["transcripts"]:
+                            snap.transcripts[sid] = rec["transcripts"][sid]
+        return snap
+
+    def _resolve_pool(self, snapshot: Any, target: str | None) -> tuple[_SimSwarmHandle, dict[str, Any]]:
+        require_parent(snapshot)
+        smeta = _session_meta(snapshot)
+        candidates = set(getattr(snapshot, "swarm_access", {}) or {})
+        for sid, rec in self.pools.items():
+            if rec["pool"].get("owner_session_id") == smeta.session_id:
+                candidates.add(sid)
+        matches: list[tuple[_SimSwarmHandle, dict[str, Any]]] = []
+        for swarm_id in sorted(candidates):
+            rec = self.pools.get(swarm_id)
+            if rec is None:
+                continue
+            pool = rec["pool"]
+            require_resource_reference(snapshot, pool)
+            if pool.get("owner_session_id") != smeta.session_id:
+                continue
+            if any(m["session_id"] == smeta.session_id for pod in pool["pods"] for m in pod["members"]):
+                raise ValueError("Swarm peers cannot control pools")
+            if (target in (pool["id"], pool["name"])) if target is not None else (pool["desired_state"] != "cancelled"):
+                matches.append((self._handle(swarm_id, snapshot), deepcopy(pool)))
+        if len(matches) != 1:
+            raise ValueError("Specify a swarm name or ID; expected exactly one matching owned swarm")
+        return matches[0]
+
+    def _build_member_discover(self, handle: _SimSwarmHandle, member: dict[str, Any]) -> tuple[DiscoverSessions, dict[str, Any]]:
+        rec = self._require_record(handle)
+        pool = rec["pool"]
+        attempt = rec["attempts"].get(member["session_id"])
+        if not attempt or attempt.get("state") in {"reserved", "unknown", "exited", "fenced"}:
+            raise ValueError("Launch remains unreconciled or stopped; no automatic replay")
+        settings = attempt["request"]["settings"]
+        root, project = settings["store_root"], settings["project"]
+        anchor = attempt.get("current") or {
+            "session_id": attempt["session_id"],
+            "instance_id": attempt["instance_id"],
+            "process_identity": deepcopy(attempt.get("process_identity")),
+            "websocket_url": (attempt.get("ready") or {}).get("websocket_url"),
+            "registry_generation": None,
+        }
+        req = DiscoverSessions(
+            store_root=root,
+            session_id=member["session_id"],
+            instance_id=anchor["instance_id"],
+            include_stale=True,
+            probe_local_processes=False,
+            resolve_lineage=True,
+            anchor_instance_id=anchor["instance_id"],
+            expected_process_identity=deepcopy(anchor.get("process_identity")),
+            expected_project=project,
+            expected_parent_session_id=pool["owner_session_id"],
+            expected_kind=attempt["request"]["kind"],
+            expected_registry_generation=anchor.get("registry_generation"),
+        )
+        meta = {
+            "store_root": root,
+            "project": project,
+            "parent_session_id": pool["owner_session_id"],
+            "kind": attempt["request"]["kind"],
+            "anchor": deepcopy(anchor),
+            "attempt_id": attempt.get("attempt_id"),
+            "revision": attempt.get("binding_revision", 0),
+            "previous": deepcopy(attempt.get("current")),
+            "origin": (attempt["instance_id"], deepcopy(attempt.get("process_identity"))),
+        }
+        return req, meta
+
+    def _record_member_failure(self, rec: dict[str, Any], member: dict[str, Any], exc: BaseException) -> dict[str, Any]:
+        status = "missing_checkpoint" if isinstance(exc, FileNotFoundError) else "blocked"
+        row = rec["members"].setdefault(member["session_id"], {"session_id": member["session_id"]})
+        row.update(session_id=member["session_id"], recovery_status=status, error=str(exc))
+        return {"label": member["label"], "session_id": member["session_id"], "state": status, "error": str(exc)}
+
+    def execute(self, req: SwarmStoreRequest, sim: Any) -> Any:
+        op = req.op
+        p = req.params
+        now_ns = self._now_ns(sim)
+
+        if op == "refresh_snapshot":
+            return self.build_snapshot(
+                p["snapshot"],
+                include_boards=bool(p.get("include_boards", True)),
+                include_operations=bool(p.get("include_operations", True)),
+                include_transcripts=bool(p.get("include_transcripts", True)),
+            )
+
+        if op == "resolve_pool":
+            return self._resolve_pool(p["snapshot"], p["target"])
+
+        if op == "store_pool":
+            return deepcopy(self._require_record(p["store"])["pool"])
+
+        if op == "post":
+            snapshot = p["snapshot"]
+            request = p["request"]
+            swarm_id = name(request["target"])
+            if swarm_id not in _swarm_durable(snapshot).swarm_access:
+                raise ValueError("Swarm is not bound to this session")
+            rec = self._require_record(swarm_id)
+            pool = rec["pool"]
+            require_resource_reference(snapshot, pool)
+            pod_idx = request["pod"]
+            if type(pod_idx) is not int or not 0 <= pod_idx < len(pool["pods"]):
+                raise ValueError("Unknown zero-based pod index")
+            pod_id = pool["pods"][pod_idx]["id"]
+            scope = _effective_scope_from_pool(snapshot, pool["id"], pool)
+            if scope not in {"", pod_id}:
+                raise ValueError("Pod is outside this session's scope")
+            channel = name(request["channel"])
+            if channel not in pool["channels"]:
+                raise ValueError("Unknown pod or board")
+            text = request["message"]
+            if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > 65536:
+                raise ValueError("Message must be nonblank and at most 65536 UTF-8 bytes")
+            sender = str(_session_meta(snapshot).session_id or "")
+            if not sender:
+                raise ValueError("Sender session identity is required")
+            grant = (getattr(snapshot, "grants", None) or {}).get(swarm_id)
+            self._require_grant(rec, grant)
+            if grant["session_id"] != sender:
+                raise ValueError("Sender is outside captured runtime grant")
+            if grant["role"] == "member":
+                member_pod_id = next(
+                    (pd["id"] for pd in pool["pods"] if sender in {m["session_id"] for m in pd["members"]}),
+                    None,
+                )
+                if member_pod_id != pod_id:
+                    raise ValueError("Sender is outside captured runtime grant")
+            message_id = name(request.get("message_id") or self._next_hex32())
+            msg_doc = {"id": message_id, "pod_id": pod_id, "channel": channel, "sender": sender, "text": text}
+            board = rec["boards"].setdefault((pod_id, channel), [])
+            appended = True
+            for entry in board:
+                if entry["id"] == message_id:
+                    if entry["message"] != msg_doc:
+                        raise ValueError("Message ID already names different content")
+                    appended = False
+                    break
+            if appended:
+                board.append({"id": message_id, "created_ns": now_ns, "message": msg_doc})
+            return {
+                "summary": (
+                    f"{pool_label(pool)}/pod {pod_idx}/{channel}: "
+                    f"message {'committed' if appended else 'already committed'}."
+                ),
+                "level": "info",
+                "_buffer_snapshot": self.build_snapshot(snapshot),
+            }
+
+        if op == "create_prep":
+            snapshot = p["snapshot"]
+            request = dict(p["request"])
+            config = p["config"]
+            require_parent(snapshot)
+            smeta = _session_meta(snapshot)
+            profile_arg = request.get("profile")
+            if profile_arg is None:
+                if getattr(snapshot, "settings", None) is not None:
+                    profile_arg = snapshot.settings.model
+                elif getattr(snapshot, "_requested_profile", None) is not None:
+                    profile_arg = snapshot._requested_profile
+                else:
+                    profile_arg = str(((config.get("llm", {}) or {}) if isinstance(config, Mapping) else {}).get("default") or "")
+            profile = validate_model_profile(config, profile_arg)
+            if getattr(snapshot, "settings", None) is None:
+                snapshot.settings = self._sim_launch_settings(snapshot, config, profile=profile)
+            used = set(self.pools) | {r["pool"]["name"] for r in self.pools.values()}
+            alias = request.get("name")
+            if alias and alias in used:
+                raise ValueError(f"Swarm name already exists: {alias}")
+            number = self.next_pool_num
+            while f"sw{number}" in used:
+                number += 1
+            swarm_id = f"sw{number}"
+            self.next_pool_num = number + 1
+            pods_n = int(request["pods"])
+            agents_n = int(request["agents"])
+            channels = list(request["channels"])
+            base, extra = divmod(agents_n, pods_n)
+            topology = [
+                {
+                    "id": f"pod-{i + 1}",
+                    "index": i,
+                    "members": [
+                        {
+                            "session_id": f"{swarm_id}-m{i}-{j}",
+                            "index": j,
+                            "label": f"{swarm_id}p{i}a{j}",
+                        }
+                        for j in range(base + (i < extra))
+                    ],
+                }
+                for i in range(pods_n)
+            ]
+            pool = {
+                "version": 2,
+                "resource_uid": self._next_hex32(),
+                "id": swarm_id,
+                "name": name(alias or swarm_id),
+                "channels": channels,
+                "pods": topology,
+                "owner_session_id": smeta.session_id,
+                "host": dict(_SIM_HOST_DICT),
+                "desired_state": "paused",
+                "phase": "paused",
+                "created_ns": now_ns,
+                "model_profile": profile,
+                "owner": {
+                    "epoch": 1,
+                    "token": self._next_hex32(),
+                    "parent_instance_id": smeta.instance_id,
+                    "host": dict(_SIM_HOST_DICT),
+                    "process_identity": dict(_SIM_PARENT_PROC_DICT),
+                },
+                "recovery": None,
+            }
+            validate_pool(pool)
+            self.pools[swarm_id] = {
+                "pool": pool,
+                "members": {},
+                "attempts": {},
+                "operations": {},
+                "boards": {},
+                "transcripts": {},
+            }
+            grant = parent_grant(pool, smeta.instance_id)
+            snapshot.grants[swarm_id] = deepcopy(grant)
+            snapshot.swarm_resource_uids = {**getattr(snapshot, "swarm_resource_uids", {}), swarm_id: pool["resource_uid"]}
+            snapshot.swarm_access[swarm_id] = ""
+            handle = _SimSwarmHandle(self, swarm_id, grant=grant)
+            return profile, handle, deepcopy(pool)
+
+        if op == "finish_operation":
+            handle = p["store"]
+            rec = self._require_record(handle)
+            operation = dict(p["operation"])
+            saved = rec["operations"].setdefault(operation["id"], {})
+            saved.update(deepcopy(operation))
+            if p.get("phase"):
+                rec["pool"]["phase"] = p["phase"]
+                if rec["pool"].get("recovery"):
+                    rec["pool"]["recovery"]["phase"] = p["phase"]
+            snap = self.build_snapshot(p["snapshot"]) if p.get("snapshot") is not None else None
+            return {"audit_error": "", "snapshot": snap}
+
+        if op == "reserve_all":
+            snapshot = p["snapshot"]
+            handle = p["store"]
+            rec = self._require_record(handle)
+            pool = rec["pool"]
+            members = p["members"]
+            settings: RuntimeSettings = p["settings"]
+            recovering = bool(p.get("recovering", False))
+            smeta = _session_meta(snapshot)
+            out = []
+            for idx, member in enumerate(members):
+                try:
+                    self._require_grant(rec, handle.grant)
+                    sid = member["session_id"]
+                    pod_id = next(
+                        (pd["id"] for pd in pool["pods"] if sid in {m["session_id"] for m in pd["members"]}),
+                        None,
+                    )
+                    if pod_id is None:
+                        raise ValueError("Session is not a member of this swarm")
+                    old = rec["attempts"].get(sid)
+                    if old and old.get("state") not in {"exited", "fenced"}:
+                        raise ValueError("Previous attempt requires reconciliation; automatic replay is forbidden")
+                    seq = self._next_seq()
+                    iid = f"{sid}-inst-{seq:04d}"
+                    attempt_id = self._next_hex32()
+                    checkpoint = None
+                    if recovering:
+                        prev_cp = (rec["members"].get(sid) or {}).get("shared_checkpoint")
+                        rev_id = (prev_cp or {}).get("revision_id") or f"rev-init-{sid}"
+                        checkpoint = CheckpointRef(sid, rev_id)
+                        if pool.get("recovery") is not None:
+                            pool["recovery"].setdefault("selected_checkpoints", {})[sid] = {
+                                "session_id": sid,
+                                "instance_id": (prev_cp or {}).get("instance_id") or iid,
+                                "revision_id": rev_id,
+                            }
+                    member_grant = {
+                        **handle.grant,
+                        "role": "member",
+                        "instance_id": iid,
+                        "session_id": sid,
+                        "attempt_id": attempt_id,
+                    }
+                    source = (
+                        SessionSource(kind="resume", session_id=checkpoint.session_id, revision_id=checkpoint.revision_id)
+                        if checkpoint is not None
+                        else SessionSource(kind="fresh")
+                    )
+                    spec = SessionSpec(
+                        project=settings.project,
+                        workdir=settings.workdir,
+                        model=settings.model,
+                        pipeline_key=settings.pipeline_key,
+                        env_name=settings.env_name,
+                        config_path=settings.config_path,
+                        config_sets=tuple(settings.config_sets),
+                        state_root=settings.state_root,
+                        store_root=settings.store_root,
+                        local_state_root=settings.local_state_root,
+                        host=settings.host,
+                        port=settings.port,
+                        modern=settings.modern,
+                        continuation_policy=settings.continuation_policy,
+                        kind=member["label"],
+                        title=f"{pool['name']} / {member['label']}",
+                        parent_session_id=smeta.session_id,
+                        first_user_message="",
+                        spawn_policy="",
+                        startup_mode="paused",
+                        lifetime="independent",
+                        extra_env=(
+                            ("AZO_SWARM_ID", pool["id"]),
+                            ("AZO_SWARM_POD_ID", pod_id),
+                            ("AZO_SWARM_GRANT", json.dumps(member_grant)),
+                        ),
+                    )
+                    request_doc = {
+                        "target": {"session_id": sid, "instance_id": iid},
+                        "source": asdict(source),
+                        "settings": asdict(settings),
+                        "parent_session_id": smeta.session_id,
+                        "kind": member["label"],
+                        "title": spec.title,
+                        "lifetime": "independent",
+                        "startup_mode": "paused",
+                        "first_user_message": "",
+                    }
+                    attempt = {
+                        "attempt_id": attempt_id,
+                        "session_id": sid,
+                        "instance_id": iid,
+                        "pod_id": pod_id,
+                        "state": "reserved",
+                        "epoch": pool["owner"]["epoch"],
+                        "binding_revision": 0,
+                        "request": request_doc,
+                        "host": dict(_SIM_HOST_DICT),
+                        "created_ns": now_ns,
+                        "recovery_operation_id": (pool.get("recovery") or {}).get("operation_id"),
+                        "selected_checkpoint": (
+                            {"session_id": checkpoint.session_id, "revision_id": checkpoint.revision_id}
+                            if checkpoint is not None
+                            else None
+                        ),
+                    }
+                    rec["attempts"][sid] = attempt
+                    row = rec["members"].setdefault(sid, {"session_id": sid})
+                    row.update(session_id=sid, current_attempt_id=attempt_id, recovery_status="pending", work_blocked=False)
+                    spawn_req = SpawnSession(
+                        session_id=sid,
+                        instance_id=iid,
+                        source=source,
+                        spec=spec,
+                        wait_ready=True,
+                        ready_timeout_s=30.0,
+                        watch=False,
+                    )
+                    out.append((idx, member, spawn_req, deepcopy(attempt), None))
+                except Exception as exc:
+                    out.append((idx, member, None, None, self._record_member_failure(rec, member, exc)))
+            return out
+
+        if op == "mark_spawn_unknown":
+            rec = self._require_record(p["store"])
+            member = p["member"]
+            attempt_id = p["attempt_id"]
+            saved = rec["attempts"].get(member["session_id"])
+            if saved and saved.get("attempt_id") == attempt_id and saved.get("state") == "reserved":
+                saved["state"] = "unknown"
+            return self._record_member_failure(rec, member, p["error"])
+
+        if op == "finalize_spawn_begin":
+            handle = p["store"]
+            rec = self._require_record(handle)
+            member = p["member"]
+            attempt_id = p["attempt_id"]
+            spawn_res: SessionSpawnResult = p["spawn_res"]
+            try:
+                self._require_grant(rec, handle.grant, allow_cancelled=True)
+                ready = dict(spawn_res.ready or {})
+                if not ready:
+                    ready = {
+                        "format_version": 1,
+                        "session_id": member["session_id"],
+                        "instance_id": spawn_res.instance_id,
+                        "pid": spawn_res.pid,
+                        "websocket_url": spawn_res.websocket_url,
+                        "revision_id": spawn_res.revision_id or f"rev-{self._next_seq()}",
+                        "process_identity": deepcopy(spawn_res.process_identity),
+                        "startup_mode": "paused",
+                        "paused": True,
+                    }
+                validate_loopback_ws_url(ready["websocket_url"])
+                saved = rec["attempts"].get(member["session_id"])
+                if not saved or saved.get("attempt_id") != attempt_id:
+                    raise ValueError("Stale attempt completion")
+                saved.update(
+                    state="ready_paused",
+                    pid=spawn_res.pid,
+                    process_identity=deepcopy(spawn_res.process_identity),
+                    ready=ready,
+                    bootstrap={
+                        "instance_id": spawn_res.instance_id,
+                        "revision_id": ready["revision_id"],
+                        "paused": True,
+                        "epoch": handle.grant["epoch"],
+                        "process_identity": deepcopy(spawn_res.process_identity),
+                    },
+                )
+                row = rec["members"].setdefault(member["session_id"], {"session_id": member["session_id"]})
+                row.update(
+                    session_id=member["session_id"],
+                    recovery_status="ready_paused",
+                    work_blocked=False,
+                    shared_checkpoint={
+                        "session_id": member["session_id"],
+                        "instance_id": spawn_res.instance_id,
+                        "revision_id": ready["revision_id"],
+                    },
+                )
+                return {
+                    "done": True,
+                    "outcome": {
+                        "label": member["label"],
+                        "session_id": member["session_id"],
+                        "state": "ready_paused",
+                    },
+                }
+            except Exception as exc:
+                return {"done": True, "outcome": self._record_member_failure(rec, member, exc)}
+
+        if op == "finalize_spawn_poll":
+            rec = self._require_record(p["store"])
+            member = p["member"]
+            saved = rec["attempts"].get(member["session_id"])
+            if saved and saved.get("state") == "ready_paused":
+                return {
+                    "done": True,
+                    "outcome": {
+                        "label": member["label"],
+                        "session_id": member["session_id"],
+                        "state": "ready_paused",
+                    },
+                }
+            return {"done": False}
+
+        if op == "record_member_failure":
+            rec = self._require_record(p["store"])
+            return self._record_member_failure(rec, p["member"], p["error"])
+
+        if op == "rebind_live_parent_successor":
+            return None
+
+        if op == "claim_recovery":
+            snapshot = p["snapshot"]
+            handle = p["store"]
+            request = p["request"]
+            config = p["config"]
+            rec = self._require_record(handle)
+            pool = rec["pool"]
+            smeta = _session_meta(snapshot)
+            require_resource_reference(snapshot, pool)
+            if pool["owner_session_id"] != smeta.session_id:
+                raise ValueError("Only the durable owning parent may recover")
+            if pool["desired_state"] == "cancelled":
+                raise ValueError("Cancelled swarms remain cancelled")
+            epoch = int(pool.get("owner", {}).get("epoch", 0))
+            expected_epoch = request.get("expected_epoch")
+            if expected_epoch is not None and epoch != expected_epoch:
+                raise ValueError(f"Owner epoch changed: expected {expected_epoch}, actual {epoch}")
+            if getattr(snapshot, "settings", None) is None:
+                snapshot.settings = self._sim_launch_settings(
+                    snapshot, config, profile=getattr(snapshot, "_requested_profile", None)
+                )
+            settings = pool_launch_settings(snapshot.settings, config, pool)
+            previous = deepcopy(pool.get("owner"))
+            operation_id = self._next_hex32()
+            pool.update(
+                version=2,
+                owner={
+                    "epoch": epoch + 1,
+                    "token": self._next_hex32(),
+                    "parent_instance_id": smeta.instance_id,
+                    "host": dict(_SIM_HOST_DICT),
+                    "process_identity": dict(_SIM_PARENT_PROC_DICT),
+                },
+                host=dict(_SIM_HOST_DICT),
+                phase="recovering",
+                desired_state="paused",
+                recovery={
+                    "operation_id": operation_id,
+                    "parent_instance_id": smeta.instance_id,
+                    "expected_previous_epoch": epoch,
+                    "previous_owner": previous,
+                    "phase": "recovering",
+                    "selected_checkpoints": {},
+                    "classifications": {},
+                    "takeover_evidence": {
+                        "confirmed_stopped": bool(request.get("confirmed_stopped", False)),
+                        "subjects": [],
+                        "owner": previous,
+                        "scope": "simulated recovery",
+                        "at_ns": now_ns,
+                    },
+                },
+            )
+            for sid, att in list(rec["attempts"].items()):
+                rec["attempts"][sid] = {**att, "state": "fenced", "reconciled_by": operation_id}
+            grant = parent_grant(pool, smeta.instance_id)
+            handle.grant = deepcopy(grant)
+            snapshot.grants[pool["id"]] = deepcopy(grant)
+            snapshot.swarm_access[pool["id"]] = ""
+            snapshot.swarm_resource_uids = {
+                **getattr(snapshot, "swarm_resource_uids", {}),
+                pool["id"]: pool["resource_uid"],
+            }
+            rec["operations"][operation_id] = {
+                "id": operation_id,
+                "action": "recover",
+                "epoch": epoch + 1,
+                "state": "pending",
+                "outcomes": [],
+                "created_ns": now_ns,
+            }
+            return deepcopy(pool), settings
+
+        if op == "control_begin":
+            snapshot = p["snapshot"]
+            request = p["request"]
+            handle = p.get("store")
+            action = request["action"]
+            if handle is not None:
+                rec = self._require_record(handle)
+                pool = deepcopy(rec["pool"])
+            else:
+                handle, pool = self._resolve_pool(snapshot, request["target"])
+                rec = self._require_record(handle)
+            if request.get("canonical") and pool["id"] != request["target"]:
+                raise ValueError("Tool swarm_id must be the canonical resource ID, not its display name")
+            members = control_members(pool, request)
+            if action == "bcast":
+                validate_broadcast(request["message"])
+            elif action == "afk":
+                afk_command(request.get("message"))
+            if action in {"continue", "bcast", "release"}:
+                for m in members:
+                    row = rec["members"].get(m["session_id"], {})
+                    if row.get("recovery_status") not in {"ready_paused", "ready"} or row.get("work_blocked"):
+                        raise ValueError("Recovery/seed checkpoint incomplete or external tool outcome ambiguous; no work sent")
+            self._require_grant(rec, handle.grant, allow_cancelled=action == "cancel")
+            op_id = request["operation_id"]
+            if op_id in rec["operations"]:
+                raise ValueError("Operation already exists; replay forbidden")
+            op_doc = {
+                "id": op_id,
+                "action": action,
+                "pods": request.get("pods"),
+                "epoch": pool["owner"]["epoch"],
+                "message": request.get("message", ""),
+                "created_ns": now_ns,
+                "state": "pending",
+                "members": [m["session_id"] for m in members],
+                "outcomes": [],
+            }
+            rec["operations"][op_id] = deepcopy(op_doc)
+            desired = {"bcast": "running", "continue": "running", "interrupt": "paused", "cancel": "cancelled"}
+            if action in desired:
+                saved = rec["pool"]
+                states = saved.setdefault("pod_states", {pod["id"]: "paused" for pod in saved["pods"]})
+                ids = {m["session_id"] for m in members}
+                for pod in saved["pods"]:
+                    if any(m["session_id"] in ids for m in pod["members"]):
+                        states[pod["id"]] = desired[action]
+                saved["desired_state"] = next(iter(set(states.values()))) if len(set(states.values())) == 1 else "mixed"
+                saved["phase"] = saved["desired_state"]
+                pool = deepcopy(saved)
+            return handle, pool, members, op_doc
+
+        if op == "build_member_discover":
+            return self._build_member_discover(p["store"], p["member"])
+
+        if op == "claim_operation_dispatch":
+            handle = p["store"]
+            rec = self._require_record(handle)
+            self._require_grant(rec, handle.grant, allow_cancelled=bool(p.get("allow_cancelled", False)))
+            member = p["member"]
+            proposal = p["proposal"]
+            op_id = p["operation_id"]
+            saved = rec["attempts"].get(member["session_id"])
+            if not saved:
+                raise ValueError("Launch remains unreconciled or stopped; no automatic replay")
+            operation = rec["operations"].setdefault(op_id, {"id": op_id, "epoch": rec["pool"]["owner"]["epoch"]})
+            if operation.get("epoch", rec["pool"]["owner"]["epoch"]) != rec["pool"]["owner"]["epoch"]:
+                raise ValueError("Operation belongs to a previous owner epoch")
+            claims = operation.setdefault("dispatch", {})
+            if member["session_id"] in claims:
+                raise ValueError("Operation already claimed this member; never replay")
+            claims[member["session_id"]] = {
+                "state": "sending",
+                "attempt_id": saved["attempt_id"],
+                "instance_id": proposal["instance_id"],
+                "generation": proposal["facts"]["registry_generation"],
+            }
+            return True
+
+        if op == "member_resource":
+            snapshot = p["snapshot"]
+            smeta = _session_meta(snapshot)
+            sid = str(smeta.session_id or "")
+            matches = []
+            for swarm_id in sorted(self.pools):
+                rec = self.pools[swarm_id]
+                pool = rec["pool"]
+                for pod in pool["pods"]:
+                    for member in pod["members"]:
+                        if member["session_id"] == sid:
+                            matches.append((self._handle(swarm_id, snapshot), deepcopy(pool), deepcopy(pod), deepcopy(member)))
+            if len(matches) > 1:
+                raise ValueError("Session belongs to multiple swarm resources")
+            res = matches[0] if matches else None
+            return {
+                "resource": res,
+                "env_swarm_id": "",
+                "self_identity": dict(_SIM_PARENT_PROC_DICT) if res is not None else None,
+                "launch_grant": deepcopy((getattr(snapshot, "grants", None) or {}).get(res[1]["id"])) if res is not None else None,
+            }
+
+        if op == "owned_stores":
+            snapshot = p["snapshot"]
+            smeta = _session_meta(snapshot)
+            result = []
+            for swarm_id in sorted(self.pools):
+                rec = self.pools[swarm_id]
+                pool = rec["pool"]
+                if pool.get("owner_session_id") != smeta.session_id:
+                    continue
+                try:
+                    require_resource_reference(snapshot, pool)
+                except Exception as exc:
+                    result.append((swarm_id, None, str(exc)))
+                    continue
+                result.append((swarm_id, self._handle(swarm_id, snapshot), None))
+            return result
+
+        if op == "launch_settings":
+            return self._sim_launch_settings(p["snapshot"], p["config"], profile=p.get("profile"))
+
+        if op == "bootstrap_read_attempt":
+            rec = self._require_record(p["store"])
+            return deepcopy(rec["attempts"].get(p["session_id"]))
+
+        if op == "bootstrap_prep_discover":
+            handle = p["store"]
+            rec = self._require_record(handle)
+            att = deepcopy(rec["attempts"].get(p["session_id"]))
+            if not att:
+                raise ValueError("Missing attempt for bootstrap discovery")
+            cur = att.get("current") or att
+            g = dict(p["grant"], instance_id=cur["instance_id"])
+            handle.grant = deepcopy(g)
+            return att, g, self._build_member_discover(handle, p["member"]), dict(_SIM_PARENT_PROC_DICT)
+
+        if op == "bootstrap_adopt":
+            handle = p["store"]
+            rec = self._require_record(handle)
+            self._require_grant(rec, handle.grant)
+            member = p["member"]
+            proposal = p["proposal"]
+            saved = rec["attempts"].get(member["session_id"])
+            if not saved:
+                raise ValueError("Missing attempt during bootstrap adopt")
+            saved["current"] = {
+                **deepcopy(proposal["facts"]),
+                "registry_store_root": proposal["registry_store_root"],
+                "verified_at_ns": now_ns,
+                "adoption": {"from_instance_id": (saved.get("current") or saved)["instance_id"], "edges": proposal["path"]},
+            }
+            saved["binding_revision"] = int(saved.get("binding_revision", 0)) + 1
+            return True
+
+        if op == "commit_member_bootstrap_try":
+            snapshot = p["snapshot"]
+            handle = p["store"]
+            rec = self._require_record(handle)
+            pool = rec["pool"]
+            pod = p["pod"]
+            grant = dict(p["grant"])
+            event = p["event"]
+            sid = str(_session_meta(snapshot).session_id or "")
+            revision = event.get("revision_id") or f"rev-{self._next_seq()}"
+            swarm_id = pool["id"]
+            snapshot.swarm_access = {swarm_id: pod["id"]}
+            snapshot.grants[swarm_id] = deepcopy(grant)
+            handle.grant = deepcopy(grant)
+            saved = rec["attempts"].get(sid)
+            if saved is not None:
+                saved["bootstrap"] = {
+                    "instance_id": event["instance_id"],
+                    "revision_id": revision,
+                    "paused": event.get("paused") is True,
+                    "epoch": grant["epoch"],
+                    "process_identity": dict(_SIM_PARENT_PROC_DICT),
+                }
+            row = rec["members"].setdefault(sid, {"session_id": sid})
+            row.update(
+                shared_checkpoint={"session_id": sid, "instance_id": event["instance_id"], "revision_id": revision},
+                work_blocked=False,
+                recovery_status="ready_paused" if event.get("paused") is True else "ready",
+            )
+            return {
+                "status": "done",
+                "result": {
+                    "summary": f"{swarm_id}: agent ready{' (paused)' if event.get('paused') is True else ''}.",
+                    "access": dict(snapshot.swarm_access),
+                    "replace_access": True,
+                    "grants": deepcopy(snapshot.grants),
+                    "resource_uids": {swarm_id: pool["resource_uid"]},
+                    "level": "info",
+                    "_buffer_snapshot": self.build_snapshot(snapshot),
+                },
+            }
+
+        if op == "startup_hook":
+            return p["hook"](p["snapshot"], p["event"])
+
+        raise ValueError(f"Unsupported SwarmStoreRequest op: {op!r}")
+
+
+def _active_swarm_globals(session: Any) -> dict[str, Any] | None:
+    """Return the module globals of the ``swarm`` instance bound to ``session.pipeline``."""
+    pipeline = getattr(session, "pipeline", None) if session is not None else None
+    if pipeline is None:
+        return None
+    for comp in getattr(pipeline, "components", ()) or ():
+        if type(comp).__name__ == "SwarmRuntimeReady":
+            handle_fn = getattr(type(comp), "handle", None)
+            globs = getattr(handle_fn, "__globals__", None)
+            if isinstance(globs, dict):
+                return globs
+    return None
+
+
+def register_sim_handlers(sim: Any, rng: random.Random) -> None:
+    """Register deterministic pure in-memory DST handlers for ``SwarmStoreRequest``."""
+    session = getattr(sim, "session", None)
+    active_globs = _active_swarm_globals(session)
+    if active_globs is not None and active_globs is not globals():
+        delegate = active_globs.get("register_sim_handlers")
+        if callable(delegate):
+            delegate(sim, rng)
+            return
+
+    from agent_utils.runtime.simulation import SimOutcome
+    from agent_zoo.events import SlashCommand
+
+    world = _SimSwarmWorld(rng)
+    sim._sim_swarm_world = world
+
+    state = getattr(session, "state", None) if session is not None else None
+    if state is not None:
+        # Ensure ephemeral SessionContext has deterministic sim launch roots for /swarm commands.
+        ctx = session_context(state, config=getattr(state, "config", None))
+        if not ctx.project_name:
+            ctx.project_name = "sim"
+        if not ctx.store_root:
+            ctx.store_root = "/sim/store"
+        if not ctx.state_root:
+            ctx.state_root = "/sim/state"
+        if not ctx.local_state_root:
+            ctx.local_state_root = "/sim/local"
+
+        rt = _swarm_runtime(state)
+        rt._sim_world = world  # type: ignore[attr-defined]
+
+        durable = _swarm_durable(state)
+        if durable.swarm_access:
+            # Restored/resumed/reloaded session: hydrate matching pools so _wf_startup recovers them cleanly.
+            world.hydrate_restored_pools(state, session=session)
+        elif (
+            not worker_identity(state)
+            and getattr(sim, "_sim_sessions", None) is not None
+            and int(getattr(getattr(state, "io", None), "generation", 1) or 1) == 1
+        ):
+            # Fresh simulated parent session: create a live swarm right after SessionReady so
+            # /swarm creation, SpawnSession, SwarmBuffers, and all swarm_* tools are exercised.
+            llm_cfg = ((getattr(state, "config", None) or {}).get("llm", {}) or {})
+            profile = str(llm_cfg.get("default") or "sim-model")
+            sim.inject(
+                SlashCommand(raw=f"/swarm -n 2 -p 2 --channels general,findings --name simpool --profile {profile}"),
+                delay=0.001,
+            )
+
+    def _handle_store_request(_op_id: OpId, req: SwarmStoreRequest, s: Any) -> SimOutcome:
+        delay = round(rng.uniform(0.001, 0.008), 6)
+        try:
+            value = world.execute(req, s)
+            return SimOutcome(value=value, delay=delay)
+        except Exception as exc:
+            return SimOutcome(error=exc, delay=delay)
+
+    sim.register_handler(SwarmStoreRequest, _handle_store_request)
+
+
+def fuzz_tool_args(tool_name: str, rng: random.Random, state: Any) -> dict[str, Any] | None:
+    """Generate deterministic, state-aware arguments for Swarm tools during DST fuzzing."""
+    if tool_name not in _SWARM_TOOL_NAMES:
+        return None
+
+    # Read durable/runtime namespaces without forcing class identity across reloaded modules.
+    features = getattr(state, "features", None)
+    ns = features.get("swarm") if isinstance(features, Mapping) else None
+    raw_access = getattr(ns, "swarm_access", None) if ns is not None else None
+    if not isinstance(raw_access, Mapping):
+        raw_access = getattr(state, "swarm_access", None)
+    access = dict(raw_access) if isinstance(raw_access, Mapping) else {}
+
+    runtime_map = getattr(state, "_runtime_state", None)
+    rt = runtime_map.get("swarm") if isinstance(runtime_map, Mapping) else getattr(state, "_swarm_runtime_fallback", None)
+    sim_world = getattr(rt, "_sim_world", None) if rt is not None else None
+    world_pools = getattr(sim_world, "pools", None) if sim_world is not None else None
+    snap_obj = getattr(rt, "snapshot", None) if rt is not None else None
+    snap_pools = dict(getattr(snap_obj, "pools", None) or {})
+
+    all_ids = sorted(access.keys())
+    if not all_ids and isinstance(world_pools, Mapping):
+        all_ids = sorted(world_pools.keys())
+
+    def _get_pool(sid: str) -> dict[str, Any] | None:
+        if isinstance(world_pools, Mapping) and sid in world_pools:
+            return world_pools[sid].get("pool")
+        return snap_pools.get(sid)
+
+    active_ids = [
+        sid
+        for sid in all_ids
+        if (_get_pool(sid) or {}).get("desired_state") != "cancelled"
+    ]
+    pool_choices = active_ids or all_ids
+    swarm_id = rng.choice(pool_choices) if pool_choices else "sw0"
+    pool = _get_pool(swarm_id)
+
+    pods = list((pool or {}).get("pods") or ())
+    num_pods = max(1, len(pods))
+    channels = list((pool or {}).get("channels") or ("general",))
+    scope_pod_id = access.get(swarm_id, "")
+    scoped_pod_idx = 0
+    if scope_pod_id and pods:
+        scoped_pod_idx = next((int(p["index"]) for p in pods if p.get("id") == scope_pod_id), 0)
+
+    if tool_name == "swarm_broadcast":
+        prompts = (
+            "Inspect the workspace modules and post a concise summary.",
+            "Review test coverage and record key findings on the board.",
+            "Verify invariants and report status in your pod channel.",
+        )
+        args: dict[str, Any] = {
+            "swarm_id": swarm_id,
+            "message": f"{rng.choice(prompts)} [ref={rng.randint(1, 9999)}]",
+        }
+        if rng.random() < 0.45:
+            if num_pods > 1 and rng.random() < 0.5:
+                args["pods"] = [rng.randrange(num_pods)]
+            else:
+                args["pods"] = list(range(num_pods))
+        return args
+
+    if tool_name in {"swarm_interrupt", "swarm_continue", "swarm_cancel"}:
+        return {"swarm_id": swarm_id}
+
+    if tool_name == "swarm_post":
+        pod_idx = scoped_pod_idx if scope_pod_id else rng.randrange(num_pods)
+        channel = rng.choice(channels) if channels else "general"
+        msg_num = rng.randint(1, 99999)
+        post_args: dict[str, Any] = {
+            "swarm_id": swarm_id,
+            "pod": pod_idx,
+            "channel": channel,
+            "message": f"Pod {pod_idx} note #{msg_num}: checked workspace state.",
+        }
+        if rng.random() < 0.6:
+            post_args["message_id"] = f"msg_{msg_num}"
+        return post_args
+
+    return None
+
+
+def check_invariants(session: Any) -> None:
+    """Verify structural integrity of durable and runtime Swarm state on ``session.state``."""
+    active_globs = _active_swarm_globals(session)
+    if active_globs is not None and active_globs is not globals():
+        delegate = active_globs.get("check_invariants")
+        if callable(delegate):
+            delegate(session)
+            return
+
+    state = getattr(session, "state", None)
+    if state is None:
+        return
+
+    features = getattr(state, "features", None)
+    if isinstance(features, Mapping) and "swarm" in features:
+        ns = features["swarm"]
+        if isinstance(ns, SwarmDurableState):
+            assert isinstance(ns.swarm_access, dict), (
+                f"SwarmDurableState.swarm_access must be a dict, got {type(ns.swarm_access).__name__}"
+            )
+            assert isinstance(ns.swarm_resource_uids, dict), (
+                f"SwarmDurableState.swarm_resource_uids must be a dict, got {type(ns.swarm_resource_uids).__name__}"
+            )
+            for sid, scope in ns.swarm_access.items():
+                assert isinstance(sid, str) and NAME.fullmatch(sid), (
+                    f"Invalid swarm ID in swarm_access: {sid!r}"
+                )
+                assert isinstance(scope, str) and (scope == "" or NAME.fullmatch(scope)), (
+                    f"Invalid scope for swarm {sid!r}: {scope!r}"
+                )
+            if any(ns.swarm_access.values()):
+                assert len(ns.swarm_access) == 1 and all(ns.swarm_access.values()), (
+                    f"Worker swarm_access must bind exactly one pod scope: {ns.swarm_access!r}"
+                )
+            for sid, uid in ns.swarm_resource_uids.items():
+                assert isinstance(sid, str) and NAME.fullmatch(sid), (
+                    f"Invalid swarm ID in swarm_resource_uids: {sid!r}"
+                )
+                assert uid is None or isinstance(uid, str), (
+                    f"Invalid resource_uid for swarm {sid!r}: {uid!r}"
+                )
+
+    runtime_map = getattr(state, "_runtime_state", None)
+    rt = runtime_map.get("swarm") if isinstance(runtime_map, Mapping) else getattr(state, "_swarm_runtime_fallback", None)
+    if isinstance(rt, SwarmRuntimeState):
+        assert isinstance(rt.grants, dict)
+        assert isinstance(rt.in_flight, dict)
+        assert isinstance(rt.workflows, dict)
+        assert isinstance(rt.owned_instances, set)
+        assert isinstance(rt.seen_events, set)
+        assert isinstance(rt.snapshot, SwarmSnapshot)
+
+        for sid, grant in rt.grants.items():
+            assert isinstance(sid, str) and NAME.fullmatch(sid), f"Invalid grant swarm ID: {sid!r}"
+            assert isinstance(grant, dict), f"Grant for {sid!r} must be dict, got {type(grant).__name__}"
+            assert grant.get("role") in {"parent", "member"}, f"Invalid grant role for {sid!r}: {grant!r}"
+            assert type(grant.get("epoch")) is int and grant["epoch"] >= 1, (
+                f"Invalid grant epoch for {sid!r}: {grant!r}"
+            )
+            assert isinstance(grant.get("session_id"), str) and grant["session_id"], (
+                f"Grant for {sid!r} missing session_id: {grant!r}"
+            )
+            assert isinstance(grant.get("instance_id"), str) and grant["instance_id"], (
+                f"Grant for {sid!r} missing instance_id: {grant!r}"
+            )
+
+        for op_id, entry in rt.in_flight.items():
+            assert isinstance(entry, tuple) and len(entry) == 3, (
+                f"Malformed SwarmRuntimeState.in_flight entry for {op_id!r}: {entry!r}"
+            )
+
+        for sid, pool in rt.snapshot.pools.items():
+            assert isinstance(sid, str) and NAME.fullmatch(sid), f"Invalid snapshot pool ID: {sid!r}"
+            validate_pool(pool)
+            assert pool["id"] == sid, f"Snapshot pool key {sid!r} != pool['id']={pool['id']!r}"
+
+        bm = getattr(state, "buffer_manager", None)
+        if rt.bound is not None and bm is not None and callable(getattr(bm, "special_buffer_namespaces", None)):
+            assert "swarm:" in bm.special_buffer_namespaces(), (
+                "Swarm bound session missing registered 'swarm:' special buffer namespace"
+            )
+
+    received = getattr(state, "swarm_received_data", None)
+    if received is not None:
+        assert isinstance(received, list), (
+            f"state.swarm_received_data must be a list, got {type(received).__name__}"
+        )
+        for item in received:
+            assert isinstance(item, SessionDataReceived), (
+                f"Unexpected item in swarm_received_data: {type(item).__name__}"
+            )
+            assert str(item.channel or "").startswith("swarm:"), (
+                f"Non-swarm channel stored in swarm_received_data: {item.channel!r}"
+            )
